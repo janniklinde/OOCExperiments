@@ -1,58 +1,67 @@
 #!/bin/bash
 set -euo pipefail
 
-# shellcheck disable=SC1091
-source ../../sysds.conf   # adjust path
+# find all config files
+confs=(sysds_*.conf)
 
-echo "mode,rep1,rep2,rep3" > results.csv
+# header
+echo "mode,conf,rep1,rep2,rep3" > results.csv
+
 modes=("cp" "ooc")
 
-for mode in "${modes[@]}"; do
-  row="$mode"
-  for rep in {1..3}; do
-    start=$(date +%s%N)
+for conf in "${confs[@]}"; do
+  # load this config
+  # shellcheck disable=SC1090
+  source "$conf"
 
-    # pick jar + optional flag
-    if [[ $mode == "ooc" ]]; then
-      jar="$SYSDS_JAR_OOC"
-      oocflag="-ooc"
-    else
-      jar="$SYSDS_JAR_CP"
-      oocflag=""
-    fi
+  # expect SYSDS_CONFIG_NAME to be set by the conf
+  cfg="${SYSDS_CONFIG_NAME:-$(basename "$conf" .conf)}"
 
-    file=./exp.dml
+  for mode in "${modes[@]}"; do
+    row="$mode,$cfg"
+    for rep in {1..3}; do
+      start=$(date +%s%N)
 
-    # base cmd
-    cmd=(
-      "${SYSDS_CMD_COMMON[@]}"
-      "$jar"
-      -f "$file"
-      -exec singlenode
-    )
+      # pick jar + optional flag
+      if [[ $mode == "ooc" ]]; then
+        jar="$SYSDS_JAR_OOC"
+        oocflag="-ooc"
+      else
+        jar="$SYSDS_JAR_CP"
+        oocflag=""
+      fi
 
-    # optional flag
-    if [[ -n $oocflag ]]; then
-      cmd+=("$oocflag")
-    fi
+      file=./exp.dml
 
-    # args
-    cmd+=( -args 10000 10000 1.0 "../../data/" )
+      cmd=(
+        "${SYSDS_CMD_COMMON[@]}"
+        "$jar"
+        -f "$file"
+        -exec singlenode
+      )
 
-    printf 'RUN CMD: %q ' "${cmd[@]}"; echo
-    output=$("${cmd[@]}")
+      if [[ -n $oocflag ]]; then
+        cmd+=("$oocflag")
+      fi
 
-    echo "$output"
+      # args (keep as in your script)
+      cmd+=( -args 10000 10000 1.0 "../../data/" )
 
-    exec_time=$(echo "$output" | grep -oP 'Total execution time:\s*\K[0-9.]+')
-    result=$(echo "$output" | grep -oP 'Result:\s*\K[0-9.]+')
+      printf 'RUN CMD (%s %s): %q ' "$cfg" "$mode" "${cmd[@]}"; echo
+      output=$("${cmd[@]}")
 
-    end=$(date +%s%N)
-    dur_ms=$(( (end - start) / 1000000 ))
+      echo "$output"
 
-    row="$row,$exec_time"
-    echo "ExecTime: $exec_time"
-    echo "Result: $result"
+      exec_time=$(echo "$output" | grep -oP 'Total execution time:\s*\K[0-9.]+')
+      result=$(echo "$output" | grep -oP 'Result:\s*\K[0-9.]+')
+
+      end=$(date +%s%N)
+      dur_ms=$(( (end - start) / 1000000 ))
+
+      row="$row,$exec_time"
+      echo "ExecTime: $exec_time ms(raw: $dur_ms)"
+      echo "Result: $result"
+    done
+    echo "$row" >> results.csv
   done
-  echo "$row" >> results.csv
 done

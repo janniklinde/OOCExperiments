@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # shellcheck disable=SC1091
-source ./sysds.conf   # adjust path
+source sysds_1.conf   # adjust path
 
 FILE=./datagen.dml
 

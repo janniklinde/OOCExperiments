@@ -1,9 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-# load config
 # shellcheck disable=SC1091
-source ../../sysds.conf
+source ../../sysds.conf   # adjust path
 
 echo "mode,rep1,rep2,rep3" > results.csv
 modes=("cp" "ooc")
@@ -13,21 +12,38 @@ for mode in "${modes[@]}"; do
   for rep in {1..3}; do
     start=$(date +%s%N)
 
-    if [ "$mode" = "ooc" ]; then
-      SYSDS_JAR="$SYSDS_JAR_OOC"
-      OOCFlag="-ooc"
+    # pick jar + optional flag
+    if [[ $mode == "ooc" ]]; then
+      jar="$SYSDS_JAR_OOC"
+      oocflag="-ooc"
     else
-      SYSDS_JAR="$SYSDS_JAR_CP"
-      OOCFlag=""
+      jar="$SYSDS_JAR_CP"
+      oocflag=""
     fi
 
-    # build the cmd from config
-    # $FILE in your original config is basically your DML script
-    FILE=./exp.dml
-    SYSDS_CMD=( $SYSDS_CMD_COMMON "$SYSDS_JAR" -f "$FILE" -exec singlenode $OOCFlag -args 10000 10000 1.0 "../data/" )
+    file=./exp.dml
 
-    # run and capture
-    output=$("${SYSDS_CMD[@]}")
+    # base cmd
+    cmd=(
+      "${SYSDS_CMD_COMMON[@]}"
+      "$jar"
+      -f "$file"
+      -exec singlenode
+    )
+
+    # optional flag
+    if [[ -n $oocflag ]]; then
+      cmd+=("$oocflag")
+    fi
+
+    # args
+    cmd+=( -args 10000 10000 1.0 "../../data/" )
+
+    printf 'RUN CMD: %q ' "${cmd[@]}"; echo
+    output=$("${cmd[@]}")
+
+    echo "$output"
+
     exec_time=$(echo "$output" | grep -oP 'Total execution time:\s*\K[0-9.]+')
     result=$(echo "$output" | grep -oP 'Result:\s*\K[0-9.]+')
 

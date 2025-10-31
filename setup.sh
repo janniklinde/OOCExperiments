@@ -1,12 +1,22 @@
 #!/bin/bash
 set -euo pipefail
 
-# load config
 # shellcheck disable=SC1091
-source ./sysds.conf
+source ./sysds.conf   # adjust path
 
-# setup 10kx10k sparsity 1 matrics
+FILE=./datagen.dml
+
 for id in {1..3}; do
-  SYSDS_CMD=( $SYSDS_CMD_COMMON "$SYSDS_JAR_CP" -f ./datagen.dml -exec singlenode -args 10000 10000 1.0 $id )
-  output=$("${SYSDS_CMD[@]}")
+  # build cmd
+  cmd=(
+    "${SYSDS_CMD_COMMON[@]}"
+    "$SYSDS_JAR_CP"          # or OOC, doesn’t matter for datagen
+    -f "$FILE"
+    -exec singlenode
+    -args 10000 10000 1.0 "$id"
+  )
+
+  printf 'SETUP CMD: %q ' "${cmd[@]}"; echo
+  output=$("${cmd[@]}")
+  printf '%s\n' "$output"
 done

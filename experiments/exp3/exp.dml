@@ -1,0 +1,21 @@
+rownum = $1;
+colnum = $2;
+spar = $3;
+data_dir = $4;
+
+start = time();
+
+M1 = read(data_dir + "mat_"+ rownum + "x" + colnum + "s" + spar + "_1", format="binary");
+M2 = read(data_dir + "mat_"+ rownum + "x" + colnum + "s" + spar + "_2", format="binary");
+
+for (i in 1:5) {
+    M1 = sin(M1 * M2);
+}
+
+res = as.matrix(mean(M1));
+write(res, "out/res", format="binary");
+
+total_time = time() - start;
+total_time = total_time / 1000000;
+print("Completed in " + total_time + "ms");
+print("Result: " + as.scalar(M1));

@@ -3,7 +3,7 @@ set -euo pipefail
 
 # load config
 # shellcheck disable=SC1091
-source ../sysds.conf
+source ../../sysds.conf
 
 echo "mode,rep1,rep2,rep3" > results.csv
 modes=("cp" "ooc")

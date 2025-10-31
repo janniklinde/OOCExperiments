@@ -18,4 +18,4 @@ write(res, "out/res", format="binary");
 total_time = time() - start;
 total_time = total_time / 1000000;
 print("Completed in " + total_time + "ms");
-print("Result: " + as.scalar(M1));
+print("Result: " + as.scalar(res));

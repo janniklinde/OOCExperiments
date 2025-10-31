@@ -1,0 +1,8 @@
+rownum = $1;
+colnum = $2;
+spar = $3;
+id = $4;
+M = rand(rows=rownum, cols=colnum, sparsity=spar);
+path = "data/mat_" + rownum + "x" + colnum + "s" + $3 + "_" + id;
+write(M, path, format="binary");
+print("Matrix written to: " + path);

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # find all config files
-confs=(sysds_*.conf)
+confs=(../../sysds_*.conf)
 
 # header
 echo "mode,conf,rep1,rep2,rep3" > results.csv

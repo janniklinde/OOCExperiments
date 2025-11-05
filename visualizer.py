@@ -108,8 +108,8 @@ def create_plot(
             )
 
     ax.set_title(title)
-    ax.set_xlabel("Configuration")
-    ax.set_ylabel("Average Runtime")
+    ax.set_xlabel("JVM Memory Configuration")
+    ax.set_ylabel("Average Runtime [s]")
     ax.set_xticks([x + (len(modes) - 1) * bar_width / 2 for x in x_positions])
     ax.set_xticklabels(confs)
     ax.legend()

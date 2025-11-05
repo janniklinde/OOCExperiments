@@ -7,7 +7,7 @@ start = time();
 
 M1 = read(data_dir + "mat_"+ rownum + "x" + colnum + "s" + spar + "_1", format="binary");
 
-M1 = M1[1:1200, 2000:3001];
+M1 = M1[1:700, 150:1020];
 
 
 res = as.matrix(mean(M1));

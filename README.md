@@ -4,6 +4,12 @@
 
 ```sh
 rsync -avz -e ssh --prune-empty-dirs \
-  --include '*/' --include 'result.csv' --exclude '*' \
+  --include '*/' --include 'results.csv' --exclude '*' \
   so014:~/OOCExperiments/  ./
+```
+
+## How to update SystemDS jar
+
+```sh
+scp SystemDS.jar so014:~/lib/
 ```

@@ -45,7 +45,7 @@ for conf in "${confs[@]}"; do
       fi
 
       # args (keep as in your script)
-      cmd+=( -explain hops -stats -args 60000 1000 1.0 "../../data/" )
+      cmd+=( -explain hops -stats -args 1000000 1000 1.0 "../../data/" )
 
       printf 'RUN CMD (%s %s): %q ' "$cfg" "$mode" "${cmd[@]}"; echo
       output=$("${cmd[@]}")

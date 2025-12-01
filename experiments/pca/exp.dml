@@ -34,7 +34,7 @@ k = 16;
 #write(PC, "out/PC", format="binary")
 #write(V, "out/V", format="binary")
 
+print("Result: " + toString(PC[1, 1]));
 total_time = time() - start;
 total_time = total_time / 1000000;
 print("Completed in " + total_time + "ms");
-print("Result: " + sum(PC));

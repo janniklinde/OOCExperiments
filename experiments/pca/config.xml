@@ -19,4 +19,5 @@
 
 <root>
     <sysds.scratch>/dev/shm/scratch_space</sysds.scratch>
+    <sysds.localtmpdir>/dev/shm/tmp/systemds</sysds.localtmpdir>
 </root>

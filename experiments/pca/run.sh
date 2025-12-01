@@ -38,6 +38,7 @@ for conf in "${confs[@]}"; do
         "$jar"
         -f "$file"
         -exec singlenode
+        -config ./config.xml
       )
 
       if [[ -n $oocflag ]]; then

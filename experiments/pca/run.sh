@@ -1,5 +1,5 @@
 #!/bin/bash
-set -euo pipefail
+set -uo pipefail
 
 # find all config files
 confs=(../../sysds_*.conf)
@@ -48,18 +48,26 @@ for conf in "${confs[@]}"; do
       cmd+=( -explain hops -stats -args 1000000 1000 1.0 "../../data/" )
 
       printf 'RUN CMD (%s %s): %q ' "$cfg" "$mode" "${cmd[@]}"; echo
-      output=$("${cmd[@]}")
-
-      echo "$output"
-
-      exec_time=$(echo "$output" | grep -oP 'Total execution time:\s*\K[0-9.]+')
-      result=$(echo "$output" | grep -oP 'Result:\s*\K[-+0-9.eE]+')
+      if output=$("${cmd[@]}" 2>&1); then
+        echo "$output"
+        exec_time=$(echo "$output" | grep -oP 'Total execution time:\s*\K[0-9.]+')
+        result=$(echo "$output" | grep -oP 'Result:\s*\K[-+0-9.eE]+')
+        [[ -z $exec_time ]] && exec_time="nan"
+        [[ -z $result ]] && result="nan"
+        status="ok"
+      else
+        echo "$output" >&2
+        echo "Run failed (cfg: $cfg mode: $mode rep: $rep); storing nan" >&2
+        exec_time="nan"
+        result="nan"
+        status="failed"
+      fi
 
       end=$(date +%s%N)
       dur_ms=$(( (end - start) / 1000000 ))
 
       row="$row,$exec_time"
-      echo "ExecTime: $exec_time ms(raw: $dur_ms)"
+      echo "ExecTime: $exec_time ms(raw: $dur_ms) [$status]"
       echo "Result: $result"
     done
     echo "$row" >> results.csv

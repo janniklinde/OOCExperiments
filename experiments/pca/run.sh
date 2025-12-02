@@ -70,6 +70,8 @@ for conf in "${confs[@]}"; do
       row="$row,$exec_time"
       echo "ExecTime: $exec_time ms(raw: $dur_ms) [$status]"
       echo "Result: $result"
+      rm -r ./tmp
+      rm -r ./scratch_space
     done
     echo "$row" >> results.csv
   done

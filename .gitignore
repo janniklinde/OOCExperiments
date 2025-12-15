@@ -4,3 +4,4 @@ data/
 *.
 **/out/
 **/scratch_space/
+**/__pycache__

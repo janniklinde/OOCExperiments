@@ -1,0 +1,6 @@
+Repo:   https://github.com/janniklinde/systemds
+Tag:    bench/base-2025-12-15
+Commit: be34066abedc6df44655a70466142fb396e352b5
+Link:   https://github.com/janniklinde/systemds/releases/tag/bench%2Fbase-2025-12-15
+Exp:    experiments/pca
+Cmd:    java -Xmx5g -Xms5g --add-modules=jdk.incubator.vector -jar $HOME/Dev/systemds/target/SystemDS.jar -f  exp.dml -exec singlenode -config ./config.xml -ooc -explain hops -stats -args 1000000 1000 1.0 "../../data/"

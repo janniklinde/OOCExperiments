@@ -6,4 +6,9 @@ data/
 **/scratch_space/
 **/__pycache__/
 eventlog/*.csv
+experiments/**/CacheSizeEventLog.csv
+experiments/**/ComputeEventLog.csv
+experiments/**/DiskReadEventLog.csv
+experiments/**/DiskWriteEventLog.csv
+experiments/**/RunSettings.csv
 experiments/**/tmp/

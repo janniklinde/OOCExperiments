@@ -21,6 +21,12 @@ from typing import Dict, List, Optional, Tuple
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 
+try:
+    # Not available in very old matplotlib versions.
+    from matplotlib.collections import BrokenBarHCollection
+except ImportError:  # pragma: no cover
+    BrokenBarHCollection = None
+
 
 TimeEntry = Tuple[int, str, int, int]  # thread, caller, start_ns, end_ns
 CacheSample = Tuple[int, int, int]  # timestamp_ns, scheduled_eviction_size, cache_size
@@ -254,6 +260,54 @@ def build_segments(
     return segments, colors, min_start, max_end
 
 
+def merge_adjacent_segments(
+    segments: Dict[int, List[Tuple[float, float, str]]]
+) -> Dict[int, List[Tuple[float, float, str]]]:
+    """Merge back-to-back segments with the same label to reduce draw calls."""
+    merged: Dict[int, List[Tuple[float, float, str]]] = {}
+    for thread_id, segs in segments.items():
+        if not segs:
+            merged[thread_id] = []
+            continue
+        sorted_segs = sorted(segs, key=lambda s: s[0])
+        compact: List[Tuple[float, float, str]] = [sorted_segs[0]]
+        for start, dur, label in sorted_segs[1:]:
+            prev_start, prev_dur, prev_label = compact[-1]
+            prev_end = prev_start + prev_dur
+            if label == prev_label and abs(start - prev_end) < 1e-9:
+                compact[-1] = (prev_start, prev_dur + dur, label)
+            else:
+                compact.append((start, dur, label))
+        merged[thread_id] = compact
+    return merged
+
+
+def add_bar_collection(
+    ax: plt.Axes,
+    bars: List[Tuple[float, float]],
+    y: float,
+    height: float,
+    color: str,
+) -> None:
+    """
+    Add a batch of horizontal bars efficiently. Falls back to broken_barh
+    if BrokenBarHCollection is unavailable in the current matplotlib.
+    """
+    if not bars:
+        return
+    if BrokenBarHCollection is None:
+        ax.broken_barh(bars, (y, height), facecolors=color, edgecolors="none", linewidth=0.0)
+        return
+    collection = BrokenBarHCollection(
+        bars,
+        (y, height),
+        facecolors=color,
+        edgecolors="none",
+        linewidth=0.0,
+    )
+    ax.add_collection(collection)
+
+
 def plot_disk_track(
     ax: plt.Axes,
     entries: List[TimeEntry],
@@ -280,17 +334,13 @@ def plot_disk_track(
             y = idx * (height + gap) + y_base
             y_ticks.append(y + height / 2)
             y_labels.append(str(thread_id))
+            bars = []
             for _, _, start, end in sorted(thread_entries, key=lambda e: e[2]):
                 duration = end - start
                 if duration <= 0:
                     continue
-                ax.broken_barh(
-                    [((start - min_start) / factor, duration / factor)],
-                    (y, height),
-                    facecolors=color,
-                    edgecolors="none",
-                    linewidth=0.0,
-                )
+                bars.append(((start - min_start) / factor, duration / factor))
+            add_bar_collection(ax, bars, y, height, color)
     else:
         ax.text(
             0.5,
@@ -384,18 +434,17 @@ def plot_compute_axis(
     height = 4
     gap = 3
 
-    for idx, (thread_id, segs) in enumerate(sorted(segments.items())):
+    compact_segments = merge_adjacent_segments(segments)
+
+    for idx, (thread_id, segs) in enumerate(sorted(compact_segments.items())):
         y = idx * (height + gap) + y_base
         y_ticks.append(y + height / 2)
         y_labels.append(str(thread_id))
+        bars_by_label: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
         for start_ns, dur_ns, label in segs:
-            ax.broken_barh(
-                [((start_ns - min_start) / factor, dur_ns / factor)],
-                (y, height),
-                facecolors=colors.get(label, "#999999"),
-                edgecolors="none",
-                linewidth=0.0,
-            )
+            bars_by_label[label].append(((start_ns - min_start) / factor, dur_ns / factor))
+        for label, bars in bars_by_label.items():
+            add_bar_collection(ax, bars, y, height, colors.get(label, "#999999"))
 
     ax.set_xlabel(f"Time ({unit}) relative to first event")
     ax.set_yticks(y_ticks)

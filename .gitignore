@@ -6,3 +6,4 @@ data/
 **/scratch_space/
 **/__pycache__/
 eventlog/*.csv
+experiments/**/tmp/

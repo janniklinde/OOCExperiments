@@ -400,7 +400,6 @@ def plot_compute_axis(
     ax.set_xlabel(f"Time ({unit}) relative to first event")
     ax.set_yticks(y_ticks)
     ax.set_yticklabels(y_labels)
-    ax.set_title("Thread timelines")
     span = max_end - min_start
     margin = span * 0.02 if span > 0 else 1.0
     ax.set_xlim(0, (span + margin) / factor)
@@ -422,7 +421,7 @@ def plot_compute_axis(
             handles=handles,
             title="CallerID",
             loc="upper center",
-            bbox_to_anchor=(0.5, -0.18),
+            bbox_to_anchor=(0.5, -0.05),
             ncol=4,
             frameon=False,
         )

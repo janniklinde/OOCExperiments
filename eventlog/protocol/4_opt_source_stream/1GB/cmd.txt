@@ -1,0 +1,1 @@
+java -Xmx1g -Xms1g --add-modules=jdk.incubator.vector -jar $HOME/Dev/systemds/target/SystemDS.jar -f  exp.dml -exec singlenode -config ./config.xml -ooc -oocStats -oocLogEvents -explain hops -stats -args 1000000 1000 1.0 "../../data/"

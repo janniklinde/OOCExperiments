@@ -1,0 +1,7 @@
+Repo:   https://github.com/janniklinde/systemds
+Tag:    bench/opt-source-stream-2025-12-19
+Commit: 69a4fda7b04e0e098d5635bc4945404855a89320
+Link:   https://github.com/janniklinde/systemds/releases/tag/bench%2Fopt-source-stream-2025-12-19
+Exp:    experiments/pca
+
+Added source stream to avoid eviction on disk backed tiles + parallel OOCReblock

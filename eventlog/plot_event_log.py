@@ -34,6 +34,9 @@ CacheSample = Tuple[int, int, int]  # timestamp_ns, scheduled_eviction_size, cac
 # Minimum cumulative duration (in nanoseconds) required for a caller to appear in the legend.
 LEGEND_MIN_DURATION_NS = 20_000_000  # 20 ms
 
+# Two distinct blues used to separate Disk Read callers for clarity.
+DISK_READ_CALLER_COLORS = ["#1f77b4", "#6aaed6"]
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot compute/idle timeline per thread.")
@@ -315,11 +318,20 @@ def plot_disk_track(
     unit: str,
     label: str,
     color: str,
+    color_by_caller: bool = False,
 ) -> None:
     factor = unit_factor(unit)
     by_thread: Dict[int, List[TimeEntry]] = defaultdict(list)
     for ent in entries:
         by_thread[ent[0]].append(ent)
+
+    caller_colors: Dict[str, str] = {}
+    if color_by_caller and entries:
+        caller_ids = sorted({e[1] for e in entries})
+        palette = DISK_READ_CALLER_COLORS
+        cmap = plt.get_cmap("tab20")
+        for idx, caller in enumerate(caller_ids):
+            caller_colors[caller] = palette[idx] if idx < len(palette) else cmap(idx % cmap.N)
 
     y_ticks: List[float] = []
     y_labels: List[str] = []
@@ -334,13 +346,14 @@ def plot_disk_track(
             y = idx * (height + gap) + y_base
             y_ticks.append(y + height / 2)
             y_labels.append(str(thread_id))
-            bars = []
-            for _, _, start, end in sorted(thread_entries, key=lambda e: e[2]):
+            bars_by_caller: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
+            for _, caller, start, end in sorted(thread_entries, key=lambda e: e[2]):
                 duration = end - start
                 if duration <= 0:
                     continue
-                bars.append(((start - min_start) / factor, duration / factor))
-            add_bar_collection(ax, bars, y, height, color)
+                bars_by_caller[caller].append(((start - min_start) / factor, duration / factor))
+            for caller, bars in bars_by_caller.items():
+                add_bar_collection(ax, bars, y, height, caller_colors.get(caller, color))
     else:
         ax.text(
             0.5,
@@ -363,6 +376,20 @@ def plot_disk_track(
     ax.grid(True, axis="x", linestyle="--", alpha=0.3)
     ax.spines["right"].set_visible(False)
     ax.spines["top"].set_visible(False)
+    if color_by_caller and caller_colors:
+        handles = [
+            Patch(facecolor=caller_colors[caller], edgecolor="none", label=caller)
+            for caller in caller_colors
+        ]
+        ax.legend(
+            handles=handles,
+            loc="upper right",
+            frameon=True,
+            facecolor="white",
+            framealpha=0.82,
+            fontsize=8,
+            title="CallerID",
+        )
 
 
 def plot_cache_track(
@@ -490,8 +517,8 @@ def plot_timeline(
     output: Optional[Path],
 ) -> None:
     disk_tracks = [
-        ("Disk Reads", disk_reads, "#1f77b4"),
-        ("Disk Writes", disk_writes, "#ff7f0e"),
+        ("Disk Reads", disk_reads, "#1f77b4", True),
+        ("Disk Writes", disk_writes, "#ff7f0e", False),
     ]
     compute_ratio = max(3.0, 0.7 * len(segments))
     cache_ratio = 2.2
@@ -519,8 +546,16 @@ def plot_timeline(
     plot_cache_track(cache_ax, cache_samples, min_start, unit, cache_soft_limit, cache_hard_limit)
     cache_ax.tick_params(labelbottom=False)
 
-    for idx, (label, entries, color) in enumerate(disk_tracks, start=1):
-        plot_disk_track(axes_list[idx], entries, min_start, unit, label, color)
+    for idx, (label, entries, color, color_by_caller) in enumerate(disk_tracks, start=1):
+        plot_disk_track(
+            axes_list[idx],
+            entries,
+            min_start,
+            unit,
+            label,
+            color,
+            color_by_caller=color_by_caller,
+        )
         axes_list[idx].tick_params(labelbottom=False)
 
     compute_ax = axes_list[-1]

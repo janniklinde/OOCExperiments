@@ -1,0 +1,16 @@
+rownum = $1;
+colnum = $2;
+spar = $3;
+data_dir = $4;
+
+# Read the input matrix as a stream
+X = read(data_dir + "mat_"+ rownum + "x" + colnum + "s" + spar + "_1", format="binary");
+Y = read(data_dir + "mat_"+ rownum + "x" + colnum + "s" + spar + "_2", format="binary");
+
+for (i in 1:15) {
+    X = X * Y / X + X - Y * X;
+    X = X * 5;
+}
+
+print("Res: " + contains(target=X, pattern=0))
+#write(res, $3, format="binary");

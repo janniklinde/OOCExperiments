@@ -7,7 +7,7 @@ confs=(../../sysds_*.conf)
 # header
 echo "mode,conf,rep1,rep2,rep3" > results.csv
 
-modes=("cp" "ooc")
+modes=("cp" "ooc" "HYBRID")
 
 for conf in "${confs[@]}"; do
   # load this config
@@ -22,46 +22,81 @@ for conf in "${confs[@]}"; do
     for rep in {1..1}; do
       start=$(date +%s%N)
 
-      # pick jar + optional flag
-      if [[ $mode == "ooc" ]]; then
-        jar="$SYSDS_JAR_OOC"
-        oocflag="-ooc"
-      else
-        jar="$SYSDS_JAR_CP"
-        oocflag=""
-      fi
-
       file=./exp.dml
 
-      cmd=(
-        "${SYSDS_CMD_COMMON[@]}"
-        "$jar"
-        -f "$file"
-        -exec singlenode
-        -config ./config.xml
-      )
+      if [[ $mode == "HYBRID" ]]; then
+        # Run exactly the tested local hybrid SystemDS wrapper invocation.
+        hybrid_opts="-Xmx10g -Xms10g -Xmn1000m \
+--add-opens=java.base/java.nio=ALL-UNNAMED \
+--add-opens=java.base/java.io=ALL-UNNAMED \
+--add-opens=java.base/java.util=ALL-UNNAMED \
+--add-opens=java.base/java.lang=ALL-UNNAMED \
+--add-opens=java.base/java.lang.ref=ALL-UNNAMED \
+--add-opens=java.base/java.lang.invoke=ALL-UNNAMED \
+--add-opens=java.base/java.util.concurrent=ALL-UNNAMED \
+--add-opens=java.base/sun.nio.ch=ALL-UNNAMED \
+-Dspark.master=local[*] \
+-Dspark.app.name=SystemDS-local"
 
-      if [[ -n $oocflag ]]; then
-        cmd+=("$oocflag")
-      fi
+        cmd=( systemds "$file" -explain -args 1000000 1000 1.0 "../../data/" )
 
-      # args (keep as in your script)
-      cmd+=( -explain hops -stats -args 1000000 1000 1.0 "../../data/" )
-
-      printf 'RUN CMD (%s %s): %q ' "$cfg" "$mode" "${cmd[@]}"; echo
-      if output=$("${cmd[@]}" 2>&1); then
-        echo "$output"
-        exec_time=$(echo "$output" | grep -oP 'Total execution time:\s*\K[0-9.]+')
-        result=$(echo "$output" | grep -oP 'Result:\s*\K[-+0-9.eE]+')
-        [[ -z $exec_time ]] && exec_time="nan"
-        [[ -z $result ]] && result="nan"
-        status="ok"
+        printf 'RUN CMD (%s %s): SYSTEMDS_STANDALONE_OPTS="%s" SYSDS_DISTRIBUTED=0 SYSDS_EXEC_MODE=hybrid %q ' \
+          "$cfg" "$mode" "$hybrid_opts" "${cmd[@]}"
+        echo
+        if output=$(SYSTEMDS_STANDALONE_OPTS="$hybrid_opts" SYSDS_DISTRIBUTED=0 SYSDS_EXEC_MODE=hybrid "${cmd[@]}" 2>&1); then
+          echo "$output"
+          exec_time=$(echo "$output" | grep -oP 'Total execution time:\s*\K[0-9.]+')
+          result=$(echo "$output" | grep -oP 'Result:\s*\K[-+0-9.eE]+')
+          [[ -z $exec_time ]] && exec_time="nan"
+          [[ -z $result ]] && result="nan"
+          status="ok"
+        else
+          echo "$output" >&2
+          echo "Run failed (cfg: $cfg mode: $mode rep: $rep); storing nan" >&2
+          exec_time="nan"
+          result="nan"
+          status="failed"
+        fi
       else
-        echo "$output" >&2
-        echo "Run failed (cfg: $cfg mode: $mode rep: $rep); storing nan" >&2
-        exec_time="nan"
-        result="nan"
-        status="failed"
+        # pick jar + optional flag
+        if [[ $mode == "ooc" ]]; then
+          jar="$SYSDS_JAR_OOC"
+          oocflags=(-ooc -oocStats -oocLogEvents)
+        else
+          jar="$SYSDS_JAR_CP"
+          oocflags=()
+        fi
+
+        cmd=(
+          "${SYSDS_CMD_COMMON[@]}"
+          "$jar"
+          -f "$file"
+          -exec singlenode
+          -config ./config.xml
+        )
+
+        if ((${#oocflags[@]})); then
+          cmd+=("${oocflags[@]}")
+        fi
+
+        # args (keep as in your script)
+        cmd+=( -explain -stats -args 1000000 1000 1.0 "../../data/" )
+
+        printf 'RUN CMD (%s %s): %q ' "$cfg" "$mode" "${cmd[@]}"; echo
+        if output=$("${cmd[@]}" 2>&1); then
+          echo "$output"
+          exec_time=$(echo "$output" | grep -oP 'Total execution time:\s*\K[0-9.]+')
+          result=$(echo "$output" | grep -oP 'Result:\s*\K[-+0-9.eE]+')
+          [[ -z $exec_time ]] && exec_time="nan"
+          [[ -z $result ]] && result="nan"
+          status="ok"
+        else
+          echo "$output" >&2
+          echo "Run failed (cfg: $cfg mode: $mode rep: $rep); storing nan" >&2
+          exec_time="nan"
+          result="nan"
+          status="failed"
+        fi
       fi
 
       end=$(date +%s%N)

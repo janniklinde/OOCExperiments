@@ -7,7 +7,7 @@ confs=(../../sysds_*.conf)
 # header
 echo "mode,conf,rep1,rep2,rep3" > results.csv
 
-modes=("cp" "ooc" "HYBRID")
+modes=("cp" "ooc" "HYBRID" "SPARK")
 
 for conf in "${confs[@]}"; do
   # load this config
@@ -24,7 +24,15 @@ for conf in "${confs[@]}"; do
 
       file=./exp.dml
 
-      if [[ $mode == "HYBRID" ]]; then
+      if [[ $mode == "HYBRID" || $mode == "SPARK" ]]; then
+        if [[ $mode == "HYBRID" ]]; then
+          exec_mode="hybrid"
+          app_name="SystemDS-local-hybrid"
+        else
+          exec_mode="spark"
+          app_name="SystemDS-local-spark"
+        fi
+
         # Reuse per-config JVM sizing from SYSDS_CMD_COMMON
         # (strip leading "java" and trailing "-jar" from that array).
         hybrid_base_opts=("${SYSDS_CMD_COMMON[@]}")
@@ -46,7 +54,7 @@ for conf in "${confs[@]}"; do
           --add-opens=java.base/java.util.concurrent=ALL-UNNAMED
           --add-opens=java.base/sun.nio.ch=ALL-UNNAMED
           -Dspark.master=local[*]
-          -Dspark.app.name=SystemDS-local
+          -Dspark.app.name=$app_name
         )
 
         printf -v hybrid_opts '%s ' "${hybrid_all_opts[@]}"
@@ -54,10 +62,10 @@ for conf in "${confs[@]}"; do
 
         cmd=( systemds "$file" -explain -args 1000000 1000 1.0 "../../data/" )
 
-        printf 'RUN CMD (%s %s): SYSTEMDS_STANDALONE_OPTS="%s" SYSDS_DISTRIBUTED=0 SYSDS_EXEC_MODE=hybrid %q ' \
-          "$cfg" "$mode" "$hybrid_opts" "${cmd[@]}"
+        printf 'RUN CMD (%s %s): SYSTEMDS_STANDALONE_OPTS="%s" SYSDS_DISTRIBUTED=0 SYSDS_EXEC_MODE=%s %q ' \
+          "$cfg" "$mode" "$hybrid_opts" "$exec_mode" "${cmd[@]}"
         echo
-        if output=$(SYSTEMDS_STANDALONE_OPTS="$hybrid_opts" SYSDS_DISTRIBUTED=0 SYSDS_EXEC_MODE=hybrid "${cmd[@]}" 2>&1); then
+        if output=$(SYSTEMDS_STANDALONE_OPTS="$hybrid_opts" SYSDS_DISTRIBUTED=0 SYSDS_EXEC_MODE="$exec_mode" "${cmd[@]}" 2>&1); then
           echo "$output"
           exec_time=$(echo "$output" | grep -oP 'Total execution time:\s*\K[0-9.]+')
           result=$(echo "$output" | grep -oP 'Result:\s*\K[-+0-9.eE]+')

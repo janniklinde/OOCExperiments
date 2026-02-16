@@ -18,6 +18,14 @@ for conf in "${confs[@]}"; do
   cfg="${SYSDS_CONFIG_NAME:-$(basename "$conf" .conf)}"
 
   for mode in "${modes[@]}"; do
+    # Common script args:
+    # 1=rownum 2=colnum 3=sparsity 4=data_dir 5=optional write path
+    run_args=(1000000 1000 1.0 "../../data/" "out")
+    out_path=""
+    if [[ ${#run_args[@]} -ge 5 ]]; then
+      out_path="${run_args[4]}"
+    fi
+
     row="$mode,$cfg"
     for rep in {1..1}; do
       start=$(date +%s%N)
@@ -60,7 +68,7 @@ for conf in "${confs[@]}"; do
         printf -v hybrid_opts '%s ' "${hybrid_all_opts[@]}"
         hybrid_opts="${hybrid_opts% }"
 
-        cmd=( systemds "$file" -explain -args 1000000 1000 1.0 "../../data/" )
+        cmd=( systemds "$file" -explain -args "${run_args[@]}" )
 
         printf 'RUN CMD (%s %s): SYSTEMDS_STANDALONE_OPTS="%s" SYSDS_DISTRIBUTED=0 SYSDS_EXEC_MODE=%s %q ' \
           "$cfg" "$mode" "$hybrid_opts" "$exec_mode" "${cmd[@]}"
@@ -102,7 +110,7 @@ for conf in "${confs[@]}"; do
         fi
 
         # args (keep as in your script)
-        cmd+=( -explain -stats -args 1000000 1000 1.0 "../../data/" )
+        cmd+=( -explain -stats -args "${run_args[@]}" )
 
         printf 'RUN CMD (%s %s): %q ' "$cfg" "$mode" "${cmd[@]}"; echo
         if output=$("${cmd[@]}" 2>&1); then
@@ -127,6 +135,13 @@ for conf in "${confs[@]}"; do
       row="$row,$exec_time"
       echo "ExecTime: $exec_time ms(raw: $dur_ms) [$status]"
       echo "Result: $result"
+
+      # Cleanup optional output target and its metadata sidecar.
+      if [[ -n "$out_path" && "$out_path" != "/" && "$out_path" != "." ]]; then
+        [[ -e "$out_path" ]] && rm -rf "$out_path"
+        [[ -e "${out_path}.mtd" ]] && rm -f "${out_path}.mtd"
+      fi
+
       rm -r ./tmp
       rm -r ./scratch_space
     done

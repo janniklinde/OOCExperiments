@@ -25,18 +25,32 @@ for conf in "${confs[@]}"; do
       file=./exp.dml
 
       if [[ $mode == "HYBRID" ]]; then
-        # Run exactly the tested local hybrid SystemDS wrapper invocation.
-        hybrid_opts="-Xmx10g -Xms10g -Xmn1000m \
---add-opens=java.base/java.nio=ALL-UNNAMED \
---add-opens=java.base/java.io=ALL-UNNAMED \
---add-opens=java.base/java.util=ALL-UNNAMED \
---add-opens=java.base/java.lang=ALL-UNNAMED \
---add-opens=java.base/java.lang.ref=ALL-UNNAMED \
---add-opens=java.base/java.lang.invoke=ALL-UNNAMED \
---add-opens=java.base/java.util.concurrent=ALL-UNNAMED \
---add-opens=java.base/sun.nio.ch=ALL-UNNAMED \
--Dspark.master=local[*] \
--Dspark.app.name=SystemDS-local"
+        # Reuse per-config JVM sizing from SYSDS_CMD_COMMON
+        # (strip leading "java" and trailing "-jar" from that array).
+        hybrid_base_opts=("${SYSDS_CMD_COMMON[@]}")
+        if [[ ${#hybrid_base_opts[@]} -gt 0 && ${hybrid_base_opts[0]} == "java" ]]; then
+          hybrid_base_opts=("${hybrid_base_opts[@]:1}")
+        fi
+        if [[ ${#hybrid_base_opts[@]} -gt 0 && ${hybrid_base_opts[-1]} == "-jar" ]]; then
+          unset 'hybrid_base_opts[-1]'
+        fi
+
+        hybrid_all_opts=(
+          "${hybrid_base_opts[@]}"
+          --add-opens=java.base/java.nio=ALL-UNNAMED
+          --add-opens=java.base/java.io=ALL-UNNAMED
+          --add-opens=java.base/java.util=ALL-UNNAMED
+          --add-opens=java.base/java.lang=ALL-UNNAMED
+          --add-opens=java.base/java.lang.ref=ALL-UNNAMED
+          --add-opens=java.base/java.lang.invoke=ALL-UNNAMED
+          --add-opens=java.base/java.util.concurrent=ALL-UNNAMED
+          --add-opens=java.base/sun.nio.ch=ALL-UNNAMED
+          -Dspark.master=local[*]
+          -Dspark.app.name=SystemDS-local
+        )
+
+        printf -v hybrid_opts '%s ' "${hybrid_all_opts[@]}"
+        hybrid_opts="${hybrid_opts% }"
 
         cmd=( systemds "$file" -explain -args 1000000 1000 1.0 "../../data/" )
 

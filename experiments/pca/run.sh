@@ -64,7 +64,7 @@ for conf in "${confs[@]}"; do
         printf -v hybrid_opts '%s ' "${hybrid_all_opts[@]}"
         hybrid_opts="${hybrid_opts% }"
 
-        cmd=( systemds "$file" -explain -stats -args "${run_args[@]}" )
+        cmd=( systemds "$file" -args "${run_args[@]}" )
 
         printf '%q ' env SYSTEMDS_STANDALONE_OPTS="$hybrid_opts" SYSDS_DISTRIBUTED=0 SYSDS_EXEC_MODE="$exec_mode" "${cmd[@]}"
         echo
@@ -86,7 +86,7 @@ for conf in "${confs[@]}"; do
         # pick jar + optional flags
         if [[ $mode == "ooc" ]]; then
           jar="$SYSDS_JAR_OOC"
-          oocflags=(-ooc -oocStats)
+          oocflags=(-ooc)
         else
           jar="$SYSDS_JAR_CP"
           oocflags=()

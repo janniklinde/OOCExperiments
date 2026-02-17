@@ -91,7 +91,7 @@ for conf in "${confs[@]}"; do
         # pick jar + optional flag
         if [[ $mode == "ooc" ]]; then
           jar="$SYSDS_JAR_OOC"
-          oocflags=(-ooc -oocStats -oocLogEvents)
+          oocflags=(-ooc -oocStats)
         else
           jar="$SYSDS_JAR_CP"
           oocflags=()

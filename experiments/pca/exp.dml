@@ -31,10 +31,10 @@ k = 16;
 
 [PC, V] = pca(X=X, K=k)
 
-#write(PC, "out/PC", format="binary")
-#write(V, "out/V", format="binary")
+write(PC, "out/PC", format="binary")
+write(V, "out/V", format="binary")
 
-print("Result: " + toString(PC[1, 1]));
+#print("Result: " + toString(PC[1, 1]));
 total_time = time() - start;
 total_time = total_time / 1000000;
 print("Completed in " + total_time + "ms");

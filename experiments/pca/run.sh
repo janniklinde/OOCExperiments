@@ -131,6 +131,9 @@ for conf in "${confs[@]}"; do
       echo "ExecTime: $exec_time ms(raw: $dur_ms) [$status]"
       echo "Result: $result"
 
+      if [[ -d ./out ]]; then
+        find ./out -mindepth 1 -exec rm -rf -- {} +
+      fi
       rm -rf ./tmp
       rm -rf ./scratch_space
     done

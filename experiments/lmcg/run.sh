@@ -70,10 +70,9 @@ for conf in "${confs[@]}"; do
 
         cmd=( systemds "$file" -explain -args "${run_args[@]}" )
 
-        printf 'RUN CMD (%s %s): SYSTEMDS_STANDALONE_OPTS="%s" SYSDS_DISTRIBUTED=0 SYSDS_EXEC_MODE=%s %q ' \
-          "$cfg" "$mode" "$hybrid_opts" "$exec_mode" "${cmd[@]}"
+        printf '%q ' env SYSTEMDS_STANDALONE_OPTS="$hybrid_opts" SYSDS_DISTRIBUTED=0 SYSDS_EXEC_MODE="$exec_mode" "${cmd[@]}"
         echo
-        if output=$(SYSTEMDS_STANDALONE_OPTS="$hybrid_opts" SYSDS_DISTRIBUTED=0 SYSDS_EXEC_MODE="$exec_mode" "${cmd[@]}" 2>&1); then
+        if output=$(env SYSTEMDS_STANDALONE_OPTS="$hybrid_opts" SYSDS_DISTRIBUTED=0 SYSDS_EXEC_MODE="$exec_mode" "${cmd[@]}" 2>&1); then
           echo "$output"
           exec_time=$(echo "$output" | grep -oP 'Total execution time:\s*\K[0-9.]+')
           result=$(echo "$output" | grep -oP 'Result:\s*\K[-+0-9.eE]+')
@@ -112,7 +111,8 @@ for conf in "${confs[@]}"; do
         # args (keep as in your script)
         cmd+=( -explain -stats -args "${run_args[@]}" )
 
-        printf 'RUN CMD (%s %s): %q ' "$cfg" "$mode" "${cmd[@]}"; echo
+        printf '%q ' "${cmd[@]}"
+        echo
         if output=$("${cmd[@]}" 2>&1); then
           echo "$output"
           exec_time=$(echo "$output" | grep -oP 'Total execution time:\s*\K[0-9.]+')

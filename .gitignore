@@ -12,3 +12,4 @@ experiments/**/DiskReadEventLog.csv
 experiments/**/DiskWriteEventLog.csv
 experiments/**/RunSettings.csv
 experiments/**/tmp/
+experiments/message_passing/

@@ -104,7 +104,7 @@ for conf in "${confs[@]}"; do
           cmd+=("${oocflags[@]}")
         fi
 
-        cmd+=( -explain -stats -args "${run_args[@]}" )
+        cmd+=( -args "${run_args[@]}" )
 
         printf '%q ' "${cmd[@]}"
         echo

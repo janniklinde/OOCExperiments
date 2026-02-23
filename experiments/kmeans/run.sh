@@ -23,6 +23,10 @@ for conf in "${confs[@]}"; do
       start=$(date +%s%N)
 
       file=./exp.dml
+      config_args=()
+      if [[ -f ./config.xml ]]; then
+        config_args=(-config ./config.xml)
+      fi
 
       if [[ $mode == "HYBRID" || $mode == "SPARK" ]]; then
         if [[ $mode == "HYBRID" ]]; then
@@ -60,7 +64,7 @@ for conf in "${confs[@]}"; do
         printf -v hybrid_opts '%s ' "${hybrid_all_opts[@]}"
         hybrid_opts="${hybrid_opts% }"
 
-        cmd=( systemds "$file" )
+        cmd=( systemds "$file" "${config_args[@]}" )
 
         printf '%q ' env SYSTEMDS_STANDALONE_OPTS="$hybrid_opts" SYSDS_DISTRIBUTED=0 SYSDS_EXEC_MODE="$exec_mode" "${cmd[@]}"
         echo
@@ -93,11 +97,8 @@ for conf in "${confs[@]}"; do
           "$jar"
           -f "$file"
           -exec singlenode
+          "${config_args[@]}"
         )
-
-        if [[ -f ./config.xml ]]; then
-          cmd+=( -config ./config.xml )
-        fi
 
         if ((${#oocflags[@]})); then
           cmd+=("${oocflags[@]}")

@@ -1,0 +1,53 @@
+# Positional args:
+# $1: rownum
+# $2: colnum
+# $3: num_blobs (k)
+# $4: sparsity (0..1)
+# $5: noise_sd
+# $6: seed
+# $7: output_base (e.g., ./data/blobs/8gb)
+
+rownum = as.integer($1);
+colnum = as.integer($2);
+num_blobs = as.integer($3);
+spar = $4;
+noise_sd = $5;
+seed = as.integer($6);
+out_base = $7;
+
+# Blob centers
+C = rand(rows = num_blobs, cols = colnum, min = 0, max = 1, pdf = "uniform", seed = seed);
+
+# Random cluster assignment in [1, num_blobs]
+Y = floor(rand(rows = rownum, cols = 1, min = 1, max = num_blobs + 1, pdf = "uniform", seed = seed + 1));
+Y = ifelse(Y < 1, 1, Y);
+Y = ifelse(Y > num_blobs, num_blobs, Y);
+
+# One-hot assignment matrix, then synthesize clustered data
+P = table(seq(1, rownum, 1), Y, rownum, num_blobs);
+X = P %*% C + noise_sd * rand(rows = rownum, cols = colnum, pdf = "normal", seed = seed + 2);
+
+# Optional sparsification for benchmarking sparse kmeans scenarios
+if (spar < 1) {
+  M = rand(rows = rownum, cols = colnum, min = 0, max = 1, pdf = "uniform", seed = seed + 3) <= spar;
+  X = X * M;
+}
+
+if (out_base == "") {
+  base = "data/blobs_" + rownum + "x" + colnum + "k" + num_blobs + "s" + $4 + "n" + $5 + "_seed" + seed;
+}
+else {
+  base = out_base;
+}
+pathX = base + "_X";
+pathC = base + "_C";
+pathY = base + "_Y";
+
+write(X, pathX, format = "binary");
+write(C, pathC, format = "binary");
+write(Y, pathY, format = "binary");
+
+print("Blob data written to:");
+print("  X: " + pathX);
+print("  C: " + pathC);
+print("  Y: " + pathY);

@@ -21,7 +21,7 @@
 
 X = read("../../data/blobs/8gb_X");
 k = 32;
-runs = 3;
+runs = 1;
 max_iter = 30;
 seed = 7;
 

@@ -26,4 +26,5 @@ max_iter = 30;
 seed = 7;
 
 [C, Y] = kmeans(X = X, k = k, runs = runs, max_iter = max_iter, eps = 1e-4, seed = seed);
-write(C, "out", format = "binary");
+write(C, "outC", format = "binary");
+write(Y, "outY", format = "binary");

@@ -14,6 +14,8 @@ modes=("cp" "ooc" "HYBRID" "SPARK")
 : "${SYSDS_SPARK_DRIVER_MEM_FRAC:=0.80}"
 : "${SYSDS_SPARK_MEM_FRACTION:=0.70}"
 : "${SYSDS_SPARK_STORAGE_FRACTION:=0.60}"
+: "${SYSDS_LOCAL_BUDGET_FRAC:=0.20}"
+: "${SYSDS_LOCAL_BUDGET_MB:=}"
 : "${SYSDS_RUN_TIMEOUT_SEC:=200}"
 : "${SYSDS_SKIP_TOKEN:=skip}"
 
@@ -31,6 +33,84 @@ get_xmx_mb() {
     fi
   done
   echo 1024
+}
+
+mem_value_to_mb() {
+  local v n u
+  v="${1:-}"
+  if [[ $v =~ ^([0-9]+)([gGmMkK])?$ ]]; then
+    n="${BASH_REMATCH[1]}"
+    u="${BASH_REMATCH[2]:-m}"
+    case "$u" in
+      g|G) echo $((n * 1024)); return 0 ;;
+      m|M) echo "$n"; return 0 ;;
+      k|K) echo $((n / 1024)); return 0 ;;
+    esac
+  fi
+  return 1
+}
+
+calc_spark_local_budgets_mb() {
+  local xmx_mb local_target_mb
+  xmx_mb="$1"
+
+  if [[ -n ${SYSDS_LOCAL_BUDGET_MB:-} ]]; then
+    local_target_mb="$(mem_value_to_mb "$SYSDS_LOCAL_BUDGET_MB" || true)"
+  fi
+  if [[ -z ${local_target_mb:-} ]]; then
+    local_target_mb="$(awk -v x="$xmx_mb" -v f="$SYSDS_LOCAL_BUDGET_FRAC" 'BEGIN{
+      v = x * f;
+      if (v < 256) v = 256;
+      printf "%d", v;
+    }')"
+  fi
+
+  read -r spark_exec_mb spark_driver_mb sysds_local_budget_mb <<<"$(awk -v x="$xmx_mb" -v ef="$SYSDS_SPARK_EXEC_MEM_FRAC" -v df="$SYSDS_SPARK_DRIVER_MEM_FRAC" -v lb="$local_target_mb" 'BEGIN{
+    minE=1024; minD=1024; minL=256;
+    hardE=256; hardD=256; hardL=128;
+
+    e = int(x * ef);
+    d = int(x * df);
+    l = int(lb);
+
+    if (e < minE) e = minE;
+    if (d < minD) d = minD;
+    if (l < minL) l = minL;
+
+    sum = e + d + l;
+    if (sum > x) {
+      scale = x / sum;
+      e = int(e * scale);
+      d = int(d * scale);
+      l = int(l * scale);
+      if (e < minE) e = minE;
+      if (d < minD) d = minD;
+      if (l < minL) l = minL;
+    }
+
+    sum = e + d + l;
+    while (sum > x) {
+      if (l > minL) { l--; sum--; continue; }
+      if (e >= d && e > minE) { e--; sum--; continue; }
+      if (d > minD) { d--; sum--; continue; }
+      if (e > minE) { e--; sum--; continue; }
+      if (l > hardL) { l--; sum--; continue; }
+      if (e >= d && e > hardE) { e--; sum--; continue; }
+      if (d > hardD) { d--; sum--; continue; }
+      break;
+    }
+
+    if (e < hardE) e = hardE;
+    if (d < hardD) d = hardD;
+    if (l < hardL) l = hardL;
+
+    if (e + d + l > x) {
+      l = x - e - d;
+      if (l < hardL) l = hardL;
+    }
+
+    printf "%d %d %d", e, d, l;
+  }')"
 }
 
 SKIP_HINT_SHOWN=0
@@ -150,16 +230,7 @@ for conf in "${confs[@]}"; do
         fi
 
         xmx_mb="$(get_xmx_mb "${SYSDS_CMD_COMMON[@]}")"
-        spark_exec_mb="$(awk -v x="$xmx_mb" -v f="$SYSDS_SPARK_EXEC_MEM_FRAC" 'BEGIN{
-          v = x * f;
-          if (v < 1024) v = 1024;
-          printf "%d", v;
-        }')"
-        spark_driver_mb="$(awk -v x="$xmx_mb" -v f="$SYSDS_SPARK_DRIVER_MEM_FRAC" 'BEGIN{
-          v = x * f;
-          if (v < 1024) v = 1024;
-          printf "%d", v;
-        }')"
+        calc_spark_local_budgets_mb "$xmx_mb"
         spark_mem_fraction="$(awk -v f="$SYSDS_SPARK_MEM_FRACTION" 'BEGIN{
           if (f <= 0.01) f = 0.01;
           if (f >= 0.99) f = 0.99;
@@ -192,7 +263,7 @@ for conf in "${confs[@]}"; do
         printf -v hybrid_opts '%s ' "${hybrid_all_opts[@]}"
         hybrid_opts="${hybrid_opts% }"
 
-        cmd=( systemds "$file" "${config_args[@]}" )
+        cmd=( systemds "$file" "${config_args[@]}" -local_budget "${sysds_local_budget_mb}m" -stats -explain )
 
         printf '%q ' env SYSTEMDS_STANDALONE_OPTS="$hybrid_opts" SYSDS_DISTRIBUTED=0 SYSDS_EXEC_MODE="$exec_mode" "${cmd[@]}"
         echo

@@ -24,16 +24,23 @@ colnum = $2;
 spar = $3;
 data_dir = $4;
 
+for(i in 1:3) {
+    X = read($4 + "mat_"+ $1 + "x" + $2 + "s" + $3 + "_1", format="binary");
+    k = 16;
+    [PC, V] = pca(X=X, K=k);
+    print(min(PC) + ", " + min(V));
+}
+
 start = time();
 
-X = read($4 + "mat_"+ $1 + "x" + $2 + "s" + $3 + "_1", format="binary");
-k = 16;
+for(i in 1:3) {
+    X = read($4 + "mat_"+ $1 + "x" + $2 + "s" + $3 + "_1", format="binary");
+    k = 16;
+    [PC, V] = pca(X=X, K=k);
+    print(min(PC) + ", " + min(V));
+}
 
-[PC, V] = pca(X=X, K=k)
-
-print(min(PC) + ", " + min(V))
-
-while(FALSE){}
+while(FALSE) {}
 total_time = time() - start;
 total_time = total_time / 1000000;
 print("Completed in " + total_time + "ms");

@@ -10,8 +10,8 @@ echo "mode,conf,rep1,rep2,rep3" > results.csv
 modes=("cp" "ooc" "HYBRID" "SPARK")
 
 # reasonable Spark defaults (override in sysds_*.conf if needed)
-: "${SYSDS_SPARK_EXEC_MEM_FRAC:=0.85}"
-: "${SYSDS_SPARK_DRIVER_MEM_FRAC:=0.85}"
+: "${SYSDS_SPARK_EXEC_MEM_FRAC:=0.80}"
+: "${SYSDS_SPARK_DRIVER_MEM_FRAC:=0.80}"
 : "${SYSDS_SPARK_MEM_FRACTION:=0.70}"
 : "${SYSDS_SPARK_STORAGE_FRACTION:=0.60}"
 : "${SYSDS_RUN_TIMEOUT_SEC:=200}"
@@ -106,6 +106,11 @@ run_with_timeout_skip() {
   return 1
 }
 
+run_output_has_error_marker() {
+  local output_text="$1"
+  grep -qE 'An Error Occurred|DMLException' <<<"$output_text"
+}
+
 for conf in "${confs[@]}"; do
   # load this config
   # shellcheck disable=SC1090
@@ -151,12 +156,12 @@ for conf in "${confs[@]}"; do
         xmx_mb="$(get_xmx_mb "${SYSDS_CMD_COMMON[@]}")"
         spark_exec_mb="$(awk -v x="$xmx_mb" -v f="$SYSDS_SPARK_EXEC_MEM_FRAC" 'BEGIN{
           v = x * f;
-          if (v < 256) v = 256;
+          if (v < 1024) v = 1024;
           printf "%d", v;
         }')"
         spark_driver_mb="$(awk -v x="$xmx_mb" -v f="$SYSDS_SPARK_DRIVER_MEM_FRAC" 'BEGIN{
           v = x * f;
-          if (v < 256) v = 256;
+          if (v < 1024) v = 1024;
           printf "%d", v;
         }')"
         spark_mem_fraction="$(awk -v f="$SYSDS_SPARK_MEM_FRACTION" 'BEGIN{
@@ -197,6 +202,11 @@ for conf in "${confs[@]}"; do
         echo
         run_with_timeout_skip env SYSTEMDS_STANDALONE_OPTS="$hybrid_opts" SYSDS_DISTRIBUTED=0 SYSDS_EXEC_MODE="$exec_mode" "${cmd[@]}"
         output="$RUN_OUTPUT"
+        reported_error=0
+        if [[ $RUN_OUTCOME == "ok" ]] && run_output_has_error_marker "$output"; then
+          RUN_OUTCOME="failed"
+          reported_error=1
+        fi
         if [[ $RUN_OUTCOME == "ok" ]]; then
           echo "$output"
           exec_time=$(echo "$output" | grep -oP 'Total execution time:\s*\K[0-9.]+')
@@ -206,7 +216,9 @@ for conf in "${confs[@]}"; do
           status="ok"
         else
           [[ -n $output ]] && echo "$output" >&2
-          if [[ $RUN_OUTCOME == "timeout" ]]; then
+          if (( reported_error )); then
+            echo "Run reported DMLException/An Error Occurred (cfg: $cfg mode: $mode rep: $rep); storing nan" >&2
+          elif [[ $RUN_OUTCOME == "timeout" ]]; then
             echo "Run timed out after ${SYSDS_RUN_TIMEOUT_SEC}s (cfg: $cfg mode: $mode rep: $rep); storing nan" >&2
           elif [[ $RUN_OUTCOME == "skipped" ]]; then
             echo "Run skipped by user (cfg: $cfg mode: $mode rep: $rep); storing nan" >&2
@@ -246,6 +258,11 @@ for conf in "${confs[@]}"; do
         echo
         run_with_timeout_skip "${cmd[@]}"
         output="$RUN_OUTPUT"
+        reported_error=0
+        if [[ $RUN_OUTCOME == "ok" ]] && run_output_has_error_marker "$output"; then
+          RUN_OUTCOME="failed"
+          reported_error=1
+        fi
         if [[ $RUN_OUTCOME == "ok" ]]; then
           echo "$output"
           exec_time=$(echo "$output" | grep -oP 'Total execution time:\s*\K[0-9.]+')
@@ -255,7 +272,9 @@ for conf in "${confs[@]}"; do
           status="ok"
         else
           [[ -n $output ]] && echo "$output" >&2
-          if [[ $RUN_OUTCOME == "timeout" ]]; then
+          if (( reported_error )); then
+            echo "Run reported DMLException/An Error Occurred (cfg: $cfg mode: $mode rep: $rep); storing nan" >&2
+          elif [[ $RUN_OUTCOME == "timeout" ]]; then
             echo "Run timed out after ${SYSDS_RUN_TIMEOUT_SEC}s (cfg: $cfg mode: $mode rep: $rep); storing nan" >&2
           elif [[ $RUN_OUTCOME == "skipped" ]]; then
             echo "Run skipped by user (cfg: $cfg mode: $mode rep: $rep); storing nan" >&2

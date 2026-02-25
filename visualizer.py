@@ -3,8 +3,9 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import re
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 try:
     import matplotlib.pyplot as plt
@@ -75,9 +76,47 @@ def ordered_unique(values: Sequence[str]) -> List[str]:
     return ordered
 
 
+def _memory_conf_bytes(conf: str) -> Optional[float]:
+    units = {
+        "": 1.0,
+        "k": 1024.0,
+        "m": 1024.0**2,
+        "g": 1024.0**3,
+        "t": 1024.0**4,
+        "p": 1024.0**5,
+    }
+
+    # Prefer explicit JVM heap config like -Xmx4g when present.
+    xmx_match = re.search(r"-xmx\s*(\d+(?:\.\d+)?)\s*([kmgtp]?)(?:i?b)?", conf, flags=re.IGNORECASE)
+    match = xmx_match or re.search(
+        r"(?<![a-z0-9])(\d+(?:\.\d+)?)\s*([kmgtp]?)(?:i?b)?(?![a-z0-9])",
+        conf,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    value = float(match.group(1))
+    unit = match.group(2).lower()
+    return value * units[unit]
+
+
+def sort_jvm_memory_confs(confs: List[str]) -> List[str]:
+    indexed = list(enumerate(confs))
+
+    def conf_key(item: Tuple[int, str]) -> Tuple[int, float, int]:
+        idx, conf = item
+        bytes_value = _memory_conf_bytes(conf)
+        if bytes_value is None:
+            return (1, 0.0, idx)
+        return (0, bytes_value, idx)
+
+    return [conf for _, conf in sorted(indexed, key=conf_key)]
+
+
 def prepare_series(data: List[Tuple[str, str, float]]) -> Tuple[List[str], List[str], Dict[str, List[float]]]:
     modes = ordered_unique([mode for mode, _, _ in data])
-    confs = ordered_unique([conf for _, conf, _ in data])
+    confs = sort_jvm_memory_confs(ordered_unique([conf for _, conf, _ in data]))
 
     lookup: Dict[Tuple[str, str], float] = {}
     for mode, conf, value in data:
@@ -194,7 +233,7 @@ def create_plot(
     ax.grid(axis="y", linestyle="--", alpha=0.35)
     ax.grid(axis="x", visible=False)
 
-    ax.legend(frameon=False, ncol=2, loc="upper left")
+    ax.legend(frameon=False, ncol=2, loc="upper right")
 
     fig.tight_layout()
     output_stem.parent.mkdir(parents=True, exist_ok=True)

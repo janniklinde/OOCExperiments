@@ -9,8 +9,11 @@ echo "mode,conf,rep1,rep2,rep3" > results.csv
 
 modes=("cp" "ooc" "HYBRID" "SPARK")
 
-# fraction of -Xmx used as Spark min data budget
-: "${SYSDS_SPARK_BUDGET_FRAC:=0.30}"
+# reasonable Spark defaults (override in sysds_*.conf if needed)
+: "${SYSDS_SPARK_EXEC_MEM_FRAC:=0.85}"
+: "${SYSDS_SPARK_DRIVER_MEM_FRAC:=0.85}"
+: "${SYSDS_SPARK_MEM_FRACTION:=0.70}"
+: "${SYSDS_SPARK_STORAGE_FRACTION:=0.60}"
 
 get_xmx_mb() {
   local t n u
@@ -67,13 +70,25 @@ for conf in "${confs[@]}"; do
         fi
 
         xmx_mb="$(get_xmx_mb "${SYSDS_CMD_COMMON[@]}")"
-        spark_exec_mb="$xmx_mb"
-        spark_storage_fraction="1.0"
-        spark_mem_fraction="$(awk -v b="$SYSDS_SPARK_BUDGET_FRAC" -v x="$xmx_mb" 'BEGIN{
-          v = b * x / (x - 300);
-          if (v < 0.01) v = 0.01;
-          if (v > 1.00) v = 1.00;
-          printf "%.4f", v;
+        spark_exec_mb="$(awk -v x="$xmx_mb" -v f="$SYSDS_SPARK_EXEC_MEM_FRAC" 'BEGIN{
+          v = x * f;
+          if (v < 256) v = 256;
+          printf "%d", v;
+        }')"
+        spark_driver_mb="$(awk -v x="$xmx_mb" -v f="$SYSDS_SPARK_DRIVER_MEM_FRAC" 'BEGIN{
+          v = x * f;
+          if (v < 256) v = 256;
+          printf "%d", v;
+        }')"
+        spark_mem_fraction="$(awk -v f="$SYSDS_SPARK_MEM_FRACTION" 'BEGIN{
+          if (f <= 0.01) f = 0.01;
+          if (f >= 0.99) f = 0.99;
+          printf "%.4f", f;
+        }')"
+        spark_storage_fraction="$(awk -v s="$SYSDS_SPARK_STORAGE_FRACTION" 'BEGIN{
+          if (s <= 0.01) s = 0.01;
+          if (s >= 0.99) s = 0.99;
+          printf "%.4f", s;
         }')"
 
         hybrid_all_opts=(
@@ -89,6 +104,7 @@ for conf in "${confs[@]}"; do
           -Dspark.master=local[*]
           -Dspark.app.name=$app_name
           "-Dspark.executor.memory=${spark_exec_mb}m"
+          "-Dspark.driver.memory=${spark_driver_mb}m"
           "-Dspark.memory.fraction=${spark_mem_fraction}"
           "-Dspark.memory.storageFraction=${spark_storage_fraction}"
         )

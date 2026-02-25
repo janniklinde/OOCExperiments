@@ -14,6 +14,8 @@ modes=("cp" "ooc" "HYBRID" "SPARK")
 : "${SYSDS_SPARK_DRIVER_MEM_FRAC:=0.85}"
 : "${SYSDS_SPARK_MEM_FRACTION:=0.70}"
 : "${SYSDS_SPARK_STORAGE_FRACTION:=0.60}"
+: "${SYSDS_RUN_TIMEOUT_SEC:=200}"
+: "${SYSDS_SKIP_TOKEN:=skip}"
 
 get_xmx_mb() {
   local t n u
@@ -29,6 +31,79 @@ get_xmx_mb() {
     fi
   done
   echo 1024
+}
+
+SKIP_HINT_SHOWN=0
+RUN_OUTPUT=""
+RUN_OUTCOME=""
+
+run_with_timeout_skip() {
+  local log_file pid start_s now_s input rc
+  local -a run_cmd
+  run_cmd=("$@")
+  RUN_OUTPUT=""
+  RUN_OUTCOME="failed"
+
+  log_file="$(mktemp)"
+
+  if [[ -r /dev/tty && $SKIP_HINT_SHOWN -eq 0 ]]; then
+    echo "Run control: type '${SYSDS_SKIP_TOKEN}' + Enter to skip a run (timeout: ${SYSDS_RUN_TIMEOUT_SEC}s)." > /dev/tty
+    SKIP_HINT_SHOWN=1
+  fi
+
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "${run_cmd[@]}" >"$log_file" 2>&1 &
+  else
+    "${run_cmd[@]}" >"$log_file" 2>&1 &
+  fi
+  pid=$!
+  start_s=$(date +%s)
+
+  while kill -0 "$pid" 2>/dev/null; do
+    now_s=$(date +%s)
+    if (( now_s - start_s >= SYSDS_RUN_TIMEOUT_SEC )); then
+      kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+      sleep 1
+      kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      RUN_OUTPUT="$(cat "$log_file")"
+      rm -f "$log_file"
+      RUN_OUTCOME="timeout"
+      return 1
+    fi
+
+    if [[ -r /dev/tty ]]; then
+      if IFS= read -r -t 1 input < /dev/tty; then
+        if [[ "${input,,}" == "${SYSDS_SKIP_TOKEN,,}" ]]; then
+          kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+          sleep 1
+          kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          RUN_OUTPUT="$(cat "$log_file")"
+          rm -f "$log_file"
+          RUN_OUTCOME="skipped"
+          return 1
+        fi
+      fi
+    else
+      sleep 1
+    fi
+  done
+
+  if wait "$pid"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  RUN_OUTPUT="$(cat "$log_file")"
+  rm -f "$log_file"
+
+  if (( rc == 0 )); then
+    RUN_OUTCOME="ok"
+    return 0
+  fi
+  RUN_OUTCOME="failed"
+  return 1
 }
 
 for conf in "${confs[@]}"; do
@@ -116,7 +191,9 @@ for conf in "${confs[@]}"; do
 
         printf '%q ' env SYSTEMDS_STANDALONE_OPTS="$hybrid_opts" SYSDS_DISTRIBUTED=0 SYSDS_EXEC_MODE="$exec_mode" "${cmd[@]}"
         echo
-        if output=$(env SYSTEMDS_STANDALONE_OPTS="$hybrid_opts" SYSDS_DISTRIBUTED=0 SYSDS_EXEC_MODE="$exec_mode" "${cmd[@]}" 2>&1); then
+        run_with_timeout_skip env SYSTEMDS_STANDALONE_OPTS="$hybrid_opts" SYSDS_DISTRIBUTED=0 SYSDS_EXEC_MODE="$exec_mode" "${cmd[@]}"
+        output="$RUN_OUTPUT"
+        if [[ $RUN_OUTCOME == "ok" ]]; then
           echo "$output"
           exec_time=$(echo "$output" | grep -oP 'Total execution time:\s*\K[0-9.]+')
           result=$(echo "$output" | grep -oP 'Result:\s*\K[-+0-9.eE]+')
@@ -124,11 +201,17 @@ for conf in "${confs[@]}"; do
           [[ -z $result ]] && result="nan"
           status="ok"
         else
-          echo "$output" >&2
-          echo "Run failed (cfg: $cfg mode: $mode rep: $rep); storing nan" >&2
+          [[ -n $output ]] && echo "$output" >&2
+          if [[ $RUN_OUTCOME == "timeout" ]]; then
+            echo "Run timed out after ${SYSDS_RUN_TIMEOUT_SEC}s (cfg: $cfg mode: $mode rep: $rep); storing nan" >&2
+          elif [[ $RUN_OUTCOME == "skipped" ]]; then
+            echo "Run skipped by user (cfg: $cfg mode: $mode rep: $rep); storing nan" >&2
+          else
+            echo "Run failed (cfg: $cfg mode: $mode rep: $rep); storing nan" >&2
+          fi
           exec_time="nan"
           result="nan"
-          status="failed"
+          status="$RUN_OUTCOME"
         fi
       else
         # pick jar + optional flags
@@ -156,7 +239,9 @@ for conf in "${confs[@]}"; do
 
         printf '%q ' "${cmd[@]}"
         echo
-        if output=$("${cmd[@]}" 2>&1); then
+        run_with_timeout_skip "${cmd[@]}"
+        output="$RUN_OUTPUT"
+        if [[ $RUN_OUTCOME == "ok" ]]; then
           echo "$output"
           exec_time=$(echo "$output" | grep -oP 'Total execution time:\s*\K[0-9.]+')
           result=$(echo "$output" | grep -oP 'Result:\s*\K[-+0-9.eE]+')
@@ -164,11 +249,17 @@ for conf in "${confs[@]}"; do
           [[ -z $result ]] && result="nan"
           status="ok"
         else
-          echo "$output" >&2
-          echo "Run failed (cfg: $cfg mode: $mode rep: $rep); storing nan" >&2
+          [[ -n $output ]] && echo "$output" >&2
+          if [[ $RUN_OUTCOME == "timeout" ]]; then
+            echo "Run timed out after ${SYSDS_RUN_TIMEOUT_SEC}s (cfg: $cfg mode: $mode rep: $rep); storing nan" >&2
+          elif [[ $RUN_OUTCOME == "skipped" ]]; then
+            echo "Run skipped by user (cfg: $cfg mode: $mode rep: $rep); storing nan" >&2
+          else
+            echo "Run failed (cfg: $cfg mode: $mode rep: $rep); storing nan" >&2
+          fi
           exec_time="nan"
           result="nan"
-          status="failed"
+          status="$RUN_OUTCOME"
         fi
       fi
 

@@ -3,10 +3,14 @@ colnum = $2;
 spar = $3;
 data_dir = $4;
 
+t = time();
+
 # Read the input matrix as a stream
 X = read(data_dir + "mat_"+ rownum + "x" + colnum + "s" + spar + "_1", format="binary");
 y = read(data_dir + "mat_"+ rownum + "x1s" + spar + "_1", format="binary");
 
 out = lmCG(X = X, y = y, reg = 1e-12);
 
-write(out, $3, format="binary");
+write(out, "out/out", format="binary");
+t = (time() - t) / 1000000;
+print("Total execution time: " + t + "s");

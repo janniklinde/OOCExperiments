@@ -9,6 +9,25 @@ echo "mode,conf,rep1,rep2,rep3" > results.csv
 
 modes=("cp" "ooc" "HYBRID" "SPARK")
 
+# fraction of -Xmx used as Spark min data budget
+: "${SYSDS_SPARK_BUDGET_FRAC:=0.30}"
+
+get_xmx_mb() {
+  local t n u
+  for t in "$@"; do
+    if [[ $t =~ ^-Xmx([0-9]+)([gGmMkK])$ ]]; then
+      n="${BASH_REMATCH[1]}"
+      u="${BASH_REMATCH[2]}"
+      case "$u" in
+        g|G) echo $((n * 1024)); return ;;
+        m|M) echo "$n"; return ;;
+        k|K) echo $((n / 1024)); return ;;
+      esac
+    fi
+  done
+  echo 1024
+}
+
 for conf in "${confs[@]}"; do
   # load this config
   # shellcheck disable=SC1090
@@ -47,6 +66,16 @@ for conf in "${confs[@]}"; do
           unset 'hybrid_base_opts[-1]'
         fi
 
+        xmx_mb="$(get_xmx_mb "${SYSDS_CMD_COMMON[@]}")"
+        spark_exec_mb="$xmx_mb"
+        spark_storage_fraction="1.0"
+        spark_mem_fraction="$(awk -v b="$SYSDS_SPARK_BUDGET_FRAC" -v x="$xmx_mb" 'BEGIN{
+          v = b * x / (x - 300);
+          if (v < 0.01) v = 0.01;
+          if (v > 1.00) v = 1.00;
+          printf "%.4f", v;
+        }')"
+
         hybrid_all_opts=(
           "${hybrid_base_opts[@]}"
           --add-opens=java.base/java.nio=ALL-UNNAMED
@@ -59,6 +88,9 @@ for conf in "${confs[@]}"; do
           --add-opens=java.base/sun.nio.ch=ALL-UNNAMED
           -Dspark.master=local[*]
           -Dspark.app.name=$app_name
+          "-Dspark.executor.memory=${spark_exec_mb}m"
+          "-Dspark.memory.fraction=${spark_mem_fraction}"
+          "-Dspark.memory.storageFraction=${spark_storage_fraction}"
         )
 
         printf -v hybrid_opts '%s ' "${hybrid_all_opts[@]}"

@@ -29,7 +29,7 @@ except ImportError:  # pragma: no cover
 
 
 TimeEntry = Tuple[int, str, int, int]  # thread, caller, start_ns, end_ns
-CacheSample = Tuple[int, int, int]  # timestamp_ns, scheduled_eviction_size, cache_size
+CacheSample = Tuple[int, int, int, int, int]  # timestamp_ns, scheduled_eviction_size, cache_size, pinned_size, read_reserved_size
 
 # Minimum cumulative duration (in nanoseconds) required for a caller to appear in the legend.
 LEGEND_MIN_DURATION_NS = 20_000_000  # 20 ms
@@ -145,12 +145,16 @@ def load_cache_samples(path: Path, allow_empty: bool = False) -> List[CacheSampl
         if not required.issubset(reader.fieldnames or []):
             missing = required - set(reader.fieldnames or [])
             raise ValueError(f"Missing required columns in cache log: {', '.join(sorted(missing))}")
+        has_pinned = "PinnedSize" in (reader.fieldnames or [])
+        has_read_reserved = "ReadReservedSize" in (reader.fieldnames or [])
         for row in reader:
             samples.append(
                 (
                     int(row["Timestamp"]),
                     int(row["ScheduledEvictionSize"]),
                     int(row["CacheSize"]),
+                    int(row["PinnedSize"]) if has_pinned and row["PinnedSize"] != "" else 0,
+                    int(row["ReadReservedSize"]) if has_read_reserved and row["ReadReservedSize"] != "" else 0,
                 )
             )
     if not samples:
@@ -402,11 +406,15 @@ def plot_cache_track(
 ) -> None:
     factor = unit_factor(unit)
     if samples:
-        times = [(ts - min_start) / factor for ts, _, _ in samples]
-        cache_sizes = [cache for _, _, cache in samples]
-        evictions = [evict for _, evict, _ in samples]
+        times = [(ts - min_start) / factor for ts, _, _, _, _ in samples]
+        cache_sizes = [cache for _, _, cache, _, _ in samples]
+        evictions = [evict for _, evict, _, _, _ in samples]
+        pinned_sizes = [pinned for _, _, _, pinned, _ in samples]
+        read_reserved_sizes = [reserved for _, _, _, _, reserved in samples]
         ax.plot(times, cache_sizes, label="Cache size", color="#2ca02c", linewidth=1.6)
         ax.plot(times, evictions, label="Scheduled eviction", color="#9467bd", linewidth=1.4)
+        ax.plot(times, pinned_sizes, label="Pinned size", color="#d62728", linewidth=1.4)
+        ax.plot(times, read_reserved_sizes, label="Read reserved", color="#ff7f0e", linewidth=1.4)
     else:
         ax.text(
             0.5,

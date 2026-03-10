@@ -206,19 +206,15 @@ for conf in "${confs[@]}"; do
   cfg="${SYSDS_CONFIG_NAME:-$(basename "$conf" .conf)}"
 
   for mode in "${modes[@]}"; do
-    # Common script args:
-    # 1=rownum 2=colnum 3=sparsity 4=data_dir 5=optional write path
-    run_args=(1000000 1000 1.0 "../../data/" "out")
-    out_path=""
-    if [[ ${#run_args[@]} -ge 5 ]]; then
-      out_path="${run_args[4]}"
-    fi
-
     row="$mode,$cfg"
     for rep in {1..1}; do
       start=$(date +%s%N)
 
       file=./exp.dml
+      config_args=()
+      if [[ -f ./config.xml ]]; then
+        config_args=(-config ./config.xml)
+      fi
 
       if [[ $mode == "HYBRID" || $mode == "SPARK" ]]; then
         if [[ $mode == "HYBRID" ]]; then
@@ -273,7 +269,7 @@ for conf in "${confs[@]}"; do
         printf -v hybrid_opts '%s ' "${hybrid_all_opts[@]}"
         hybrid_opts="${hybrid_opts% }"
 
-        cmd=( systemds "$file" -local_budget "${sysds_local_budget_mb}m" -stats -explain -args "${run_args[@]}" )
+        cmd=( systemds "$file" "${config_args[@]}" -local_budget "${sysds_local_budget_mb}m" -stats -explain )
 
         printf '%q ' env SYSTEMDS_STANDALONE_OPTS="$hybrid_opts" SYSDS_DISTRIBUTED=0 SYSDS_EXEC_MODE="$exec_mode" "${cmd[@]}"
         echo
@@ -286,7 +282,7 @@ for conf in "${confs[@]}"; do
         fi
         if [[ $RUN_OUTCOME == "ok" ]]; then
           echo "$output"
-          exec_time="$(extract_last_numeric_after_label 'Total execution time:' "$output")"
+          exec_time="$(extract_last_numeric_after_label 'Completed in' "$output")"
           result="$(extract_last_numeric_after_label 'Result:' "$output")"
           [[ -z $exec_time ]] && exec_time="nan"
           [[ -z $result ]] && result="nan"
@@ -307,10 +303,10 @@ for conf in "${confs[@]}"; do
           status="$RUN_OUTCOME"
         fi
       else
-        # pick jar + optional flag
+        # pick jar + optional flags
         if [[ $mode == "ooc" ]]; then
           jar="$SYSDS_JAR_OOC"
-          oocflags=(-ooc -oocStats)
+          oocflags=(-ooc)
         else
           jar="$SYSDS_JAR_CP"
           oocflags=()
@@ -321,15 +317,12 @@ for conf in "${confs[@]}"; do
           "$jar"
           -f "$file"
           -exec singlenode
-          -config ./config.xml
+          "${config_args[@]}"
         )
 
         if ((${#oocflags[@]})); then
           cmd+=("${oocflags[@]}")
         fi
-
-        # args (keep as in your script)
-        cmd+=( -explain -stats -args "${run_args[@]}" )
 
         printf '%q ' "${cmd[@]}"
         echo
@@ -342,7 +335,7 @@ for conf in "${confs[@]}"; do
         fi
         if [[ $RUN_OUTCOME == "ok" ]]; then
           echo "$output"
-          exec_time="$(extract_last_numeric_after_label 'Total execution time:' "$output")"
+          exec_time="$(extract_last_numeric_after_label 'Completed in' "$output")"
           result="$(extract_last_numeric_after_label 'Result:' "$output")"
           [[ -z $exec_time ]] && exec_time="nan"
           [[ -z $result ]] && result="nan"
@@ -371,14 +364,14 @@ for conf in "${confs[@]}"; do
       echo "ExecTime: $exec_time ms(raw: $dur_ms) [$status]"
       echo "Result: $result"
 
-      # Cleanup optional output target and its metadata sidecar.
-      if [[ -n "$out_path" && "$out_path" != "/" && "$out_path" != "." ]]; then
-        [[ -e "$out_path" ]] && rm -rf "$out_path"
-        [[ -e "${out_path}.mtd" ]] && rm -f "${out_path}.mtd"
+      if [[ -e ./out ]]; then
+        rm -rf ./out
       fi
-
-      rm -r ./tmp
-      rm -r ./scratch_space
+      if [[ -e ./out.mtd ]]; then
+        rm -f ./out.mtd
+      fi
+      rm -rf ./tmp
+      rm -rf ./scratch_space
     done
     echo "$row" >> results.csv
   done

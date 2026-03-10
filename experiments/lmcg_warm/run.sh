@@ -286,7 +286,7 @@ for conf in "${confs[@]}"; do
         fi
         if [[ $RUN_OUTCOME == "ok" ]]; then
           echo "$output"
-          exec_time="$(extract_last_numeric_after_label 'Total execution time:' "$output")"
+          exec_time="$(extract_last_numeric_after_label 'Completed in' "$output")"
           result="$(extract_last_numeric_after_label 'Result:' "$output")"
           [[ -z $exec_time ]] && exec_time="nan"
           [[ -z $result ]] && result="nan"
@@ -342,7 +342,7 @@ for conf in "${confs[@]}"; do
         fi
         if [[ $RUN_OUTCOME == "ok" ]]; then
           echo "$output"
-          exec_time="$(extract_last_numeric_after_label 'Total execution time:' "$output")"
+          exec_time="$(extract_last_numeric_after_label 'Completed in' "$output")"
           result="$(extract_last_numeric_after_label 'Result:' "$output")"
           [[ -z $exec_time ]] && exec_time="nan"
           [[ -z $result ]] && result="nan"

@@ -18,6 +18,7 @@ modes=("cp" "ooc" "HYBRID" "SPARK")
 : "${SYSDS_LOCAL_BUDGET_MB:=}"
 : "${SYSDS_RUN_TIMEOUT_SEC:=200}"
 : "${SYSDS_SKIP_TOKEN:=skip}"
+: "${SYSDS_DISABLE_TTY_INPUT:=0}"
 
 get_xmx_mb() {
   local t n u
@@ -118,15 +119,21 @@ RUN_OUTPUT=""
 RUN_OUTCOME=""
 
 run_with_timeout_skip() {
-  local log_file pid start_s now_s input rc
+  local log_file pid start_s now_s input rc use_tty_input disable_tty_input
   local -a run_cmd
   run_cmd=("$@")
   RUN_OUTPUT=""
   RUN_OUTCOME="failed"
 
+  disable_tty_input="${SYSDS_DISABLE_TTY_INPUT,,}"
+  use_tty_input=0
+  if [[ "$disable_tty_input" != "1" && "$disable_tty_input" != "true" && "$disable_tty_input" != "yes" && -r /dev/tty ]]; then
+    use_tty_input=1
+  fi
+
   log_file="$(mktemp)"
 
-  if [[ -r /dev/tty && $SKIP_HINT_SHOWN -eq 0 ]]; then
+  if (( use_tty_input )) && [[ $SKIP_HINT_SHOWN -eq 0 ]]; then
     echo "Run control: type '${SYSDS_SKIP_TOKEN}' + Enter to skip a run (timeout: ${SYSDS_RUN_TIMEOUT_SEC}s)." > /dev/tty
     SKIP_HINT_SHOWN=1
   fi
@@ -152,7 +159,7 @@ run_with_timeout_skip() {
       return 1
     fi
 
-    if [[ -r /dev/tty ]]; then
+    if (( use_tty_input )); then
       if IFS= read -r -t 1 input < /dev/tty; then
         if [[ "${input,,}" == "${SYSDS_SKIP_TOKEN,,}" ]]; then
           kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true

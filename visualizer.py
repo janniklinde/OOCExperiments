@@ -19,7 +19,7 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Generate a publication-style runtime bar chart from a results.csv file. "
-            "NaN values are rendered as full-height textured bars to indicate infinite runtime."
+            "NaN values are rendered as compact failure markers near the runtime axis."
         )
     )
     parser.add_argument(
@@ -138,15 +138,101 @@ def apply_scientific_style() -> None:
             "figure.dpi": 200,
             "font.family": "serif",
             "font.serif": ["Times New Roman", "Nimbus Roman", "DejaVu Serif"],
-            "font.size": 10,
-            "axes.labelsize": 11,
-            "axes.titlesize": 12,
-            "legend.fontsize": 9,
+            "font.size": 13,
+            "axes.labelsize": 14,
+            "axes.titlesize": 16,
+            "axes.titleweight": "semibold",
+            "legend.fontsize": 12,
+            "xtick.labelsize": 12,
+            "ytick.labelsize": 12,
             "axes.spines.top": False,
             "axes.spines.right": False,
             "hatch.linewidth": 0.35,
         }
     )
+
+
+def format_experiment_name(name: str) -> str:
+    token_map = {
+        "pca": "PCA",
+        "lmcg": "LMCG",
+        "kmeans": "K-MEANS",
+        "warm": "Warm",
+    }
+    parts = [part for part in name.split("_") if part]
+    if not parts:
+        return name
+    return " ".join(token_map.get(part.lower(), part.upper()) for part in parts)
+
+
+def _format_dimension(value: str) -> str:
+    number = int(value)
+    suffixes = [
+        (1_000_000_000, "B"),
+        (1_000_000, "M"),
+        (1_000, "k"),
+    ]
+    for divisor, suffix in suffixes:
+        if number >= divisor and number % divisor == 0:
+            return f"{number // divisor}{suffix}"
+    return str(number)
+
+
+def _infer_dimensions_from_run_script(run_script_path: Path) -> Optional[str]:
+    if not run_script_path.exists():
+        return None
+
+    text = run_script_path.read_text()
+    match = re.search(r"run_args=\(\s*(\d+)\s+(\d+)\s+", text)
+    if not match:
+        return None
+
+    rows = _format_dimension(match.group(1))
+    cols = _format_dimension(match.group(2))
+    return f"{rows} x {cols}"
+
+
+def _infer_dimensions_from_blob_setup(experiment_dir: Path) -> Optional[str]:
+    exp_path = experiment_dir / "exp.dml"
+    setup_path = Path("setup.sh")
+    if not exp_path.exists() or not setup_path.exists():
+        return None
+
+    exp_text = exp_path.read_text()
+    blob_match = re.search(r'read\("(?P<path>\.\./\.\./data/blobs/[^"]+)_X"\)', exp_text)
+    if not blob_match:
+        return None
+
+    blob_base = blob_match.group("path").replace("../../", "")
+    setup_text = setup_path.read_text()
+    setup_match = re.search(
+        rf'blob_base="{re.escape(blob_base)}".*?-args\s+(\d+)\s+(\d+)\s+\d+\s+[-+0-9.]+\s+[-+0-9.]+\s+\d+\s+"\$blob_base"',
+        setup_text,
+        flags=re.DOTALL,
+    )
+    if not setup_match:
+        return None
+
+    rows = _format_dimension(setup_match.group(1))
+    cols = _format_dimension(setup_match.group(2))
+    return f"{rows} x {cols}"
+
+
+def infer_experiment_dimensions(experiment_dir: Path) -> Optional[str]:
+    return _infer_dimensions_from_run_script(experiment_dir / "run.sh") or _infer_dimensions_from_blob_setup(
+        experiment_dir
+    )
+
+
+def build_plot_title(csv_path: Path, explicit_title: Optional[str]) -> str:
+    if explicit_title:
+        return explicit_title
+
+    experiment_name = format_experiment_name(csv_path.parent.name)
+    dimensions = infer_experiment_dimensions(csv_path.parent)
+    if dimensions:
+        return f"{experiment_name} Runtime ({dimensions})"
+    return f"{experiment_name} Runtime"
 
 
 def create_plot(
@@ -161,23 +247,21 @@ def create_plot(
 
     finite_values = [value for mode in modes for value in series[mode] if math.isfinite(value)]
     finite_max = max(finite_values) if finite_values else 1.0
-    y_limit = finite_max * 1.15 if finite_max > 0 else 1.0
-    infinite_bar_height = y_limit * 2.0
+    y_limit = finite_max * 1.22 if finite_max > 0 else 1.0
+    failed_marker_y = y_limit * 0.035
 
-    # Okabe-Ito style palette (colorblind-friendly), combined with hatches for grayscale print.
+    # Soft pastel palette, combined with hatches for grayscale print.
     mode_palette = [
-        "#0072B2",
-        "#E69F00",
-        "#009E73",
-        "#D55E00",
-        "#CC79A7",
-        "#56B4E9",
-        "#F0E442",
-        "#000000",
+        "#CDA2BE",
+        "#E4C890",
+        "#CCFFFF",
+        "#FFD9CC",
+        "#CDA2BE",
+        "#E4C890",
+        "#CCFFFF",
+        "#FFD9CC",
     ]
-    failed_hatch = "////"
-
-    fig, ax = plt.subplots(figsize=(7.0, 4.2))
+    fig, ax = plt.subplots(figsize=(5.8, 5.2))
     x_positions = list(range(len(confs)))
     bar_width = 0.8 / max(len(modes), 1)
 
@@ -193,15 +277,25 @@ def create_plot(
                 finite_y.append(value)
                 continue
 
-            ax.bar(
-                x_pos,
-                infinite_bar_height,
-                width=bar_width,
-                facecolor="none",
-                edgecolor=mode_color,
-                linewidth=0.8,
-                hatch=failed_hatch,
-                zorder=2,
+            ax.plot(
+                [x_pos],
+                [failed_marker_y],
+                linestyle="none",
+                marker="x",
+                markersize=14,
+                markeredgewidth=4.2,
+                color="black",
+                zorder=4,
+            )
+            ax.plot(
+                [x_pos],
+                [failed_marker_y],
+                linestyle="none",
+                marker="x",
+                markersize=12,
+                markeredgewidth=2.6,
+                color=mode_color,
+                zorder=5,
             )
 
         if finite_x:
@@ -253,7 +347,7 @@ def main() -> None:
     apply_scientific_style()
     data = read_results(args.csv)
     modes, confs, series = prepare_series(data)
-    title = args.title or f"{args.csv.parent.name} Runtime"
+    title = build_plot_title(args.csv, args.title)
     output_stem = (args.output.with_suffix("") if args.output else (args.csv.parent / "results"))
     outputs = create_plot(modes, confs, series, title, output_stem)
     for path in outputs:

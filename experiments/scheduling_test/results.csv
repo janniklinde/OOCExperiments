@@ -1,0 +1,10 @@
+Setup,ExecMode,Runtime [s]
+sqrt_1000x_10k_x_10k,Pipeline Parallelism,54.70
+sqrt_1000x_10k_x_10k,Tile Parallelism w/ Pipelining,54.53
+sqrt_1000x_10k_x_10k,Tile Parallelism w/o Pipelining,53.82
+abs_1000x_10M_x_1,Pipeline Parallelism,23.46
+abs_1000x_10M_x_1,Tile Parallelism w/ Pipelining,11.53
+abs_1000x_10M_x_1,Tile Parallelism w/o Pipelining,10.14
+abs_100x_100M_x_1,Pipeline Parallelism,21.61
+abs_100x_100M_x_1,Tile Parallelism w/ Pipelining,13.95
+abs_100x_100M_x_1,Tile Parallelism w/o Pipelining,14.00

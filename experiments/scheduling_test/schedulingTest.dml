@@ -1,0 +1,21 @@
+#A = read("../../data/mat_1000000x1s1.0_1");
+A = rand(rows=100000000, cols=1, seed=7);
+
+# Warmup
+for(i in 1:200) {
+    A = abs(A);
+}
+
+print(min(A));
+while(FALSE){}
+
+start = time();
+for(i in 1:100) {
+    A = abs(A);
+}
+
+print(min(A));
+while(FALSE){}
+delta = (time() - start) / 1000000;
+
+print(delta + "ms");

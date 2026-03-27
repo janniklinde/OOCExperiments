@@ -1,0 +1,1 @@
+java -Xmx10g -Xms10g --add-modules=jdk.incubator.vector -jar /home/jannik/Dev/systemds/target/SystemDS.jar -f ./schedulingTest.dml -exec singlenode -ooc -config ./config2.xml

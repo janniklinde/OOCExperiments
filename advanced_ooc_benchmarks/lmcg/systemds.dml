@@ -1,0 +1,16 @@
+#-------------------------------------------------------------
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0.
+#-------------------------------------------------------------
+
+source("lmcg/implementation.dml") as lmcg_impl;
+
+X = read($1);
+y = read($2);
+[beta, residual_norm] = lmcg_impl::m_lmcg_fixed(
+  X=X, y=y, reg=$3, iterations=as.integer($4), tolerance=$5);
+
+write(beta, $6, format="binary");
+print("residual_norm=" + residual_norm);

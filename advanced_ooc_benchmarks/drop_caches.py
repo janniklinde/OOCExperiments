@@ -63,9 +63,15 @@ def walk(paths):
         if os.path.isdir(path):
             for root, _, names in os.walk(path):
                 for name in names:
-                    yield os.path.join(root, name)
+                    candidate = os.path.join(root, name)
+                    # Dataset preparation keeps symlinks to tools such as the
+                    # SystemDS JAR. They are not benchmark inputs, and an IDE or
+                    # another JVM may legitimately keep their target mapped.
+                    if not os.path.islink(candidate):
+                        yield candidate
         elif os.path.isfile(path):
-            yield path
+            if not os.path.islink(path):
+                yield path
 
 
 def main(argv):

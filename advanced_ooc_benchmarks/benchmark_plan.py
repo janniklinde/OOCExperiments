@@ -9,6 +9,7 @@
 import argparse
 import copy
 import csv
+from datetime import datetime
 import hashlib
 import json
 import os
@@ -26,6 +27,12 @@ except ImportError:
 
 _PLACEHOLDER = re.compile(r"\$\{([A-Za-z0-9_.-]+)\}")
 _VALID_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def execution_timestamp(moment=None):
+    """Return a filesystem-safe, timezone-qualified benchmark invocation ID."""
+    moment = moment or datetime.now().astimezone()
+    return moment.strftime("%Y%m%dT%H%M%S.%f%z")
 
 
 def flatten(prefix, value, out):
@@ -272,11 +279,50 @@ def prepare_dataset_variant(dataset_id, variant_id, variant, directory, context,
     return context
 
 
-def expand_run_cases(runs, templates=None):
-    """Expand legacy or backend-specific blocksize sweeps into named run cases."""
-    templates = templates or {}
+def run_dataset_ids(run):
+    """Return and validate the dataset IDs declared by one configured run."""
+    value = run.get("dataset", "")
+    values = value if isinstance(value, list) else [value]
+    run_id = str(run.get("id", ""))
+    if not values:
+        raise ValueError(f"Run {run_id} dataset list must not be empty")
+    dataset_ids = []
+    seen = set()
+    for dataset in values:
+        dataset_id = str(dataset)
+        if not _VALID_ID.match(dataset_id):
+            raise ValueError(f"Run {run_id} has invalid dataset id {dataset_id!r}")
+        if dataset_id in seen:
+            raise ValueError(f"Run {run_id} repeats dataset {dataset_id!r}")
+        seen.add(dataset_id)
+        dataset_ids.append(dataset_id)
+    return dataset_ids
+
+
+def expand_dataset_cases(runs):
+    """Expand list-valued dataset declarations before other run dimensions."""
     cases = []
     for configured_run in runs:
+        if not isinstance(configured_run.get("dataset"), list):
+            cases.append(configured_run)
+            continue
+        dataset_ids = run_dataset_ids(configured_run)
+        configured_id = str(configured_run.get("id", ""))
+        logical_base_id = str(configured_run.get("base_id", configured_id))
+        for dataset_id in dataset_ids:
+            run = copy.deepcopy(configured_run)
+            run["id"] = f"{configured_id}-{dataset_id}"
+            run["base_id"] = logical_base_id
+            run["dataset"] = dataset_id
+            cases.append(run)
+    return cases
+
+
+def expand_run_cases(runs, templates=None):
+    """Expand dataset and legacy or backend-specific blocksize sweeps into run cases."""
+    templates = templates or {}
+    cases = []
+    for configured_run in expand_dataset_cases(runs):
         sweeps = configured_run.get("blocksize_sweeps")
         if sweeps is not None:
             if not isinstance(sweeps, dict) or not sweeps:
@@ -301,7 +347,7 @@ def expand_run_cases(runs, templates=None):
                 run = copy.deepcopy(configured_run)
                 base_id = str(run.get("id", ""))
                 run["id"] = f"{base_id}-baseline"
-                run["base_id"] = base_id
+                run["base_id"] = str(run.get("base_id", base_id))
                 run["_baseline_case"] = True
                 run["implementations"] = copy.deepcopy(neutral)
                 run["setup"] = copy.deepcopy(run.get("baseline_setup", []))
@@ -331,7 +377,7 @@ def expand_run_cases(runs, templates=None):
                     run = copy.deepcopy(configured_run)
                     base_id = str(run.get("id", ""))
                     run["id"] = f"{base_id}-{sweep_id}-bs{blocksize}"
-                    run["base_id"] = base_id
+                    run["base_id"] = str(run.get("base_id", base_id))
                     run.setdefault("parameters", {})["blocksize"] = blocksize
                     run["parameters"]["blocksize_sweep"] = sweep_id
                     run["implementations"] = copy.deepcopy(selected)
@@ -364,7 +410,7 @@ def expand_run_cases(runs, templates=None):
             run = copy.deepcopy(configured_run)
             base_id = str(run.get("id", ""))
             run["id"] = f"{base_id}-bs{blocksize}"
-            run["base_id"] = base_id
+            run["base_id"] = str(run.get("base_id", base_id))
             run["parameters"]["blocksize"] = blocksize
             cases.append(run)
     return cases
@@ -488,24 +534,30 @@ def execute_plan(plan_path, validate_only=False):
 
     datasets = plan.get("datasets", {})
     templates = plan.get("templates", {})
-    configured_runs = [run for run in plan.get("runs", []) if run.get("enabled", True) and any(
+    configured_runs = plan.get("runs", [])
+    for run in configured_runs:
+        run_id = str(run.get("id", ""))
+        if not _VALID_ID.match(run_id):
+            raise ValueError(f"Invalid run id {run_id!r}")
+        for dataset_id in run_dataset_ids(run):
+            if dataset_id not in datasets:
+                raise ValueError(f"Run {run_id} refers to unknown dataset {dataset_id}")
+        if not run.get("implementations"):
+            raise ValueError(f"Run {run_id} has no implementations")
+        for implementation in run["implementations"]:
+            resolve_implementation(implementation, templates)
+    expanded_runs = expand_run_cases(configured_runs, templates)
+    enabled_runs = [run for run in expanded_runs if run.get("enabled", True) and any(
         resolve_implementation(implementation, templates).get("enabled", True)
         for implementation in run.get("implementations", []))]
-    enabled_runs = expand_run_cases(configured_runs, templates)
     run_ids = set()
-    for run in enabled_runs:
+    for run in expanded_runs:
         run_id = str(run.get("id", ""))
         if not _VALID_ID.match(run_id):
             raise ValueError(f"Invalid run id {run_id!r}")
         if run_id in run_ids:
             raise ValueError(f"Duplicate expanded run id {run_id!r}")
         run_ids.add(run_id)
-        if str(run.get("dataset", "")) not in datasets:
-            raise ValueError(f"Run {run_id} refers to unknown dataset {run.get('dataset')}")
-        if not run.get("implementations"):
-            raise ValueError(f"Run {run_id} has no implementations")
-        for implementation in run["implementations"]:
-            resolve_implementation(implementation, templates)
     if validate_only:
         print(f"Valid benchmark plan: {len(datasets)} datasets, {len(enabled_runs)} enabled run cases")
         return 0
@@ -531,7 +583,10 @@ def execute_plan(plan_path, validate_only=False):
     prepared = {}
     results_root = Path(expand(str(plan.get("results", "${plan.root}/results")), context)).resolve()
     results_root.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(plan_path, results_root / "benchmark-plan.yaml")
+    invocation_id = execution_timestamp()
+    invocation_dir = results_root / invocation_id
+    invocation_dir.mkdir()
+    shutil.copy2(plan_path, invocation_dir / "benchmark-plan.yaml")
 
     for run in enabled_runs:
         run_id = str(run["id"])
@@ -547,6 +602,7 @@ def execute_plan(plan_path, validate_only=False):
         run_context = dict(dataset_context)
         run_context["run.id"] = run_id
         run_context["run.base_id"] = str(run.get("base_id", run_id))
+        run_context["run.invocation_id"] = invocation_id
         flatten("run", run.get("parameters", {}), run_context)
         if not run.get("_baseline_case"):
             for variant_id, variant in datasets[dataset_id].get("variants", {}).items():
@@ -566,6 +622,15 @@ def execute_plan(plan_path, validate_only=False):
         if threads < 1:
             raise ValueError(f"Run {run_id} resources.threads must be a positive integer or auto")
         resources["threads"] = threads
+        spark_threads = resources.get("spark_threads", threads)
+        if str(spark_threads).lower() == "auto":
+            spark_threads = threads
+        else:
+            spark_threads = int(spark_threads)
+        if spark_threads < 1:
+            raise ValueError(f"Run {run_id} resources.spark_threads must be a positive integer "
+                             "or auto")
+        resources["spark_threads"] = spark_threads
         flatten("resources", resources, run_context)
         run_context["run.entrypoint"] = expand(str(run.get("entrypoint", "")), run_context)
         for name, value in run.get("inputs", {}).items():
@@ -579,7 +644,9 @@ def execute_plan(plan_path, validate_only=False):
             else:
                 run_context[f"input.{name}"] = expand(str(value), run_context)
 
-        run_dir = results_root / run_id
+        # Keep previous measurements immutable, and group all cases of one benchmark
+        # invocation together for straightforward comparison.
+        run_dir = invocation_dir / run_id
         logs = run_dir / "logs"
         outputs = run_dir / "outputs"
         logs.mkdir(parents=True, exist_ok=True)
@@ -629,7 +696,8 @@ def execute_plan(plan_path, validate_only=False):
                     tag = f"{run_id}-{impl_id}-r{rep}"
                     log = logs / f"{tag}.log"
                     metrics = logs / f"{tag}.metrics"
-                    print(f"Starting {tag} (timeout={timeout_seconds}s, memory={memory})", flush=True)
+                    print(f"Starting {tag} (timeout={timeout_seconds}s, memory={memory}, "
+                          f"results={run_dir})", flush=True)
                     drop_caches(cache_paths, local_context, plan_dir, context["tools.python"],
                                 logs / "drop-caches.log")
                     env = dict(global_env)

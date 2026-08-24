@@ -1,0 +1,16 @@
+#-------------------------------------------------------------
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0.
+#-------------------------------------------------------------
+
+source("kmeans/implementation.dml") as kmeans_impl;
+
+X = read($1);
+[C, Y, inertia] = kmeans_impl::m_kmeans_fixed(
+  X=X, k=as.integer($2), iterations=as.integer($3));
+
+write(C, $4, format="binary");
+write(Y, $5, format="binary");
+print("inertia=" + inertia);

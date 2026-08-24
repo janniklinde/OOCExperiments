@@ -1,0 +1,32 @@
+#-------------------------------------------------------------
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0.
+#-------------------------------------------------------------
+
+# Fixed-iteration conjugate gradient for (t(X)%*%X + reg*I) beta=t(X)%*%y.
+# A zero tolerance makes iteration counts identical across implementations.
+m_lmcg_fixed = function(Matrix[Double] X, Matrix[Double] y,
+    Double reg, Integer iterations, Double tolerance=0.0)
+  return (Matrix[Double] beta, Double residual_norm)
+{
+  beta = matrix(0, rows=ncol(X), cols=1);
+  r = -(t(X) %*% y);
+  p = -r;
+  norm_r2 = sum(r ^ 2);
+  target = norm_r2 * tolerance ^ 2;
+
+  i = 0;
+  while(i < iterations & norm_r2 > target) {
+    q = t(X) %*% (X %*% p) + reg * p;
+    alpha = norm_r2 / sum(p * q);
+    beta = beta + alpha * p;
+    r = r + alpha * q;
+    old_norm_r2 = norm_r2;
+    norm_r2 = sum(r ^ 2);
+    p = -r + (norm_r2 / old_norm_r2) * p;
+    i = i + 1;
+  }
+  residual_norm = sqrt(norm_r2);
+}

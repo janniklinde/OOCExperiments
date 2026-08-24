@@ -1,0 +1,29 @@
+#-------------------------------------------------------------
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0.
+#-------------------------------------------------------------
+
+# Centered, unscaled covariance PCA. The covariance identity avoids
+# materializing a second input-sized centered matrix.
+m_pca_covariance = function(Matrix[Double] X, Integer k)
+  return (Matrix[Double] scores, Matrix[Double] components, Matrix[Double] eigenvalues)
+{
+  n = nrow(X);
+  d = ncol(X);
+  sums = colSums(X);
+  gram = t(X) %*% X;
+  center_correction = (t(sums) %*% sums) / n;
+  covariance = (gram - center_correction) / (n - 1);
+
+  [all_values, all_vectors] = eigen(covariance);
+  decreasing_idx = order(target=all_values, by=1, decreasing=TRUE, index.return=TRUE);
+  permutation = table(seq(1, d), decreasing_idx);
+  sorted_vectors = all_vectors %*% permutation;
+  sorted_values = permutation %*% all_values;
+  components = sorted_vectors[, 1:k];
+  eigenvalues = sorted_values[1:k, ];
+  sum_projection = sums %*% components;
+  scores = X %*% components - sum_projection / n;
+}

@@ -1,0 +1,44 @@
+#-------------------------------------------------------------
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements. See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership. The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License. You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied. See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+#-------------------------------------------------------------
+
+# Deterministic fixed-iteration Lloyd KMeans. Initializing from the first k
+# records makes the SystemDS, NumPy, and Dask arms independent of their random
+# number generators. Continuous benchmark data makes distance ties and empty
+# clusters vanishingly unlikely; ties are shared during centroid updates.
+m_kmeans_fixed = function(Matrix[Double] X, Integer k, Integer iterations)
+  return (Matrix[Double] C, Matrix[Double] Y, Double inertia)
+{
+  C = X[1:k, ];
+  sum_x_sq = sum(X ^ 2);
+
+  for(i in 1:iterations) {
+    D = -2 * (X %*% t(C)) + t(rowSums(C ^ 2));
+    min_d = rowMins(D);
+    P = D <= min_d;
+    P = P / rowSums(P);
+    counts = colSums(P);
+    C = (t(P) %*% X) / t(counts);
+  }
+
+  D = -2 * (X %*% t(C)) + t(rowSums(C ^ 2));
+  Y = rowIndexMin(D);
+  inertia = sum_x_sq + sum(rowMins(D));
+}

@@ -21,6 +21,7 @@ defaults:
   repetitions: 1
   resources:
     threads: auto
+    spark_threads: 8
     swap_max: 0
     timeout_seconds: 60
     timeout_grace_seconds: 30
@@ -39,14 +40,32 @@ templates:
       ${run.systemds_args}
   systemds-spark:
     comparable: true
+    enabled: false
     blocksize_sweep: spark
     required_tools: [spark_submit]
     command: >-
-      "${tools.spark_submit}" --master "local[${resources.threads}]"
+      "${tools.spark_submit}" --master "local[${resources.spark_threads}]"
       --driver-memory "${resources.java_heap}" --executor-memory "${resources.java_heap}"
       --driver-java-options "-XX:+UseG1GC -XX:G1HeapRegionSize=8m
-      -XX:ActiveProcessorCount=${resources.threads} --add-modules=jdk.incubator.vector
+      -XX:ActiveProcessorCount=${resources.spark_threads} --add-modules=jdk.incubator.vector
+      --add-opens=java.base/java.nio=ALL-UNNAMED
+      --add-opens=java.base/java.io=ALL-UNNAMED
+      --add-opens=java.base/java.util=ALL-UNNAMED
+      --add-opens=java.base/java.lang=ALL-UNNAMED
+      --add-opens=java.base/java.lang.ref=ALL-UNNAMED
+      --add-opens=java.base/java.lang.invoke=ALL-UNNAMED
+      --add-opens=java.base/java.util.concurrent=ALL-UNNAMED
+      --add-opens=java.base/sun.nio.ch=ALL-UNNAMED
       -Djava.io.tmpdir=${plan.root}/tmp/java"
+      --conf "spark.executor.extraJavaOptions=--add-modules=jdk.incubator.vector
+      --add-opens=java.base/java.nio=ALL-UNNAMED
+      --add-opens=java.base/java.io=ALL-UNNAMED
+      --add-opens=java.base/java.util=ALL-UNNAMED
+      --add-opens=java.base/java.lang=ALL-UNNAMED
+      --add-opens=java.base/java.lang.ref=ALL-UNNAMED
+      --add-opens=java.base/java.lang.invoke=ALL-UNNAMED
+      --add-opens=java.base/java.util.concurrent=ALL-UNNAMED
+      --add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
       --conf "spark.local.dir=${plan.root}/tmp/spark"
       --conf "spark.ui.enabled=false"
       --conf "spark.driver.maxResultSize=0"
@@ -56,6 +75,7 @@ templates:
       ${run.systemds_args}
   python:
     comparable: true
+    enabled: false
     environment:
       OMP_NUM_THREADS: ${resources.threads}
       OPENBLAS_NUM_THREADS: ${resources.threads}
@@ -201,6 +221,7 @@ systemds_setup: &systemds_setup
       <sysds.localtmpdir>${plan.root}/tmp/systemds</sysds.localtmpdir>
       <sysds.scratch>${plan.root}/scratch_space</sysds.scratch>
       <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>
+      <sysds.native.blas>openblas</sysds.native.blas>
     </root>
     EOF
 
@@ -237,7 +258,7 @@ runs:
     enabled: true
     dataset: dense_1m
     entrypoint: ${plan.dir}/multilogreg/systemds.dml
-    blocksize_sweeps: {ooc: [250, 500, 1000], spark: [1000]}
+    blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
       iterations: 1
       inner_iterations: 1
@@ -265,7 +286,7 @@ runs:
     enabled: true
     dataset: dense_1m
     entrypoint: ${plan.dir}/randomized_svd/systemds.dml
-    blocksize_sweeps: {ooc: [250, 500, 1000], spark: [1000]}
+    blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
       rank: 16
       seed: 31
@@ -294,7 +315,7 @@ runs:
     enabled: true
     dataset: dense_1m
     entrypoint: ${plan.dir}/mlp/systemds.dml
-    blocksize_sweeps: {ooc: [250, 500, 1000], spark: [1000]}
+    blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
       epochs: 1
       batch_size: 4096
@@ -322,7 +343,7 @@ runs:
     enabled: true
     dataset: dense_1m
     entrypoint: ${plan.dir}/gmm/systemds.dml
-    blocksize_sweeps: {ooc: [250, 500, 1000], spark: [1000]}
+    blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
       components: 4
       model: VVI
@@ -348,3 +369,99 @@ runs:
           --components ${run.components} --model ${run.model} --iterations ${run.iterations}
           --reg ${run.reg} --tolerance ${run.tolerance} --seed ${run.seed}
           --output "${run.outputs}/sklearn-r${rep}.json"
+
+  # Newly added workloads are disabled until one blocksize/backend at a time has
+  # completed a host smoke run under the 3 GiB heap and 4 GiB cgroup.
+  - id: kmeans_3g
+    enabled: true
+    dataset: dense_1m
+    entrypoint: ${plan.dir}/kmeans/systemds.dml
+    blocksize_sweeps: {ooc: [250, 500, 1000], spark: [1000]}
+    parameters:
+      clusters: 16
+      iterations: 2
+      systemds_args: >-
+        -args "${input.X}" ${run.clusters} ${run.iterations}
+        "${run.outputs}/systemds-centers-r${rep}"
+        "${run.outputs}/systemds-labels-r${rep}"
+    inputs: {X: {artifact: X}}
+    resources: {memory_max: 4G, java_heap: 3g, timeout_seconds: 300}
+    setup: *systemds_setup
+    cold_cache: ["${dataset.dir}", "${plan.root}/tmp/systemds", "${plan.root}/tmp/spark"]
+    implementations:
+      - {id: systemds-ooc, template: systemds-ooc}
+      - {id: systemds-spark, template: systemds-spark}
+      - id: numpy-lloyd
+        template: python
+        command: >-
+          "${tools.python}" "${plan.dir}/kmeans/numpy.py" "${dataset.dir}"
+          --clusters ${run.clusters} --iterations ${run.iterations}
+          --output "${run.outputs}/numpy-r${rep}.json"
+      - id: dask-lloyd
+        template: python
+        command: >-
+          "${tools.python}" "${plan.dir}/kmeans/dask_array.py" "${dataset.dir}"
+          --clusters ${run.clusters} --iterations ${run.iterations}
+          --output "${run.outputs}/dask-r${rep}.json"
+
+  - id: pca_3g
+    enabled: true
+    dataset: dense_1m
+    entrypoint: ${plan.dir}/pca/systemds.dml
+    blocksize_sweeps: {ooc: [250, 500, 1000], spark: [1000]}
+    parameters:
+      components: 16
+      systemds_args: >-
+        -args "${input.X}" ${run.components}
+        "${run.outputs}/systemds-scores-r${rep}"
+        "${run.outputs}/systemds-components-r${rep}"
+        "${run.outputs}/systemds-eigenvalues-r${rep}"
+    inputs: {X: {artifact: X}}
+    resources: {memory_max: 4G, java_heap: 3g, timeout_seconds: 600}
+    setup: *systemds_setup
+    cold_cache: ["${dataset.dir}", "${plan.root}/tmp/systemds", "${plan.root}/tmp/spark"]
+    implementations:
+      - {id: systemds-ooc, template: systemds-ooc}
+      - {id: systemds-spark, template: systemds-spark}
+      - id: numpy-covariance
+        template: python
+        command: >-
+          "${tools.python}" "${plan.dir}/pca/numpy.py" "${dataset.dir}"
+          --components ${run.components} --output "${run.outputs}/numpy-r${rep}.json"
+      - id: dask-covariance
+        template: python
+        command: >-
+          "${tools.python}" "${plan.dir}/pca/dask_array.py" "${dataset.dir}"
+          --components ${run.components} --output "${run.outputs}/dask-r${rep}.json"
+
+  - id: lmcg_3g
+    enabled: true
+    dataset: dense_1m
+    entrypoint: ${plan.dir}/lmcg/systemds.dml
+    blocksize_sweeps: {ooc: [250, 500, 1000], spark: [1000]}
+    parameters:
+      iterations: 2
+      reg: 1e-7
+      tolerance: 0.0
+      systemds_args: >-
+        -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance}
+        "${run.outputs}/systemds-beta-r${rep}"
+    inputs: {X: {artifact: X}, y: {artifact: binary_y}}
+    resources: {memory_max: 4G, java_heap: 3g, timeout_seconds: 300}
+    setup: *systemds_setup
+    cold_cache: ["${dataset.dir}", "${plan.root}/tmp/systemds", "${plan.root}/tmp/spark"]
+    implementations:
+      - {id: systemds-ooc, template: systemds-ooc}
+      - {id: systemds-spark, template: systemds-spark}
+      - id: numpy-cg
+        template: python
+        command: >-
+          "${tools.python}" "${plan.dir}/lmcg/numpy.py" "${dataset.dir}"
+          --iterations ${run.iterations} --reg ${run.reg} --tolerance ${run.tolerance}
+          --output "${run.outputs}/numpy-r${rep}.json"
+      - id: dask-cg
+        template: python
+        command: >-
+          "${tools.python}" "${plan.dir}/lmcg/dask_array.py" "${dataset.dir}"
+          --iterations ${run.iterations} --reg ${run.reg} --tolerance ${run.tolerance}
+          --output "${run.outputs}/dask-r${rep}.json"

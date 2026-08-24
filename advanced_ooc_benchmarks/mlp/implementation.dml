@@ -88,6 +88,11 @@ m_ffTrain = function(Matrix[double] X, Matrix[double] Y, Integer batch_size=64,
   } else {
     X_train = X
     Y_train = Y
+    # Keep validation variables matrix-typed even when unused. Spark inserts
+    # checkpoints for these variables during recompilation and cannot checkpoint
+    # an implicitly created Boolean placeholder as a matrix.
+    X_val = X[1:1,]
+    Y_val = Y[1:1,]
   }
 
   H1 = 128 # number of layer1 neurons

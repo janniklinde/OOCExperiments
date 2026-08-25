@@ -10,9 +10,11 @@ from pathlib import Path
 script_dir = str(Path(__file__).resolve().parent)
 if sys.path and sys.path[0] == script_dir:
     sys.path.pop(0)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import dask.array as da
 import numpy as np
+from dask_support import create_client, load_matrix, read_rows
 
 
 def main():
@@ -21,20 +23,22 @@ def main():
     parser.add_argument("--clusters", type=int, default=16)
     parser.add_argument("--iterations", type=int, default=2)
     parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--memory-limit", default="3GiB")
+    parser.add_argument("--temporary-directory", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if min(args.clusters, args.iterations, args.threads) < 1:
         raise ValueError("clusters, iterations, and threads must be positive")
-    compute_options = {"scheduler": "threads", "num_workers": args.threads}
+    client = create_client(args.threads, args.memory_limit, args.temporary_directory)
+    compute_options = {}
 
     start = time.perf_counter()
     metadata = json.loads((args.data / "metadata.json").read_text())
     shape = (metadata["rows"], metadata["cols"])
     if args.clusters > shape[0]:
         raise ValueError("clusters cannot exceed the number of rows")
-    mapped = np.memmap(args.data / "X.f64", dtype=np.float64, mode="r", shape=shape)
-    matrix = da.from_array(mapped, chunks="auto")
-    centers = np.array(mapped[:args.clusters], dtype=np.float64, copy=True)
+    matrix = load_matrix(args.data / "X.f64", shape)
+    centers = read_rows(args.data / "X.f64", shape, 0, args.clusters)
     cluster_ids = np.arange(args.clusters)
 
     for _ in range(args.iterations):
@@ -59,6 +63,7 @@ def main():
               "clusters": args.clusters, "iterations": args.iterations, "inertia": inertia}
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report))
+    client.close()
 
 
 if __name__ == "__main__":

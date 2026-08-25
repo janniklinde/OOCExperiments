@@ -7,9 +7,9 @@ from the raw memmaps without modifying the raw inputs.
 
 ## Layout
 
-- `benchmark-plan.yaml`: 3 GiB-heap / 4 GiB-cgroup comparisons with one repetition and independent
-  SystemDS OOC and local-Spark blocksize sweeps. Newly added large cases remain disabled pending
-  one-at-a-time host smoke runs.
+- `benchmark-plan.yaml`: aligned 4/8/16 GB synthetic inputs crossed with 16/8/4 GB memory profiles
+  for MultiLogReg, randomized SVD, GNMF, KMeans, PCA, LMCG, and L2-SVM.
+- `benchmark-plan2.yaml`: the previous single-configuration plan preserved unchanged.
 - `run_cgroup_baselines.sh`, `benchmark_plan.py`, `drop_caches.py`: all runner support required
   by the plan.
 - `prepare_numpy.py`: generates arbitrary-shape synthetic row-major FP64 matrices with bounded RAM
@@ -60,8 +60,9 @@ activation contains 603,979,776 FP64 values (4.5 GiB), and forward/backward trai
 such logical tensors. The input itself is intentionally only 65,536 by 8: this keeps the arithmetic
 manageable while making the neural-network activation working set, rather than merely the source
 dataset, exceed the 4 GiB cgroup. The weights remain small, so this is accurately an activation-OOC
-benchmark rather than an OOC model-parameter benchmark. NumPy expresses the same full batch and is
-expected to exceed the cap; Dask derives chunks automatically from the expanded activation geometry.
+benchmark rather than an OOC model-parameter benchmark. NumPy expresses the same full batch using
+disk-backed activation, mask, and gradient arrays; Dask derives chunks automatically from the
+expanded activation geometry.
 All implementations retain the two affine layers, He initialization, ReLU, inverted dropout with
 keep probability 0.35, sigmoid/log-loss gradient, Nesterov update, momentum schedule, and
 learning-rate decay. Framework-specific dropout random streams can produce different model values.
@@ -100,6 +101,13 @@ starts from zero, uses the correlated `binary_y.f64` response, performs the decl
 of `X%*%p` and `t(X)%*%v` passes when tolerance is zero, and materializes the coefficient vector.
 NumPy exposes the complete memmap to its linear algebra kernels; Dask selects chunks automatically.
 
+L2-SVM trains the same zero-intercept binary linear classifier with squared hinge loss and L2
+regularization. SystemDS calls the vendored builtin implementation directly; NumPy and Dask mirror
+its nonlinear conjugate-gradient direction and Newton line search. All arms use the correlated
+`{-1,+1}` labels, zero initialization, three outer iterations, 20 inner iterations, zero stopping
+tolerance, and materialize the complete coefficient vector. NumPy exposes the whole memmap and
+Dask chooses chunks automatically; neither baseline introduces a user-selected row-block loop.
+
 GNMF minimizes the Euclidean reconstruction error of `X ~= W %*% H` with the standard Lee-Seung
 multiplicative updates. Its dedicated 1,000,000-by-384 input is uniformly distributed on `[0,1)` and
 occupies 3.072 GB as raw FP64. Rank, iteration count, epsilon, seed, update order, initialization,
@@ -124,9 +132,9 @@ blocksize_sweeps:
 A sweep expands into independently named cases such as `multilogreg_3g-ooc-bs500` and
 `multilogreg_3g-spark-bs2000`, with separate result directories and CSV files. The OOC case contains
 `systemds-ooc`; the Spark case contains `systemds-spark`, launched using `spark-submit --master
-local[<spark_threads>]`. The default `resources.spark_threads: 4` limits simultaneously decoded
-Spark partitions independently of the host-wide CPU ceiling; this avoids exhausting the 3 GiB
-driver heap with one input partition per available CPU. Implementations without a blocksize
+local[<spark_threads>]`. The scaling plan gives SystemDS, NumPy, Dask, and Spark the same host-wide
+thread allowance through `auto`; Dask fixes BLAS to one thread per scheduled task to avoid nested
+parallelism. Implementations without a blocksize
 association run exactly once in a separate case such as `multilogreg_3g-baseline`. NumPy/Dask
 therefore continue to use the same unblocked
 row-major memmaps without being repeated or labelled with a SystemDS blocksize. Before a SystemDS
@@ -142,9 +150,16 @@ Cold-cache traversal ignores preparation symlinks to tools such as the SystemDS 
 The implementation template's `blocksize_sweep` field associates it with `ooc` or `spark`.
 Implementations without an association, such as NumPy, sklearn, SciPy, and Dask, are grouped in the
 single `-baseline` case. This case skips SystemDS native conversion and SystemDS-specific setup.
-The dedicated Dask template limits the threaded scheduler with `resources.dask_threads` and fixes
-BLAS libraries to one thread per task, avoiding nested Dask-by-BLAS parallelism. NumPy continues to
-use `resources.threads`, while Spark uses its independent `resources.spark_threads` setting.
+The dedicated Dask template uses one in-process threaded scheduler, limits it with
+`resources.dask_threads`, targets `resources.dask_chunk_size` per automatically selected chunk,
+and fixes BLAS libraries to one thread per task, avoiding nested Dask-by-BLAS parallelism. The
+default 32 MiB target controls task granularity, while each memory profile scales Dask's managed
+memory limit to 12, 6, or 3 GiB; neither setting is a SystemDS blocksize. Tall Dask outputs such as
+PCA scores and GNMF `W` are stored directly into `.npy` memmaps rather than first being collected
+into the Python heap. NumPy continues to use `resources.threads`; its activation-sized MLP
+intermediates and tall PCA output are disk-backed memmaps. RandomForest separately caps concurrent
+sklearn tree builds with `resources.python_jobs`, because job-level parallelism duplicates
+tree-building state. Spark uses its independent `resources.spark_threads` setting.
 The old scalar or list-valued `parameters.blocksize` form remains accepted for plans that want one
 shared sweep across all implementations.
 
@@ -189,19 +204,58 @@ during plan validation. Missing raw files are generated per dataset first, follo
 every native SystemDS blocksize selected for that dataset. Incompatible raw data is never silently
 replaced.
 
-The `kmeans_3g`, `pca_3g`, and `lmcg_3g` declarations are disabled by default because their large
-3 GiB OOC/Spark paths have not been executed against the configured host JAR. Enable only one run
-and initially reduce its sweeps to one candidate, for example:
+Larger campaigns should use named dataset groups, resource profiles, and correlated parameter
+cases instead of duplicating run declarations. The default plan includes an aligned 4/8/16 GB
+`dense_scaling` group, consistent cgroup/JVM pairs, and activation-sized MLP cases:
 
 ```yaml
-- id: lmcg_3g
+resource_profiles:
+  mem16: {memory_max: 16G, java_heap: 12g, dask_memory_limit: 12GiB}
+  mem8: {memory_max: 8G, java_heap: 6g, dask_memory_limit: 6GiB}
+  mem4: {memory_max: 4G, java_heap: 3g, dask_memory_limit: 3GiB}
+
+dataset_groups:
+  dense_scaling: [dense_d4, dense_d8, dense_d16]
+
+parameter_cases:
+  mlp_activation:
+    - {id: act4, hidden_size: 8192}
+    - {id: act8, hidden_size: 16384}
+
+runs:
+  - id: lmcg
+    dataset: {group: dense_scaling}
+    resource_profiles: [mem16, mem8, mem4]
+    blocksize_sweeps: {ooc: [500], spark: [1000]}
+    # Remaining workload fields are unchanged.
+```
+
+Expansion order is dataset, resource profile, parameter case, backend/blocksize, and repetition.
+For example, a run that also selects `parameter_cases: mlp_activation` can produce
+`mlp-dense_d8-mem4-act8-ooc-bs500`. A selected resource profile overrides matching keys in the
+run's `resources` mapping; unrelated run-specific settings such as its timeout remain in effect.
+Parameter cases similarly override matching keys in `parameters`. Scalar datasets and runs without
+these selectors retain their previous names and behavior. Dataset groups, profiles, parameter case
+IDs, duplicates, and all referenced datasets are validated even when the corresponding run is
+disabled.
+
+The current plan enables MultiLogReg, KMeans, LMCG, and L2-SVM. With `dense_scaling` currently
+narrowed to `dense_d16`, three resource profiles and three backend case types expand these to 36
+run cases and 48 implementation executions per repetition. The other supported scaling workloads
+remain declared but disabled, and GNMF uses a separate size-matched nonnegative dataset group. For
+an initial host smoke test, disable the other workloads and retain one dataset and profile, for
+example:
+
+```yaml
+- id: lmcg_scaling
   enabled: true
+  dataset: dense_d4
+  resource_profiles: [mem16]
   blocksize_sweeps: {ooc: [500], spark: [1000]}
 ```
 
-After that run validates, expand the sweep or enable the next workload. KMeans and LMCG use
-300-second caps; covariance PCA uses a 600-second cap because its 1,024-column Gram matrix is much
-more compute-intensive than the existing tall-and-skinny workloads.
+KMeans, LMCG, and L2-SVM use 300-second caps; covariance PCA and GNMF use 600-second caps. Dataset
+generation and native conversion remain on demand and outside the measured cgroups.
 
 The canonical dense interchange format is headerless little-endian row-major FP64 plus JSON
 metadata. NumPy, Dask, and dense SciPy operations can all consume it directly through `np.memmap`;
@@ -234,26 +288,49 @@ Update `root` and `tools` in `benchmark-plan.yaml` for the target host. In parti
 cgroups are available:
 
 ```bash
+python3 -m pip install -r requirements-baselines.txt
 systemctl --user status
 systemd-run --user --scope -p MemoryMax=4G true
 ./run_cgroup_baselines.sh
 ```
 
+Install the requirements with the same interpreter configured as `tools.python`; the command above
+is illustrative when that interpreter is the active `python3`.
+
 `tools.systemds_jar` must point to an existing JAR. PageRank preparation delegates to
 `experiments/real_world/prepare.sh`, whose downloads are resumable and whose expensive CSR data is
 reused when only a native SystemDS representation is missing.
 
-The SystemDS templates use a 3 GiB JVM/Spark-driver heap, `MemoryMax=4G`, and a 60-second timeout by
-default; the Twitter PageRank case overrides the timeout to 3,600 seconds. Local Spark defaults to
-eight simultaneous tasks and runs its driver and executor threads inside the same timed cgroup. Override
-`resources.spark_threads` per run only after a one-case memory smoke test. The extra cgroup GiB
-accommodates JVM and Spark overhead while Linux charges and reclaims mapped input pages. Results
+The scaling plan pairs 12/6/3 GiB Java heaps with 16/8/4 GB cgroups. Local Spark runs its driver,
+executor threads, native allocations, and local shuffle storage inside the same timed cgroup. Its
+task count and blocksize are independent from the OOC settings. Each case has private SystemDS
+scratch, Java temporary, and Spark-local directories,
+which prevents stale temporary state from another case from entering a lazy Spark lineage. Override
+`resources.spark_threads` per run only after a one-case memory smoke test. Heap headroom accommodates
+JVM/native overhead while Linux charges and reclaims mapped input pages. Results
 are append-only and written under
 `${plan.root}/bench-results/<YYYYMMDDTHHMMSS.microseconds+timezone>/<run-case-id>/`. The
-timestamped invocation directory contains its benchmark-plan snapshot; each case directory
-contains its logs, outputs, `results.csv`, and resolved context.
+timestamped invocation directory contains its benchmark-plan snapshot and `expanded-plan.yaml`,
+whose runs have no remaining group/profile/case selectors and whose implementations have their
+templates resolved. Each case directory contains its logs,
+outputs, `results.csv`, `resolved-context.json`, and `resolved-run.json`. The latter records concrete
+inputs, resource settings, setup commands, and per-repetition commands without copying the inherited
+host environment.
+Every timed implementation/repetition receives fresh private `systemds-tmp`, `systemds-scratch`,
+`spark-local`, `java-tmp`, `dask-spill`, and `python-tmp` roots below its case directory. The runner
+removes those complete roots in a `finally` block after success, failure, timeout, or cgroup OOM;
+cleanup occurs after the measured wall-time boundary. Logs, metrics, and declared outputs are not
+part of the cleanup set. Plans can override the list with top-level or run-level `temporary_paths`,
+but the runner rejects the case directory itself and every path outside it.
 `results.csv` reports `wall_seconds` from GNU `time`, enclosing process startup, mapping, execution,
 and output. For Spark this includes `spark-submit`, JVM startup, and Spark-context initialization.
 This is the primary comparison metric. `algorithm_seconds` includes workload input
 setup, computation, checksums, and materialized numeric outputs, but remains a secondary metric
 because framework startup boundaries differ.
+
+When Python or Dask templates are enabled, the runner checks their
+declared modules in `tools.python` and reports a single plan error for missing NumPy, SciPy,
+scikit-learn, joblib, or Dask dependencies. The timed payload raises its Linux OOM score relative to
+the accounting wrapper, so a cgroup OOM normally leaves exit status 137, GNU-time data, and cgroup
+memory events instead of an empty log and `nan` metrics. NumPy MLP activation memmaps use the
+runner-owned `python-tmp` root and are therefore removed after failed or successful executions.

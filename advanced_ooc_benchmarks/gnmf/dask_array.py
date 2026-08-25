@@ -10,9 +10,11 @@ from pathlib import Path
 script_dir = str(Path(__file__).resolve().parent)
 if sys.path and sys.path[0] == script_dir:
     sys.path.pop(0)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import dask.array as da
 import numpy as np
+from dask_support import create_client, load_matrix
 
 
 def main():
@@ -23,18 +25,19 @@ def main():
     parser.add_argument("--epsilon", type=float, default=1e-8)
     parser.add_argument("--seed", type=int, default=23)
     parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--memory-limit", default="3GiB")
+    parser.add_argument("--temporary-directory", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if min(args.rank, args.iterations, args.threads) < 1 or args.epsilon <= 0:
         raise ValueError("rank/iterations/threads and epsilon must be positive")
-    compute_options = {"scheduler": "threads", "num_workers": args.threads}
+    client = create_client(args.threads, args.memory_limit, args.temporary_directory)
+    compute_options = {}
 
     start = time.perf_counter()
     metadata = json.loads((args.data / "X.f64.json").read_text(encoding="utf-8"))
     rows, cols = metadata["rows"], metadata["cols"]
-    mapped = np.memmap(args.data / "X.f64", dtype=np.float64, mode="r",
-                       shape=(rows, cols))
-    matrix = da.from_array(mapped, chunks="auto")
+    matrix = load_matrix(args.data / "X.f64", (rows, cols))
     row_ids = da.arange(1, rows + 1, chunks=matrix.chunks[0])[:, None]
     component_ids = np.arange(1, args.rank + 1, dtype=np.float64)[None, :]
     col_ids = np.arange(1, cols + 1, dtype=np.float64)[None, :]
@@ -48,19 +51,24 @@ def main():
         denominator = w @ (h @ h.T)
         w = (w * numerator / (denominator + args.epsilon)).persist(**compute_options)
 
-    materialized_w = w.compute(**compute_options)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    np.save(args.output.with_name(args.output.stem + "-W.npy"), materialized_w)
+    w_path = args.output.with_name(args.output.stem + "-W.npy")
+    materialized_w = np.lib.format.open_memmap(
+        w_path, mode="w+", dtype=np.float64, shape=(rows, args.rank))
+    stored = da.store(w, materialized_w, lock=False, compute=False, return_stored=True)
+    w_checksum = float(stored.sum().compute(**compute_options))
+    materialized_w.flush()
     np.save(args.output.with_name(args.output.stem + "-H.npy"), h)
     report = {
         "implementation": "dask-gnmf",
         "seconds": time.perf_counter() - start,
         "iterations": args.iterations,
-        "w_checksum": float(materialized_w.sum()),
+        "w_checksum": w_checksum,
         "h_checksum": float(h.sum()),
     }
     args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report))
+    client.close()
 
 
 if __name__ == "__main__":

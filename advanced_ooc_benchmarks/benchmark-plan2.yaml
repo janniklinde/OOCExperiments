@@ -1,4 +1,4 @@
-# Aligned 4/8/16 GB synthetic scaling sweep over 16/8/4 GB memory limits.
+# Standalone 3 GiB-heap OOC comparison over the existing 1M x 1024 dense input.
 version: 1
 root: /media/jannik/data/OOCExperiments
 results: ${plan.root}/bench-results
@@ -21,11 +21,11 @@ defaults:
   repetitions: 1
   resources:
     threads: auto
-    dask_threads: auto
+    dask_threads: 8
     dask_chunk_size: 32MiB
     dask_memory_limit: 3GiB
     python_jobs: 4
-    spark_threads: auto
+    spark_threads: 8
     swap_max: 0
     timeout_seconds: 60
     timeout_grace_seconds: 30
@@ -33,9 +33,9 @@ defaults:
 # Named profiles keep correlated cgroup and JVM settings together. A run may
 # select one or a list with `resource_profiles: [mem16, mem8, mem4]`.
 resource_profiles:
-  mem16: {memory_max: 16G, java_heap: 12g, dask_memory_limit: 12GiB}
-  mem8: {memory_max: 8G, java_heap: 6g, dask_memory_limit: 6GiB}
-  mem4: {memory_max: 4G, java_heap: 3g, dask_memory_limit: 3GiB}
+  mem16: {memory_max: 16G, java_heap: 12g}
+  mem8: {memory_max: 8G, java_heap: 6g}
+  mem4: {memory_max: 4G, java_heap: 3g}
 
 # Correlated algorithm parameters expand as named cases rather than as an
 # unrestricted Cartesian product. These activation sizes are exact GiB for
@@ -107,7 +107,7 @@ templates:
       ${run.systemds_args}
   python:
     comparable: true
-    enabled: true
+    enabled: false
     required_python_modules: [numpy]
     environment:
       OMP_NUM_THREADS: ${resources.threads}
@@ -116,7 +116,7 @@ templates:
       MALLOC_ARENA_MAX: 2
   dask:
     comparable: true
-    enabled: true
+    enabled: false
     required_python_modules: [numpy, dask.array, distributed]
     environment:
       OMP_NUM_THREADS: 1
@@ -228,38 +228,20 @@ datasets:
        distribution: normal, seed: 103, generator_chunk_mib: 256,
        accept_legacy: false, systemds_chunk_mib: 128}
 
+  dense_d32:
+    <<: *dense_dataset
+    directory: ${plan.root}/bench-data/dense-d32
+    parameters:
+      {rows: 4000000, cols: 1000, classes: 2, sparsity: 1.0,
+       distribution: normal, seed: 104, generator_chunk_mib: 256,
+       accept_legacy: false, systemds_chunk_mib: 128}
+
   gnmf_1m:
     <<: *dense_dataset
     directory: ${plan.root}/bench-data/gnmf
     parameters:
       {rows: 1000000, cols: 384, classes: 2, sparsity: 1.0,
        distribution: uniform_nonnegative, seed: 23, generator_chunk_mib: 256,
-       accept_legacy: false, systemds_chunk_mib: 128}
-
-  # GNMF requires nonnegative inputs, so its scaling series matches the dense
-  # sweep's byte sizes and geometry without reusing invalid normal data.
-  gnmf_d4:
-    <<: *dense_dataset
-    directory: ${plan.root}/bench-data/gnmf-d4
-    parameters:
-      {rows: 500000, cols: 1000, classes: 2, sparsity: 1.0,
-       distribution: uniform_nonnegative, seed: 201, generator_chunk_mib: 256,
-       accept_legacy: false, systemds_chunk_mib: 128}
-
-  gnmf_d8:
-    <<: *dense_dataset
-    directory: ${plan.root}/bench-data/gnmf-d8
-    parameters:
-      {rows: 1000000, cols: 1000, classes: 2, sparsity: 1.0,
-       distribution: uniform_nonnegative, seed: 202, generator_chunk_mib: 256,
-       accept_legacy: false, systemds_chunk_mib: 128}
-
-  gnmf_d16:
-    <<: *dense_dataset
-    directory: ${plan.root}/bench-data/gnmf-d16
-    parameters:
-      {rows: 2000000, cols: 1000, classes: 2, sparsity: 1.0,
-       distribution: uniform_nonnegative, seed: 203, generator_chunk_mib: 256,
        accept_legacy: false, systemds_chunk_mib: 128}
 
   mlp_activation_64k:
@@ -439,9 +421,8 @@ datasets:
         ../experiments/real_world/prepare.sh twitter-2010 "${dataset.dir}"
 
 dataset_groups:
-  dense_scaling: [dense_d16] #[dense_d4, dense_d8, dense_d16]
-  gnmf_scaling: [gnmf_d16] #[gnmf_d4, gnmf_d8, gnmf_d16]
-  dense_legacy_scaling: [dense_2m] #[dense_1m, dense_2m]
+  dense_scaling: [dense_d4, dense_d8, dense_d16, dense_d32]
+  dense_legacy_scaling: [dense_1m, dense_2m]
 
 systemds_setup: &systemds_setup
   command: |
@@ -485,10 +466,9 @@ runs:
           --iterations ${run.iterations} --alpha ${run.alpha}
           --output "${run.outputs}/scipy-r${rep}.npy"
 
-  - id: multilogreg_scaling
-    enabled: true
-    dataset: {group: dense_scaling}
-    resource_profiles: [mem16, mem8, mem4]
+  - id: multilogreg_3g
+    enabled: false
+    dataset: dense_1m
     entrypoint: ${plan.dir}/multilogreg/systemds.dml
     blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
@@ -500,7 +480,7 @@ runs:
         -args "${input.X}" "${input.y}" ${run.tolerance} ${run.reg}
         ${run.iterations} ${run.inner_iterations} "${run.outputs}/systemds-r${rep}"
     inputs: {X: {artifact: X}, y: {artifact: binary_y}}
-    resources: {timeout_seconds: 300}
+    resources: {memory_max: 4G, java_heap: 3g, timeout_seconds: 300}
     setup: *systemds_setup
     cold_cache: ["${dataset.dir}"]
     implementations:
@@ -514,10 +494,9 @@ runs:
           --tolerance ${run.tolerance} --reg ${run.reg}
           --output "${run.outputs}/python-r${rep}.json"
 
-  - id: randomized_svd_scaling
-    enabled: true
-    dataset: {group: dense_scaling}
-    resource_profiles: [mem16, mem8, mem4]
+  - id: randomized_svd_3g
+    enabled: false
+    dataset: dense_1m
     entrypoint: ${plan.dir}/randomized_svd/systemds.dml
     blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
@@ -527,7 +506,7 @@ runs:
         -args "${input.X}" ${run.rank} ${run.seed}
         "${run.outputs}/systemds-S-r${rep}" "${run.outputs}/systemds-V-r${rep}"
     inputs: {X: {artifact: X}}
-    resources: {timeout_seconds: 300}
+    resources: {memory_max: 4G, java_heap: 3g, timeout_seconds: 300}
     setup: *systemds_setup
     cold_cache: ["${dataset.dir}"]
     implementations:
@@ -585,10 +564,9 @@ runs:
           --memory-limit ${resources.dask_memory_limit} --temporary-directory "${run.results}/dask-spill"
           --output "${run.outputs}/dask-r${rep}.json"
 
-  - id: gnmf_scaling
+  - id: gnmf_3g
     enabled: true
-    dataset: {group: gnmf_scaling}
-    resource_profiles: [mem16, mem8, mem4]
+    dataset: gnmf_1m
     entrypoint: ${plan.dir}/gnmf/systemds.dml
     blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
@@ -600,7 +578,7 @@ runs:
         -args "${input.X}" ${run.rank} ${run.iterations} ${run.epsilon} ${run.seed}
         "${run.outputs}/systemds-W-r${rep}" "${run.outputs}/systemds-H-r${rep}"
     inputs: {X: {artifact: X}}
-    resources: {timeout_seconds: 600}
+    resources: {memory_max: 4G, java_heap: 3g, timeout_seconds: 600}
     setup: *systemds_setup
     cold_cache: ["${dataset.dir}"]
     implementations:
@@ -655,10 +633,9 @@ runs:
 
   # Newly added workloads are disabled until one blocksize/backend at a time has
   # completed a host smoke run under the 3 GiB heap and 4 GiB cgroup.
-  - id: kmeans_scaling
-    enabled: true
-    dataset: {group: dense_scaling}
-    resource_profiles: [mem16, mem8, mem4]
+  - id: kmeans_3g
+    enabled: false
+    dataset: dense_1m
     entrypoint: ${plan.dir}/kmeans/systemds.dml
     blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
@@ -669,7 +646,7 @@ runs:
         "${run.outputs}/systemds-centers-r${rep}"
         "${run.outputs}/systemds-labels-r${rep}"
     inputs: {X: {artifact: X}}
-    resources: {timeout_seconds: 300}
+    resources: {memory_max: 4G, java_heap: 3g, timeout_seconds: 300}
     setup: *systemds_setup
     cold_cache: ["${dataset.dir}"]
     implementations:
@@ -690,10 +667,9 @@ runs:
           --memory-limit ${resources.dask_memory_limit} --temporary-directory "${run.results}/dask-spill"
           --output "${run.outputs}/dask-r${rep}.json"
 
-  - id: pca_scaling
-    enabled: true
-    dataset: {group: dense_scaling}
-    resource_profiles: [mem16, mem8, mem4]
+  - id: pca_3g
+    enabled: false
+    dataset: dense_1m
     entrypoint: ${plan.dir}/pca/systemds.dml
     blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
@@ -704,7 +680,7 @@ runs:
         "${run.outputs}/systemds-components-r${rep}"
         "${run.outputs}/systemds-eigenvalues-r${rep}"
     inputs: {X: {artifact: X}}
-    resources: {timeout_seconds: 600}
+    resources: {memory_max: 4G, java_heap: 3g, timeout_seconds: 600}
     setup: *systemds_setup
     cold_cache: ["${dataset.dir}"]
     implementations:
@@ -723,10 +699,9 @@ runs:
           --memory-limit ${resources.dask_memory_limit} --temporary-directory "${run.results}/dask-spill"
           --output "${run.outputs}/dask-r${rep}.json"
 
-  - id: lmcg_scaling
-    enabled: true
-    dataset: {group: dense_scaling}
-    resource_profiles: [mem16, mem8, mem4]
+  - id: lmcg_3g
+    enabled: false
+    dataset: dense_1m
     entrypoint: ${plan.dir}/lmcg/systemds.dml
     blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
@@ -737,7 +712,7 @@ runs:
         -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance}
         "${run.outputs}/systemds-beta-r${rep}"
     inputs: {X: {artifact: X}, y: {artifact: binary_y}}
-    resources: {timeout_seconds: 300}
+    resources: {memory_max: 4G, java_heap: 3g, timeout_seconds: 300}
     setup: *systemds_setup
     cold_cache: ["${dataset.dir}"]
     implementations:
@@ -754,45 +729,6 @@ runs:
         command: >-
           "${tools.python}" "${plan.dir}/lmcg/dask_array.py" "${dataset.dir}"
           --iterations ${run.iterations} --reg ${run.reg} --tolerance ${run.tolerance}
-          --threads ${resources.dask_threads}
-          --memory-limit ${resources.dask_memory_limit} --temporary-directory "${run.results}/dask-spill"
-          --output "${run.outputs}/dask-r${rep}.json"
-
-  - id: l2svm_scaling
-    enabled: true
-    dataset: {group: dense_scaling}
-    resource_profiles: [mem16, mem8, mem4]
-    entrypoint: ${plan.dir}/l2svm/systemds.dml
-    blocksize_sweeps: {ooc: [500], spark: [1000]}
-    parameters:
-      iterations: 3
-      inner_iterations: 20
-      tolerance: 0.0
-      reg: 1.0
-      systemds_args: >-
-        -args "${input.X}" "${input.y}" ${run.tolerance} ${run.reg}
-        ${run.iterations} ${run.inner_iterations}
-        "${run.outputs}/systemds-model-r${rep}"
-    inputs: {X: {artifact: X}, y: {artifact: binary_y}}
-    resources: {timeout_seconds: 300}
-    setup: *systemds_setup
-    cold_cache: ["${dataset.dir}"]
-    implementations:
-      - {id: systemds-ooc, template: systemds-ooc}
-      - {id: systemds-spark, template: systemds-spark}
-      - id: numpy-cg-linesearch
-        template: python
-        command: >-
-          "${tools.python}" "${plan.dir}/l2svm/numpy.py" "${dataset.dir}"
-          --iterations ${run.iterations} --inner-iterations ${run.inner_iterations}
-          --tolerance ${run.tolerance} --reg ${run.reg}
-          --output "${run.outputs}/numpy-r${rep}.json"
-      - id: dask-cg-linesearch
-        template: dask
-        command: >-
-          "${tools.python}" "${plan.dir}/l2svm/dask_array.py" "${dataset.dir}"
-          --iterations ${run.iterations} --inner-iterations ${run.inner_iterations}
-          --tolerance ${run.tolerance} --reg ${run.reg}
           --threads ${resources.dask_threads}
           --memory-limit ${resources.dask_memory_limit} --temporary-directory "${run.results}/dask-spill"
           --output "${run.outputs}/dask-r${rep}.json"
@@ -833,7 +769,7 @@ runs:
     enabled: false
     dataset: als_1m
     entrypoint: ${plan.dir}/als/systemds.dml
-    blocksize_sweeps: {ooc: [8000], spark: [8000]}
+    blocksize_sweeps: {ooc: [8000], spark: [4000]}
     parameters:
       rank: 16
       iterations: 1

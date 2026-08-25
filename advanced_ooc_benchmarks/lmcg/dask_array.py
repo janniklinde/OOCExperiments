@@ -10,9 +10,11 @@ from pathlib import Path
 script_dir = str(Path(__file__).resolve().parent)
 if sys.path and sys.path[0] == script_dir:
     sys.path.pop(0)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import dask.array as da
 import numpy as np
+from dask_support import create_client, default_row_chunk, load_matrix
 
 
 def main():
@@ -22,20 +24,22 @@ def main():
     parser.add_argument("--reg", type=float, default=1e-7)
     parser.add_argument("--tolerance", type=float, default=0.0)
     parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--memory-limit", default="3GiB")
+    parser.add_argument("--temporary-directory", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.iterations < 1 or args.reg < 0 or args.tolerance < 0 or args.threads < 1:
         raise ValueError("iterations/threads must be positive and reg/tolerance non-negative")
-    compute_options = {"scheduler": "threads", "num_workers": args.threads}
+    client = create_client(args.threads, args.memory_limit, args.temporary_directory)
+    compute_options = {}
 
     start = time.perf_counter()
     metadata = json.loads((args.data / "metadata.json").read_text())
     shape = (metadata["rows"], metadata["cols"])
-    mapped = np.memmap(args.data / "X.f64", dtype=np.float64, mode="r", shape=shape)
-    mapped_y = np.memmap(args.data / "binary_y.f64", dtype=np.float64, mode="r",
-                         shape=(shape[0], 1))
-    matrix = da.from_array(mapped, chunks="auto")
-    response = da.from_array(mapped_y, chunks=(matrix.chunks[0], (1,)))
+    #both operands share one row-chunking so the elementwise/reduction steps stay aligned
+    row_chunk = default_row_chunk(shape[1])
+    matrix = load_matrix(args.data / "X.f64", shape, row_chunk=row_chunk)
+    response = load_matrix(args.data / "binary_y.f64", (shape[0], 1), row_chunk=row_chunk)
     beta = np.zeros((shape[1], 1), dtype=np.float64)
     residual = -(matrix.T @ response).compute(**compute_options)
     direction = -residual
@@ -61,6 +65,7 @@ def main():
               "beta_checksum": float(beta.sum())}
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report))
+    client.close()
 
 
 if __name__ == "__main__":

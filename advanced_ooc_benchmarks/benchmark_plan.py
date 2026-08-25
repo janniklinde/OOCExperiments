@@ -27,6 +27,14 @@ except ImportError:
 
 _PLACEHOLDER = re.compile(r"\$\{([A-Za-z0-9_.-]+)\}")
 _VALID_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
+_DEFAULT_TEMPORARY_PATHS = [
+    "${run.results}/systemds-tmp",
+    "${run.results}/systemds-scratch",
+    "${run.results}/spark-local",
+    "${run.results}/java-tmp",
+    "${run.results}/dask-spill",
+    "${run.results}/python-tmp",
+]
 
 
 def execution_timestamp(moment=None):
@@ -279,9 +287,36 @@ def prepare_dataset_variant(dataset_id, variant_id, variant, directory, context,
     return context
 
 
-def run_dataset_ids(run):
-    """Return and validate the dataset IDs declared by one configured run."""
+def named_mapping(plan, key):
+    """Return and structurally validate a top-level mapping of named definitions."""
+    values = plan.get(key, {})
+    if not isinstance(values, dict):
+        raise ValueError(f"{key} must be a mapping")
+    for value_id in values:
+        if not _VALID_ID.match(str(value_id)):
+            raise ValueError(f"Invalid {key} id {value_id!r}")
+    return values
+
+
+def dataset_selection(run, dataset_groups=None):
+    """Resolve a scalar/list dataset selection or a named dataset group."""
     value = run.get("dataset", "")
+    if not isinstance(value, dict):
+        return value
+    if set(value) != {"group"}:
+        raise ValueError(f"Run {run.get('id', '')} dataset mapping must contain only group")
+    group_id = str(value["group"])
+    if not _VALID_ID.match(group_id):
+        raise ValueError(f"Run {run.get('id', '')} has invalid dataset group id {group_id!r}")
+    dataset_groups = dataset_groups or {}
+    if group_id not in dataset_groups:
+        raise ValueError(f"Run {run.get('id', '')} refers to unknown dataset group {group_id}")
+    return dataset_groups[group_id]
+
+
+def run_dataset_ids(run, dataset_groups=None):
+    """Return and validate the dataset IDs declared by one configured run."""
+    value = dataset_selection(run, dataset_groups)
     values = value if isinstance(value, list) else [value]
     run_id = str(run.get("id", ""))
     if not values:
@@ -299,14 +334,15 @@ def run_dataset_ids(run):
     return dataset_ids
 
 
-def expand_dataset_cases(runs):
+def expand_dataset_cases(runs, dataset_groups=None):
     """Expand list-valued dataset declarations before other run dimensions."""
     cases = []
     for configured_run in runs:
-        if not isinstance(configured_run.get("dataset"), list):
+        selection = dataset_selection(configured_run, dataset_groups)
+        if not isinstance(selection, list):
             cases.append(configured_run)
             continue
-        dataset_ids = run_dataset_ids(configured_run)
+        dataset_ids = run_dataset_ids(configured_run, dataset_groups)
         configured_id = str(configured_run.get("id", ""))
         logical_base_id = str(configured_run.get("base_id", configured_id))
         for dataset_id in dataset_ids:
@@ -318,11 +354,114 @@ def expand_dataset_cases(runs):
     return cases
 
 
-def expand_run_cases(runs, templates=None):
-    """Expand dataset and legacy or backend-specific blocksize sweeps into run cases."""
+def selected_names(run, field, definitions):
+    """Validate a scalar/list selection from a named top-level definition mapping."""
+    value = run.get(field)
+    values = value if isinstance(value, list) else [value]
+    run_id = str(run.get("id", ""))
+    if not values or any(value is None for value in values):
+        raise ValueError(f"Run {run_id} {field} must not be empty")
+    selected = []
+    seen = set()
+    for value in values:
+        value_id = str(value)
+        if not _VALID_ID.match(value_id):
+            raise ValueError(f"Run {run_id} has invalid {field} id {value_id!r}")
+        if value_id not in definitions:
+            raise ValueError(f"Run {run_id} refers to unknown {field} {value_id}")
+        if value_id in seen:
+            raise ValueError(f"Run {run_id} repeats {field} {value_id!r}")
+        seen.add(value_id)
+        selected.append(value_id)
+    return selected
+
+
+def expand_resource_profile_cases(runs, resource_profiles=None):
+    """Expand named, correlated resource configurations such as cgroup/heap pairs."""
+    resource_profiles = resource_profiles or {}
+    cases = []
+    for configured_run in runs:
+        if "resource_profiles" not in configured_run:
+            cases.append(configured_run)
+            continue
+        for profile_id in selected_names(configured_run, "resource_profiles", resource_profiles):
+            profile = resource_profiles[profile_id]
+            if not isinstance(profile, dict):
+                raise ValueError(f"Resource profile {profile_id} must be a mapping")
+            run = copy.deepcopy(configured_run)
+            base_id = str(run.get("id", ""))
+            run["id"] = f"{base_id}-{profile_id}"
+            run["base_id"] = str(run.get("base_id", base_id))
+            resources = copy.deepcopy(run.get("resources", {}))
+            resources.update(profile)
+            run["resources"] = resources
+            run["resource_profile"] = profile_id
+            run.pop("resource_profiles", None)
+            cases.append(run)
+    return cases
+
+
+def parameter_case_values(case_group, case_id, value):
+    if not isinstance(value, dict):
+        raise ValueError(f"Parameter case {case_group}.{case_id} must be a mapping")
+    if "parameters" in value:
+        if set(value) != {"id", "parameters"} or not isinstance(value["parameters"], dict):
+            raise ValueError(f"Parameter case {case_group}.{case_id} with parameters must contain "
+                             "only id and a parameter mapping")
+        return copy.deepcopy(value["parameters"])
+    return {key: copy.deepcopy(child) for key, child in value.items() if key != "id"}
+
+
+def expand_parameter_cases(runs, parameter_cases=None):
+    """Expand named lists of correlated algorithm parameter mappings."""
+    parameter_cases = parameter_cases or {}
+    cases = []
+    for configured_run in runs:
+        if "parameter_cases" not in configured_run:
+            cases.append(configured_run)
+            continue
+        group_id = configured_run["parameter_cases"]
+        if not isinstance(group_id, str) or not _VALID_ID.match(group_id):
+            raise ValueError(f"Run {configured_run.get('id', '')} parameter_cases must name one "
+                             "parameter case group")
+        if group_id not in parameter_cases:
+            raise ValueError(f"Run {configured_run.get('id', '')} refers to unknown parameter "
+                             f"case group {group_id}")
+        values = parameter_cases[group_id]
+        if not isinstance(values, list) or not values:
+            raise ValueError(f"Parameter case group {group_id} must be a non-empty list")
+        seen = set()
+        for value in values:
+            if not isinstance(value, dict) or "id" not in value:
+                raise ValueError(f"Parameter case group {group_id} entries must be mappings with id")
+            case_id = str(value["id"])
+            if not _VALID_ID.match(case_id):
+                raise ValueError(f"Invalid parameter case id {case_id!r} in group {group_id}")
+            if case_id in seen:
+                raise ValueError(f"Parameter case group {group_id} repeats case {case_id!r}")
+            seen.add(case_id)
+            run = copy.deepcopy(configured_run)
+            base_id = str(run.get("id", ""))
+            run["id"] = f"{base_id}-{case_id}"
+            run["base_id"] = str(run.get("base_id", base_id))
+            parameters = copy.deepcopy(run.get("parameters", {}))
+            parameters.update(parameter_case_values(group_id, case_id, value))
+            run["parameters"] = parameters
+            run["parameter_case"] = case_id
+            run.pop("parameter_cases", None)
+            cases.append(run)
+    return cases
+
+
+def expand_run_cases(runs, templates=None, dataset_groups=None, resource_profiles=None,
+                     parameter_cases=None):
+    """Expand datasets, resources, parameters, and backend-specific block sizes."""
     templates = templates or {}
     cases = []
-    for configured_run in expand_dataset_cases(runs):
+    expanded = expand_dataset_cases(runs, dataset_groups)
+    expanded = expand_resource_profile_cases(expanded, resource_profiles)
+    expanded = expand_parameter_cases(expanded, parameter_cases)
+    for configured_run in expanded:
         sweeps = configured_run.get("blocksize_sweeps")
         if sweeps is not None:
             if not isinstance(sweeps, dict) or not sweeps:
@@ -434,16 +573,21 @@ set +e
 log="$1"; metrics="$2"; run_timeout="$3"; grace="$4"; shift 4
 time_bin="${TIME_BIN:-/usr/bin/time}"
 printf 'started_at=%s timeout_seconds=%s grace_seconds=%s\n' "$(date -Is)" "$run_timeout" "$grace" >"$log"
+printf 'exit_status=running\n' >"$metrics"
+# Give the benchmark payload a higher OOM score than this small accounting
+# wrapper. If MemoryMax is exhausted, the kernel can kill the payload while
+# timeout, GNU time, and this wrapper remain alive to record the failure.
+payload=(bash -c 'echo 500 > /proc/self/oom_score_adj 2>/dev/null || true; exec bash -lc "$1"' benchmark "$1")
 if [[ -x "$time_bin" ]]; then
   if [[ "$run_timeout" == 0 ]]; then
-    "$time_bin" -v -o "${metrics}.time" bash -lc "$1" >>"$log" 2>&1
+    "$time_bin" -v -o "${metrics}.time" "${payload[@]}" >>"$log" 2>&1
   else
-    "$time_bin" -v -o "${metrics}.time" timeout --kill-after="$grace" "$run_timeout" bash -lc "$1" >>"$log" 2>&1
+    "$time_bin" -v -o "${metrics}.time" timeout --kill-after="$grace" "$run_timeout" "${payload[@]}" >>"$log" 2>&1
   fi
 elif [[ "$run_timeout" == 0 ]]; then
-  bash -lc "$1" >>"$log" 2>&1
+  "${payload[@]}" >>"$log" 2>&1
 else
-  timeout --kill-after="$grace" "$run_timeout" bash -lc "$1" >>"$log" 2>&1
+  timeout --kill-after="$grace" "$run_timeout" "${payload[@]}" >>"$log" 2>&1
 fi
 rc=$?
 cg=$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup)
@@ -507,6 +651,57 @@ def resolve_implementation(implementation, templates):
     return resolved
 
 
+def validate_named_definitions(datasets, dataset_groups, resource_profiles, parameter_cases):
+    """Validate reusable definitions even when no enabled run currently selects them."""
+    for group_id, values in dataset_groups.items():
+        if not isinstance(values, list) or not values:
+            raise ValueError(f"Dataset group {group_id} must be a non-empty list")
+        fake_run = {"id": f"dataset-group-{group_id}", "dataset": values}
+        for dataset_id in run_dataset_ids(fake_run):
+            if dataset_id not in datasets:
+                raise ValueError(f"Dataset group {group_id} refers to unknown dataset {dataset_id}")
+    for profile_id, values in resource_profiles.items():
+        if not isinstance(values, dict):
+            raise ValueError(f"Resource profile {profile_id} must be a mapping")
+    for group_id, values in parameter_cases.items():
+        if not isinstance(values, list) or not values:
+            raise ValueError(f"Parameter case group {group_id} must be a non-empty list")
+        seen = set()
+        for value in values:
+            if not isinstance(value, dict) or "id" not in value:
+                raise ValueError(f"Parameter case group {group_id} entries must be mappings with id")
+            case_id = str(value["id"])
+            if not _VALID_ID.match(case_id):
+                raise ValueError(f"Invalid parameter case id {case_id!r} in group {group_id}")
+            if case_id in seen:
+                raise ValueError(f"Parameter case group {group_id} repeats case {case_id!r}")
+            seen.add(case_id)
+            parameter_case_values(group_id, case_id, value)
+
+
+def expanded_plan_manifest(plan, runs, invocation_id):
+    """Create a selector-free record of the concrete cases chosen for one invocation."""
+    manifest = copy.deepcopy(plan)
+    manifest.pop("dataset_groups", None)
+    manifest.pop("resource_profiles", None)
+    manifest.pop("parameter_cases", None)
+    templates = manifest.get("templates", {})
+    concrete = []
+    for run in runs:
+        resolved = copy.deepcopy(run)
+        implementations = [resolve_implementation(implementation, templates)
+                           for implementation in run.get("implementations", [])]
+        resolved["implementations"] = [implementation for implementation in implementations
+                                       if implementation.get("enabled", True)]
+        concrete.append(resolved)
+    manifest["runs"] = concrete
+    manifest["execution"] = {
+        "invocation_id": invocation_id,
+        "expanded_run_cases": len(concrete),
+    }
+    return manifest
+
+
 def drop_caches(paths, context, plan_dir, python, log):
     expanded = [expand(str(path), context) for path in paths]
     if not expanded:
@@ -517,6 +712,59 @@ def drop_caches(paths, context, plan_dir, python, log):
                                 stderr=subprocess.STDOUT, check=False)
     if result.returncode:
         raise RuntimeError(f"Cold-cache precondition failed ({result.returncode}); see {log}")
+
+
+def resolve_temporary_paths(configured, context, run_dir):
+    """Resolve cleanup roots and constrain them to one immutable result case."""
+    if not isinstance(configured, list) or not configured:
+        raise ValueError("temporary_paths must be a non-empty list")
+    run_root = Path(os.path.abspath(run_dir))
+    paths = []
+    seen = set()
+    for value in configured:
+        path = Path(os.path.abspath(expand(str(value), context)))
+        try:
+            path.relative_to(run_root)
+        except ValueError as error:
+            raise ValueError(f"Refusing temporary path outside run directory: {path}") from error
+        if path == run_root:
+            raise ValueError(f"Refusing to use the complete run directory as temporary path: {path}")
+        if path in seen:
+            raise ValueError(f"Duplicate temporary path {path}")
+        seen.add(path)
+        paths.append(path)
+    return paths
+
+
+def prepare_temporary_paths(paths):
+    """Create fresh roots required by Java, Spark, SystemDS, and Dask."""
+    for path in paths:
+        if path.is_symlink():
+            raise RuntimeError(f"Refusing symlinked temporary path {path}")
+        if path.exists() and not path.is_dir():
+            raise RuntimeError(f"Temporary path is not a directory: {path}")
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def cleanup_temporary_paths(paths):
+    """Remove private temporary roots, returning errors without masking run status."""
+    errors = []
+    removed = 0
+    for path in paths:
+        try:
+            if path.is_symlink():
+                raise RuntimeError("refusing symlink")
+            if path.is_dir():
+                shutil.rmtree(path)
+                removed += 1
+            elif path.exists():
+                path.unlink()
+                removed += 1
+        except OSError as error:
+            errors.append(f"{path}: {error}")
+        except RuntimeError as error:
+            errors.append(f"{path}: {error}")
+    return removed, errors
 
 
 def execute_plan(plan_path, validate_only=False):
@@ -534,19 +782,24 @@ def execute_plan(plan_path, validate_only=False):
 
     datasets = plan.get("datasets", {})
     templates = plan.get("templates", {})
+    dataset_groups = named_mapping(plan, "dataset_groups")
+    resource_profiles = named_mapping(plan, "resource_profiles")
+    parameter_cases = named_mapping(plan, "parameter_cases")
+    validate_named_definitions(datasets, dataset_groups, resource_profiles, parameter_cases)
     configured_runs = plan.get("runs", [])
     for run in configured_runs:
         run_id = str(run.get("id", ""))
         if not _VALID_ID.match(run_id):
             raise ValueError(f"Invalid run id {run_id!r}")
-        for dataset_id in run_dataset_ids(run):
+        for dataset_id in run_dataset_ids(run, dataset_groups):
             if dataset_id not in datasets:
                 raise ValueError(f"Run {run_id} refers to unknown dataset {dataset_id}")
         if not run.get("implementations"):
             raise ValueError(f"Run {run_id} has no implementations")
         for implementation in run["implementations"]:
             resolve_implementation(implementation, templates)
-    expanded_runs = expand_run_cases(configured_runs, templates)
+    expanded_runs = expand_run_cases(configured_runs, templates, dataset_groups,
+                                     resource_profiles, parameter_cases)
     enabled_runs = [run for run in expanded_runs if run.get("enabled", True) and any(
         resolve_implementation(implementation, templates).get("enabled", True)
         for implementation in run.get("implementations", []))]
@@ -574,6 +827,29 @@ def execute_plan(plan_path, validate_only=False):
         executable = expand(context[context_key], context)
         if not shutil.which(executable):
             raise RuntimeError(f"Required tool {tool_id!r} is not executable: {executable}")
+    required_python_modules = set()
+    for run in enabled_runs:
+        for implementation in run.get("implementations", []):
+            resolved = resolve_implementation(implementation, templates)
+            if resolved.get("enabled", True):
+                required_python_modules.update(
+                    str(module) for module in resolved.get("required_python_modules", []))
+    if required_python_modules:
+        python = expand(context["tools.python"], context)
+        module_check = (
+            "import importlib,sys\n"
+            "missing=[]\n"
+            "for module in sys.argv[1:]:\n"
+            " try: importlib.import_module(module)\n"
+            " except ImportError: missing.append(module)\n"
+            "print(', '.join(missing))\n"
+            "raise SystemExit(bool(missing))\n"
+        )
+        result = subprocess.run([python, "-c", module_check, *sorted(required_python_modules)],
+                                text=True, capture_output=True)
+        if result.returncode:
+            raise RuntimeError(f"Configured Python is missing required modules: "
+                               f"{result.stdout.strip()}")
     if not shutil.which("systemd-run") or subprocess.run(
             ["systemctl", "--user", "status"], stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL).returncode:
@@ -587,6 +863,9 @@ def execute_plan(plan_path, validate_only=False):
     invocation_dir = results_root / invocation_id
     invocation_dir.mkdir()
     shutil.copy2(plan_path, invocation_dir / "benchmark-plan.yaml")
+    manifest = expanded_plan_manifest(plan, enabled_runs, invocation_id)
+    (invocation_dir / "expanded-plan.yaml").write_text(
+        yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8")
 
     for run in enabled_runs:
         run_id = str(run["id"])
@@ -603,6 +882,9 @@ def execute_plan(plan_path, validate_only=False):
         run_context["run.id"] = run_id
         run_context["run.base_id"] = str(run.get("base_id", run_id))
         run_context["run.invocation_id"] = invocation_id
+        for field in ("resource_profile", "parameter_case"):
+            if field in run:
+                run_context[f"run.{field}"] = str(run[field])
         flatten("run", run.get("parameters", {}), run_context)
         if not run.get("_baseline_case"):
             for variant_id, variant in datasets[dataset_id].get("variants", {}).items():
@@ -662,14 +944,68 @@ def execute_plan(plan_path, validate_only=False):
         outputs.mkdir(parents=True, exist_ok=True)
         run_context["run.results"] = str(run_dir)
         run_context["run.outputs"] = str(outputs)
+        configured_temporary_paths = run.get(
+            "temporary_paths", plan.get("temporary_paths", _DEFAULT_TEMPORARY_PATHS))
+        temporary_paths = resolve_temporary_paths(
+            configured_temporary_paths, run_context, run_dir)
         setup_steps = run.get("setup", [])
         if isinstance(setup_steps, (str, dict)):
             setup_steps = [setup_steps]
-        for number, step in enumerate(setup_steps, 1):
+        resolved_setup = []
+        for step in setup_steps:
             step = {"command": step} if isinstance(step, str) else step
             command = expand(str(step["command"]), run_context)
+            resolved_setup.append({
+                "command": command,
+                "environment": expand_map(step.get("environment"), run_context),
+            })
+        repetitions = int(run.get("repetitions", plan.get("defaults", {}).get("repetitions", 1)))
+        resolved_implementations = []
+        for configured_implementation in run.get("implementations", []):
+            implementation = resolve_implementation(configured_implementation, templates)
+            if not implementation.get("enabled", True):
+                continue
+            executions = []
+            for rep in range(1, repetitions + 1):
+                local_context = dict(run_context)
+                local_context["rep"] = str(rep)
+                local_context["implementation.id"] = str(implementation["id"])
+                executions.append({
+                    "rep": rep,
+                    "command": expand(str(implementation["command"]), local_context),
+                    "environment": {
+                        "BENCH_RUN_TMP": str(run_dir / "python-tmp"),
+                        **expand_map(run.get("environment"), local_context),
+                        **expand_map(implementation.get("environment"), local_context),
+                    },
+                })
+            resolved_implementations.append({
+                "id": str(implementation["id"]),
+                "comparable": implementation.get("comparable", True),
+                "executions": executions,
+            })
+        resolved_run = {
+            "id": run_id,
+            "base_id": run_context["run.base_id"],
+            "dataset": dataset_id,
+            "resource_profile": run.get("resource_profile"),
+            "parameter_case": run.get("parameter_case"),
+            "parameters": run.get("parameters", {}),
+            "resources": resources,
+            "inputs": {key.removeprefix("input."): value for key, value in run_context.items()
+                       if key.startswith("input.")},
+            "cold_cache": [expand(str(path), run_context)
+                           for path in run.get("cold_cache", ["${dataset.dir}"])],
+            "temporary_paths": [str(path) for path in temporary_paths],
+            "setup": resolved_setup,
+            "implementations": resolved_implementations,
+        }
+        (run_dir / "resolved-run.json").write_text(
+            json.dumps(resolved_run, indent=2, sort_keys=True), encoding="utf-8")
+        for number, step in enumerate(resolved_setup, 1):
+            command = step["command"]
             env = dict(global_env)
-            env.update(expand_map(step.get("environment"), run_context))
+            env.update(step["environment"])
             setup_log = logs / f"setup-{number}.log"
             rc = command_run(command, plan_dir, env, setup_log)
             if rc:
@@ -683,7 +1019,6 @@ def execute_plan(plan_path, validate_only=False):
             writer.writerow(["run", "implementation", "comparable", "rep", "status", "wall_seconds",
                              "algorithm_seconds", "memory_peak_bytes", "major_faults",
                              "file_system_inputs", "log", "metrics"])
-            repetitions = int(run.get("repetitions", plan.get("defaults", {}).get("repetitions", 1)))
             timeout_seconds = int(resources.get("timeout_seconds", 0))
             grace_seconds = int(resources.get("timeout_grace_seconds", 30))
             if timeout_seconds < 0 or grace_seconds < 0:
@@ -707,9 +1042,15 @@ def execute_plan(plan_path, validate_only=False):
                     metrics = logs / f"{tag}.metrics"
                     print(f"Starting {tag} (timeout={timeout_seconds}s, memory={memory}, "
                           f"results={run_dir})", flush=True)
+                    _, reset_errors = cleanup_temporary_paths(temporary_paths)
+                    if reset_errors:
+                        raise RuntimeError(f"Could not reset temporary paths for {tag}: "
+                                           f"{'; '.join(reset_errors)}")
+                    prepare_temporary_paths(temporary_paths)
                     drop_caches(cache_paths, local_context, plan_dir, context["tools.python"],
                                 logs / "drop-caches.log")
                     env = dict(global_env)
+                    env["BENCH_RUN_TMP"] = str(run_dir / "python-tmp")
                     env.update(expand_map(run.get("environment"), local_context))
                     env.update(expand_map(implementation.get("environment"), local_context))
                     unit = re.sub(r"[^A-Za-z0-9_.-]", "-", f"ooc-{tag}-{os.getpid()}")
@@ -721,8 +1062,26 @@ def execute_plan(plan_path, validate_only=False):
                     if timeout_seconds:
                         scope += ["-p", f"RuntimeMaxSec={timeout_seconds + grace_seconds + 15}s"]
                     scope += [str(scope_runner), str(log), str(metrics), timeout, str(grace_seconds), command]
-                    rc = subprocess.run(scope, cwd=plan_dir, env=env).returncode
+                    try:
+                        with open(log, "a", encoding="utf-8") as scope_output:
+                            rc = subprocess.run(scope, cwd=plan_dir, env=env,
+                                                stdout=scope_output,
+                                                stderr=subprocess.STDOUT).returncode
+                    finally:
+                        removed, cleanup_errors = cleanup_temporary_paths(temporary_paths)
+                        with open(log, "a", encoding="utf-8") as output:
+                            output.write(f"temporary cleanup: removed {removed} roots\n")
+                            for error in cleanup_errors:
+                                output.write(f"temporary cleanup warning: {error}\n")
+                        if cleanup_errors:
+                            print(f"WARNING: {tag} temporary cleanup was incomplete; see {log}",
+                                  file=sys.stderr, flush=True)
                     status = "ok" if rc == 0 else "timeout" if rc == 124 else "killed" if rc == 137 else "failed"
+                    if metric(metrics, r"^exit_status=(.+)$") == "running":
+                        status = "killed"
+                        with open(log, "a", encoding="utf-8") as output:
+                            output.write(f"scope exited with {rc} before the accounting wrapper "
+                                         "could finalize; likely whole-scope termination\n")
                     if status == "ok" and "An Error Occurred" in log.read_text(errors="replace"):
                         status = "failed"
                     time_path = Path(str(metrics) + ".time")

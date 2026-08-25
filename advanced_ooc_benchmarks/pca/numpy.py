@@ -34,14 +34,18 @@ def main():
     order = np.argsort(values)[::-1][:args.components]
     eigenvalues = values[order]
     components = vectors[:, order]
-    scores = matrix @ components - center @ components
-
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    np.save(args.output.with_name(args.output.stem + "-scores.npy"), scores)
+    score_path = args.output.with_name(args.output.stem + "-scores.npy")
+    scores = np.lib.format.open_memmap(
+        score_path, mode="w+", dtype=np.float64, shape=(shape[0], args.components))
+    np.matmul(matrix, components, out=scores)
+    np.subtract(scores, center @ components, out=scores)
+    score_checksum = float(scores.sum())
+    scores.flush()
     np.save(args.output.with_name(args.output.stem + "-components.npy"), components)
     np.save(args.output.with_name(args.output.stem + "-eigenvalues.npy"), eigenvalues.reshape(-1, 1))
     report = {"implementation": "numpy-pca", "seconds": time.perf_counter() - start,
-              "components": args.components, "score_checksum": float(scores.sum()),
+              "components": args.components, "score_checksum": score_checksum,
               "eigenvalues": eigenvalues.tolist()}
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report))

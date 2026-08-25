@@ -11,9 +11,11 @@ from pathlib import Path
 script_dir = str(Path(__file__).resolve().parent)
 if sys.path and sys.path[0] == script_dir:
     sys.path.pop(0)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import dask.array as da
 import numpy as np
+from dask_support import create_client, load_matrix
 
 
 def main():
@@ -25,19 +27,20 @@ def main():
     parser.add_argument("--learning-rate", type=float, default=0.003)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--memory-limit", default="3GiB")
+    parser.add_argument("--temporary-directory", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if min(args.epochs, args.batch_size, args.hidden_size, args.threads) < 1:
         raise ValueError("epochs, batch-size, hidden-size, and threads must be positive")
-    compute_options = {"scheduler": "threads", "num_workers": args.threads}
+    client = create_client(args.threads, args.memory_limit, args.temporary_directory)
+    compute_options = {}
 
     start = time.perf_counter()
     metadata = json.loads((args.data / "metadata.json").read_text(encoding="utf-8"))
     rows, cols, hidden = metadata["rows"], metadata["cols"], args.hidden_size
-    matrix = np.memmap(args.data / "X.f64", dtype=np.float64, mode="r",
-                       shape=(rows, cols))
-    labels = np.memmap(args.data / "nn_y.f64", dtype=np.float64, mode="r",
-                       shape=(rows, 1))
+    features_path = args.data / "X.f64"
+    labels_path = args.data / "nn_y.f64"
     w1 = np.random.default_rng(args.seed).standard_normal((cols, hidden)) * math.sqrt(2 / cols)
     w2 = np.random.default_rng(args.seed).standard_normal((hidden, 1)) * math.sqrt(2 / hidden)
     b1, b2 = np.zeros((1, hidden)), np.zeros((1, 1))
@@ -54,8 +57,12 @@ def main():
             # reuse those row/column chunks for the operands producing it.
             activation_layout = da.empty((count, hidden), chunks="auto", dtype=np.float64)
             row_chunks, hidden_chunks = activation_layout.chunks
-            x = da.from_array(matrix[first:last], chunks=(row_chunks, (cols,)))
-            y = da.from_array(labels[first:last], chunks=(row_chunks, (1,)))
+            #row_chunks is uniform except for its tail, so its head is the chunk height
+            batch_row_chunk = row_chunks[0]
+            x = load_matrix(features_path, (rows, cols), row_chunk=batch_row_chunk,
+                            row_range=(first, last))
+            y = load_matrix(labels_path, (rows, 1), row_chunk=batch_row_chunk,
+                            row_range=(first, last))
             dask_w1 = da.from_array(w1, chunks=((cols,), hidden_chunks))
             dask_w2 = da.from_array(w2, chunks=(hidden_chunks, (1,)))
 
@@ -103,6 +110,7 @@ def main():
     }
     args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report))
+    client.close()
 
 
 if __name__ == "__main__":

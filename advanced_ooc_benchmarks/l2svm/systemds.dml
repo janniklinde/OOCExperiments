@@ -1,0 +1,17 @@
+#-------------------------------------------------------------
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0.
+#-------------------------------------------------------------
+
+source("l2svm/implementation.dml") as l2svm_impl;
+
+X = read($1);
+y = read($2);
+model = l2svm_impl::m_l2svm(
+  X=X, Y=y, intercept=FALSE, epsilon=$3, reg=$4,
+  maxIterations=as.integer($5), maxii=as.integer($6), verbose=FALSE);
+
+write(model, $7, format="binary");
+print("model_norm=" + sqrt(sum(model^2)));

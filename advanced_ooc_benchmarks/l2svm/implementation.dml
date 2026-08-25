@@ -1,0 +1,104 @@
+#-------------------------------------------------------------
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+#-------------------------------------------------------------
+
+# Binary-class linear SVM with squared hinge loss and L2 regularization.
+m_l2svm = function(Matrix[Double] X, Matrix[Double] Y, Boolean intercept = FALSE,
+    Double epsilon = 0.001, Double reg = 1, Integer maxIterations = 100,
+    Integer maxii = 20, Boolean verbose = FALSE, Integer columnId = -1)
+  return(Matrix[Double] model)
+{
+  if(nrow(X) < 2)
+    stop("L2SVM: Stopping due to invalid inputs: Not possible to learn a binary class classifier without at least 2 rows")
+  if(epsilon < 0)
+    stop("L2SVM: Stopping due to invalid argument: Tolerance (tol) must be non-negative")
+  if(reg < 0)
+    stop("L2SVM: Stopping due to invalid argument: Regularization constant (reg) must be non-negative")
+  if(maxIterations < 1)
+    stop("L2SVM: Stopping due to invalid argument: Maximum iterations should be a positive integer")
+  if(ncol(Y) < 1)
+    stop("L2SVM: Stopping due to invalid multiple label columns, maybe use MSVM instead?")
+
+  check_min = min(Y)
+  check_max = max(Y)
+  num_min = sum(Y == check_min)
+  num_max = sum(Y == check_max)
+  if(num_min + num_max != nrow(Y))
+    print("L2SVM: WARNING invalid number of labels in Y: "+num_min+" "+num_max)
+
+  if(check_min != -1 | check_max != +1)
+    Y = 2/(check_max - check_min)*Y - (check_min + check_max)/(check_max - check_min)
+
+  if(verbose & columnId == -1)
+    print("Running L2-SVM ")
+
+  if (intercept) {
+    ones = matrix(1, rows=nrow(X), cols=1)
+    X = cbind(X, ones);
+  }
+
+  w = matrix(0, rows=ncol(X), cols=1)
+  Xw = matrix(0, rows=nrow(X), cols=1)
+  g_old = t(X) %*% Y
+  s = g_old
+
+  iter = 0
+  continue = TRUE
+  while(continue & iter < maxIterations) {
+    step_sz = 0
+    Xd = X %*% s
+    wd = reg * sum(w * s)
+    dd = reg * sum(s * s)
+    continue1 = TRUE
+    iiter = 0
+    while(continue1 & iiter < maxii) {
+      tmp_Xw = Xw + step_sz*Xd
+      out = 1 - Y * tmp_Xw
+      sv = (out > 0)
+      out = out * sv
+      g = wd + step_sz*dd - sum(out * Y * Xd)
+      h = dd + sum(Xd * sv * Xd)
+      step_sz = step_sz - g/h
+      continue1 = (g*g/h >= epsilon)
+      iiter = iiter + 1
+    }
+
+    w = w + step_sz*s
+    Xw = Xw + step_sz*Xd
+    out = 1 - Y * Xw
+    sv = (out > 0)
+    out = sv * out
+    obj = 0.5 * sum(out * out) + reg/2 * sum(w * w)
+    g_new = t(X) %*% (out * Y) - reg * w
+
+    if(verbose) {
+      colstr = ifelse(columnId!=-1, "-- MSVM class="+columnId+": ", "")
+      print(colstr + "Iter: " + iter + " InnerIter: " + iiter + " --- Obj:" + obj)
+    }
+
+    tmp = sum(s * g_old)
+    continue = (step_sz*tmp >= epsilon*obj & sum(s^2) != 0)
+    be = sum(g_new * g_new)/sum(g_old * g_old)
+    s = be * s + g_new
+    g_old = g_new
+    iter = iter + 1
+  }
+  model = w
+}

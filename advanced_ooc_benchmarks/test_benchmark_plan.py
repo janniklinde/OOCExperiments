@@ -5,6 +5,7 @@
 # The ASF licenses this file to You under the Apache License, Version 2.0.
 
 import json
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -108,6 +109,81 @@ class RunExpansionTest(unittest.TestCase):
         self.assertTrue(all(case["base_id"] == "workload" for case in cases))
         self.assertEqual(source[0]["dataset"], ["dense_1m", "dense_2m"])
 
+    def test_named_dimensions_expand_in_stable_order(self):
+        templates = {"ooc": {"blocksize_sweep": "ooc"}}
+        source = [{
+            "id": "mlp",
+            "dataset": {"group": "dense"},
+            "resource_profiles": ["mem8", "mem4"],
+            "parameter_cases": "hidden",
+            "resources": {"timeout_seconds": 90, "memory_max": "legacy"},
+            "parameters": {"iterations": 1},
+            "blocksize_sweeps": {"ooc": [500]},
+            "implementations": [{"id": "systemds-ooc", "template": "ooc"}],
+        }]
+
+        cases = benchmark_plan.expand_run_cases(
+            source, templates,
+            dataset_groups={"dense": ["d4", "d8"]},
+            resource_profiles={
+                "mem8": {"memory_max": "8G", "java_heap": "6g"},
+                "mem4": {"memory_max": "4G", "java_heap": "3g"},
+            },
+            parameter_cases={"hidden": [
+                {"id": "act4", "hidden_size": 8192},
+                {"id": "act8", "parameters": {"hidden_size": 16384}},
+            ]})
+
+        self.assertEqual(cases[0]["id"], "mlp-d4-mem8-act4-ooc-bs500")
+        self.assertEqual(cases[-1]["id"], "mlp-d8-mem4-act8-ooc-bs500")
+        self.assertEqual(len(cases), 8)
+        self.assertEqual(cases[0]["base_id"], "mlp")
+        self.assertEqual(cases[0]["resources"], {
+            "timeout_seconds": 90, "memory_max": "8G", "java_heap": "6g"
+        })
+        self.assertEqual(cases[0]["parameters"]["hidden_size"], 8192)
+        self.assertEqual(cases[0]["resource_profile"], "mem8")
+        self.assertEqual(cases[0]["parameter_case"], "act4")
+        self.assertEqual(source[0]["dataset"], {"group": "dense"})
+
+    def test_unknown_named_dimensions_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unknown dataset group missing"):
+            benchmark_plan.expand_run_cases([
+                {"id": "workload", "dataset": {"group": "missing"}}
+            ])
+        with self.assertRaisesRegex(ValueError, "unknown resource_profiles mem4"):
+            benchmark_plan.expand_run_cases([
+                {"id": "workload", "resource_profiles": ["mem4"]}
+            ])
+        with self.assertRaisesRegex(ValueError, "unknown parameter case group hidden"):
+            benchmark_plan.expand_run_cases([
+                {"id": "workload", "parameter_cases": "hidden"}
+            ])
+
+    def test_expanded_manifest_contains_only_concrete_cases(self):
+        plan = {
+            "version": 1,
+            "dataset_groups": {"dense": ["d4"]},
+            "resource_profiles": {"mem4": {"memory_max": "4G"}},
+            "parameter_cases": {"iterations": [{"id": "i1", "iterations": 1}]},
+            "templates": {"python": {"command": "python baseline.py"}},
+        }
+        runs = [{
+            "id": "run-d4-mem4-i1",
+            "dataset": "d4",
+            "resources": {"memory_max": "4G"},
+            "implementations": [{"id": "numpy", "template": "python"}],
+        }]
+
+        manifest = benchmark_plan.expanded_plan_manifest(plan, runs, "invocation")
+
+        self.assertNotIn("dataset_groups", manifest)
+        self.assertNotIn("resource_profiles", manifest)
+        self.assertNotIn("parameter_cases", manifest)
+        self.assertEqual(manifest["execution"]["expanded_run_cases"], 1)
+        self.assertEqual(manifest["runs"][0]["implementations"][0]["command"],
+                         "python baseline.py")
+
     def test_scalar_dataset_does_not_change_case_names(self):
         source = [{"id": "workload", "dataset": "dense_1m", "parameters": {}}]
 
@@ -205,6 +281,63 @@ class DropCachesTest(unittest.TestCase):
             tool.symlink_to(data)
 
             self.assertEqual(list(drop_caches.walk([str(directory)])), [str(data)])
+
+
+class TemporaryCleanupTest(unittest.TestCase):
+    def test_private_temporary_roots_are_removed_without_touching_results(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "case"
+            outputs = run_dir / "outputs"
+            outputs.mkdir(parents=True)
+            result = outputs / "model.bin"
+            result.write_bytes(b"result")
+            context = {"run.results": str(run_dir)}
+            paths = benchmark_plan.resolve_temporary_paths(
+                ["${run.results}/systemds-tmp", "${run.results}/dask-spill"],
+                context, run_dir)
+
+            benchmark_plan.prepare_temporary_paths(paths)
+            (paths[0] / "spill.bin").write_bytes(b"spill")
+            nested = paths[1] / "worker" / "storage"
+            nested.mkdir(parents=True)
+            (nested / "part").write_bytes(b"spill")
+
+            removed, errors = benchmark_plan.cleanup_temporary_paths(paths)
+
+            self.assertEqual(removed, 2)
+            self.assertEqual(errors, [])
+            self.assertTrue(result.exists())
+            self.assertTrue(all(not path.exists() for path in paths))
+
+    def test_temporary_roots_must_be_strict_children_of_run_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "case"
+            run_dir.mkdir()
+            context = {"run.results": str(run_dir)}
+
+            with self.assertRaisesRegex(ValueError, "complete run directory"):
+                benchmark_plan.resolve_temporary_paths(
+                    ["${run.results}"], context, run_dir)
+            with self.assertRaisesRegex(ValueError, "outside run directory"):
+                benchmark_plan.resolve_temporary_paths(
+                    [str(Path(temporary) / "outside")], context, run_dir)
+
+
+class ScopeRunnerTest(unittest.TestCase):
+    def test_payload_failure_is_recorded_by_accounting_wrapper(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            runner = directory / "runner.sh"
+            log = directory / "run.log"
+            metrics = directory / "run.metrics"
+            benchmark_plan.write_scope_runner(runner)
+
+            result = subprocess.run(
+                [runner, log, metrics, "10", "1", "echo payload-started; exit 23"])
+
+            self.assertEqual(result.returncode, 23)
+            self.assertIn("payload-started", log.read_text())
+            self.assertIn("exit_status=23", metrics.read_text())
 
 
 if __name__ == "__main__":

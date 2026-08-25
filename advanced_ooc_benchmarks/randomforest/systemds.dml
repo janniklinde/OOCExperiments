@@ -4,7 +4,7 @@
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
 # regarding copyright ownership.  The ASF licenses this file
-# to You under the Apache License, Version 2.0 (the
+# to you under the Apache License, Version 2.0 (the
 # "License"); you may not use this file except in compliance
 # with the License.  You may obtain a copy of the License at
 #
@@ -19,18 +19,14 @@
 #
 #-------------------------------------------------------------
 
-source("mlp/implementation.dml") as fftrain_impl;
+source("randomforest/implementation.dml") as randomforest_impl;
 
-start = time();
 X = read($1);
-Y = read($2);
-model = fftrain_impl::m_ffTrain(X=X, Y=Y, batch_size=$3, epochs=$4, learning_rate=$5,
-  out_activation="sigmoid", loss_fcn="log_loss", shuffle=FALSE,
-  validation_split=0, seed=$6, hidden_size=$7, verbose=FALSE);
-W1 = as.matrix(model["W1"]);
-W2 = as.matrix(model["W2"]);
-checksum = sum(W1) + sum(W2);
-write(W1, $8, format="binary");
-write(W2, $9, format="binary");
-print("model checksum: " + checksum);
-print("Total execution time: " + ((time()-start)/1000000));
+y = read($2);
+ctypes = cbind(matrix(1, rows=1, cols=ncol(X)), matrix(2, rows=1, cols=1));
+M = randomforest_impl::m_randomForest(X=X, y=y, ctypes=ctypes,
+  num_trees=$3, sample_frac=$4, feature_frac=1.0, max_depth=$5,
+  min_leaf=$6, min_split=$7, max_features=0.5, max_values=1.0,
+  impurity="gini", seed=$8, verbose=FALSE);
+
+write(M, $9, format="binary");

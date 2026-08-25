@@ -7,16 +7,17 @@ from the raw memmaps without modifying the raw inputs.
 
 ## Layout
 
-- `benchmark-plan.yaml`: four currently enabled 3 GiB-heap / 4 GiB-cgroup comparisons with one
-  repetition and independent SystemDS OOC and local-Spark blocksize sweeps. KMeans, PCA, LMCG,
-  and PageRank are supported but initially disabled pending one-at-a-time host smoke runs.
+- `benchmark-plan.yaml`: 3 GiB-heap / 4 GiB-cgroup comparisons with one repetition and independent
+  SystemDS OOC and local-Spark blocksize sweeps. Newly added large cases remain disabled pending
+  one-at-a-time host smoke runs.
 - `run_cgroup_baselines.sh`, `benchmark_plan.py`, `drop_caches.py`: all runner support required
   by the plan.
 - `prepare_numpy.py`: generates arbitrary-shape synthetic row-major FP64 matrices with bounded RAM
   and configurable Bernoulli sparsity.
 - `prepare_dense_dataset.py`: generates the complete benchmark bundle (`X.f64`, `binary_y.f64`,
   `nn_y.f64`, and provenance metadata) from a dataset declaration.
-- `convert_fp64_systemds.py`: reusable single-matrix bounded-transfer and native OOC assembly CLI.
+- `convert_fp64_systemds.py`: reusable single-matrix bounded-transfer and native OOC assembly CLI;
+  FP64 remains the default, while `--dtype` supports compact prepared inputs such as binned `uint8`.
 - `prepare_dense_systemds.py`: transfers canonical raw matrices in bounded, block-aligned chunks,
   then uses native SystemDS OOC `rbind` and an explicit-blocksize write to create
   `X-bs<blocksize>`, `binary_y-bs<blocksize>`, and `nn_y-bs<blocksize>`.
@@ -27,13 +28,21 @@ from the raw memmaps without modifying the raw inputs.
   Python `dask` package.
 - `kmeans/`, `pca/`, and `lmcg/` contain deterministic self-contained DML implementations plus
   whole-memmap NumPy and automatically chunked Dask baselines.
-- `als/` and `xgboost/` retain their DML/Python pairs for later work, but are not active in the
-  plan: ALS has no forced-overflow sparse input yet, and SystemDS OOC XGBoost lacks `QSort`.
-- `pagerank/` uses a deterministic, degree-irregular graph with globally dispersed edges and
-  400,000-by-400,000 tiles—the same tile geometry as the Twitter PageRank experiment. Its mean
-  degree of 12.5 yields about 200k nonzeros, or 3.2 MB of ultra-sparse serialized data, per tile.
-  It is prepared in a separate `pagerank-b400k` dataset directory, leaving earlier PageRank
-  datasets untouched.
+- `gnmf/` implements the fixed-iteration Lee-Seung multiplicative updates over a non-negative FP64
+  matrix. SystemDS, NumPy, and Dask share deterministic positive initialization and materialize both
+  learned factors.
+- `als/` uses an auto-prepared deterministic sparse ratings matrix and a SciPy ALS-CG baseline.
+  Its canonical CSR arrays are generated once, while blocksize-qualified native SystemDS inputs
+  are converted on demand for each OOC/Spark blocksize candidate. Its entrypoint calls the vendored
+  `m_alsCG` implementation directly, so the complete algorithm being measured is available beside
+  the benchmark just like the MLP implementation sources.
+- `randomforest/` uses a bounded-memory prepared 8-bin `uint8` matrix in its own
+  `bench-data/randomforest` directory. SystemDS
+  and sklearn both train fixed-depth, Gini-classification forests without row bootstrapping and
+  materialize their learned models.
+- `pagerank/` reuses the prepared Twitter-2010 graph from `experiments/real_world`, including its
+  deterministic vertex permutation, normalized CSR representation, dangling bitmap, and native
+  400,000-by-400,000 SystemDS tiles used by the established Twitter experiments.
 
 ## Comparability contract
 
@@ -46,17 +55,34 @@ tall `U`, singular values, and right factor just as the DML script does, and mat
 `V`. MultiLogReg materializes its coefficient matrix. The Dask implementation uses Dask's automatic
 array chunks rather than a hand-selected row partition and performs the same factor construction.
 
-The MLP retains its 4,096-row mini-batch loop because `ffTrain` itself uses mini-batch SGD. It
-matches the two affine layers, He initialization, ReLU, inverted dropout with keep probability
-0.35, sigmoid/log-loss gradient, Nesterov update, momentum schedule, and learning-rate decay.
+The MLP uses one 65,536-row batch and a configurable 9,216-neuron hidden layer. Each dense hidden
+activation contains 603,979,776 FP64 values (4.5 GiB), and forward/backward training creates several
+such logical tensors. The input itself is intentionally only 65,536 by 8: this keeps the arithmetic
+manageable while making the neural-network activation working set, rather than merely the source
+dataset, exceed the 4 GiB cgroup. The weights remain small, so this is accurately an activation-OOC
+benchmark rather than an OOC model-parameter benchmark. NumPy expresses the same full batch and is
+expected to exceed the cap; Dask derives chunks automatically from the expanded activation geometry.
+All implementations retain the two affine layers, He initialization, ReLU, inverted dropout with
+keep probability 0.35, sigmoid/log-loss gradient, Nesterov update, momentum schedule, and
+learning-rate decay. Framework-specific dropout random streams can produce different model values.
 sklearn GMM receives the full memmap and materializes means and mixture weights. Its `fit_predict` path's
 final label E-step matches the final E-step in DML; the baseline does not add a subsequent
 `predict_proba` pass. Its EM kernels and random-number generator remain framework-specific.
 
-PageRank uses twenty fixed power iterations, the same column-stochastic transition matrix, uniform
+PageRank uses fifteen fixed power iterations, the same column-stochastic transition matrix, uniform
 initial rank, and uniform dangling-mass redistribution in both arms. The SciPy baseline exposes one
 whole CSR matrix over NumPy memmaps; it does not manually partition graph rows. Both arms
 materialize the final rank vector in binary form.
+
+RandomForest consumes the identical prepared 1-through-8 feature bins in both arms. Both use Gini
+classification, all training rows and columns per tree, square-root feature candidates per split,
+the same tree count, depth, minimum leaf size, and minimum split size. Framework-specific random
+streams and tree-layout representations may differ; both outputs contain the complete trained
+forest rather than only predictions or a checksum. This is logical-work comparability, not equal
+input-byte comparability: sklearn maps the one-byte bins directly, while native SystemDS binary
+blocks represent matrix values as doubles. Cold-cache wall time therefore includes different input
+volumes; use `algorithm_seconds` as supporting evidence or prepare an FP64 sklearn input when equal
+physical read volume is required.
 
 KMeans uses the first `k` records as deterministic initial centroids and performs the same fixed
 number of Lloyd iterations in SystemDS, NumPy, and Dask. Every iteration computes the complete
@@ -73,6 +99,12 @@ LMCG solves the same zero-intercept, L2-regularized normal equations using conju
 starts from zero, uses the correlated `binary_y.f64` response, performs the declared fixed number
 of `X%*%p` and `t(X)%*%v` passes when tolerance is zero, and materializes the coefficient vector.
 NumPy exposes the complete memmap to its linear algebra kernels; Dask selects chunks automatically.
+
+GNMF minimizes the Euclidean reconstruction error of `X ~= W %*% H` with the standard Lee-Seung
+multiplicative updates. Its dedicated 1,000,000-by-384 input is uniformly distributed on `[0,1)` and
+occupies 3.072 GB as raw FP64. Rank, iteration count, epsilon, seed, update order, initialization,
+and full `W`/`H` output materialization match across SystemDS, NumPy, and Dask. Each iteration's
+`t(W)%*%X` and `X%*%t(H)` operations provide two canonical scans of the large input.
 
 The dense-data preflight requires the canonical raw FP64 files, derives their exact byte sizes from
 the declared shape, checks dimensions, seed, sparsity, distribution, and generator version, and
@@ -110,6 +142,9 @@ Cold-cache traversal ignores preparation symlinks to tools such as the SystemDS 
 The implementation template's `blocksize_sweep` field associates it with `ooc` or `spark`.
 Implementations without an association, such as NumPy, sklearn, SciPy, and Dask, are grouped in the
 single `-baseline` case. This case skips SystemDS native conversion and SystemDS-specific setup.
+The dedicated Dask template limits the threaded scheduler with `resources.dask_threads` and fixes
+BLAS libraries to one thread per task, avoiding nested Dask-by-BLAS parallelism. NumPy continues to
+use `resources.threads`, while Spark uses its independent `resources.spark_threads` setting.
 The old scalar or list-valued `parameters.blocksize` form remains accepted for plans that want one
 shared sweep across all implementations.
 
@@ -204,13 +239,13 @@ systemd-run --user --scope -p MemoryMax=4G true
 ./run_cgroup_baselines.sh
 ```
 
-`tools.systemds_jar` must point to an existing JAR. PageRank preparation reuses its generated
-`systemds/G.ijv` import artifact when only native SystemDS conversion failed, so correct the tool
-path and rerun rather than regenerating the graph.
+`tools.systemds_jar` must point to an existing JAR. PageRank preparation delegates to
+`experiments/real_world/prepare.sh`, whose downloads are resumable and whose expensive CSR data is
+reused when only a native SystemDS representation is missing.
 
 The SystemDS templates use a 3 GiB JVM/Spark-driver heap, `MemoryMax=4G`, and a 60-second timeout by
-default; PageRank overrides the timeout to 180 seconds. Local Spark defaults to four simultaneous
-tasks and runs its driver and executor threads inside the same timed cgroup. Override
+default; the Twitter PageRank case overrides the timeout to 3,600 seconds. Local Spark defaults to
+eight simultaneous tasks and runs its driver and executor threads inside the same timed cgroup. Override
 `resources.spark_threads` per run only after a one-case memory smoke test. The extra cgroup GiB
 accommodates JVM and Spark overhead while Linux charges and reclaims mapped input pages. Results
 are append-only and written under

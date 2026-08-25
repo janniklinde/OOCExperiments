@@ -43,7 +43,7 @@ def native_state(path, rows, cols, blocksize=None):
     return "valid" if matches else "incompatible"
 
 
-def raw_identity(path, rows, cols):
+def raw_identity(path, rows, cols, dtype):
     stat = path.stat()
     return {
         "path": str(path.resolve()),
@@ -51,7 +51,7 @@ def raw_identity(path, rows, cols):
         "mtime_ns": stat.st_mtime_ns,
         "rows": rows,
         "cols": cols,
-        "dtype": "float64",
+        "dtype": np.dtype(dtype).name,
         "layout": "row-major",
     }
 
@@ -85,8 +85,8 @@ def quarantine_native(path):
         print("Quarantined incompatible output as " + str(quarantine), flush=True)
 
 
-def aligned_chunk_rows(cols, blocksize, chunk_bytes):
-    raw_rows = max(1, chunk_bytes // (cols * np.dtype(np.float64).itemsize))
+def aligned_chunk_rows(cols, blocksize, chunk_bytes, dtype=np.float64):
+    raw_rows = max(1, chunk_bytes // (cols * np.dtype(dtype).itemsize))
     if raw_rows < blocksize:
         return blocksize
     return (raw_rows // blocksize) * blocksize
@@ -105,13 +105,14 @@ def read_json(path):
         return None
 
 
-def stage_chunks(raw_path, rows, cols, blocksize, chunk_bytes, staging):
-    chunk_rows = aligned_chunk_rows(cols, blocksize, chunk_bytes)
+def stage_chunks(raw_path, rows, cols, blocksize, chunk_bytes, staging, dtype=np.float64):
+    dtype = np.dtype(dtype)
+    chunk_rows = aligned_chunk_rows(cols, blocksize, chunk_bytes, dtype)
     count = (rows + chunk_rows - 1) // chunk_rows
     manifest_path = staging / "manifest.json"
     manifest = {
         "version": 1,
-        "source": raw_identity(raw_path, rows, cols),
+        "source": raw_identity(raw_path, rows, cols, dtype),
         "blocksize_alignment": blocksize,
         "chunk_bytes_requested": chunk_bytes,
         "chunk_rows": chunk_rows,
@@ -153,17 +154,17 @@ def stage_chunks(raw_path, rows, cols, blocksize, chunk_bytes, staging):
             missing.append((index, start, current_rows, chunk, completion, completion_record))
 
     if missing:
-        actual_mib = chunk_rows * cols * 8 / (1 << 20)
+        actual_mib = chunk_rows * cols * dtype.itemsize / (1 << 20)
         print(f"Staging {raw_path.name} as {count} chunk(s) of at most {chunk_rows} rows "
               f"({actual_mib:.1f} MiB aligned; {chunk_bytes / (1 << 20):.0f} MiB requested).",
               flush=True)
         from systemds.context import SystemDSContext
 
-        mapped = np.memmap(raw_path, dtype=np.float64, mode="r", shape=(rows, cols), order="C")
+        mapped = np.memmap(raw_path, dtype=dtype, mode="r", shape=(rows, cols), order="C")
         for position, (index, start, current_rows, chunk, completion,
                        completion_record) in enumerate(missing, 1):
             end = start + current_rows
-            mib = current_rows * cols * 8 / (1 << 20)
+            mib = current_rows * cols * dtype.itemsize / (1 << 20)
             print(f"  transfer {position}/{len(missing)}: rows {start}:{end} ({mib:.1f} MiB)",
                   flush=True)
             # A fresh context per chunk guarantees that Java-side transfer state is
@@ -229,11 +230,12 @@ def assemble(chunks, output, rows, cols, blocksize, java, jar, config, heap, jav
 
 def convert_fp64(raw, output, rows, cols, blocksize, chunk_mib, java, jar, config,
                   java_heap="3g", java_tmp=None, replace_invalid=False, keep_staging=False,
-                  staging=None):
-    """Convert one raw row-major FP64 matrix to one native SystemDS matrix."""
+                  staging=None, dtype=np.float64):
+    """Convert one raw row-major numeric matrix to one native SystemDS matrix."""
     raw = Path(raw)
     output = Path(output)
-    expected_size = rows * cols * np.dtype("<f8").itemsize
+    dtype = np.dtype(dtype)
+    expected_size = rows * cols * dtype.itemsize
     if not raw.is_file() or raw.stat().st_size != expected_size:
         raise RuntimeError(f"missing or incompatible canonical raw input {raw}; "
                            f"expected {expected_size} bytes")
@@ -250,7 +252,7 @@ def convert_fp64(raw, output, rows, cols, blocksize, chunk_mib, java, jar, confi
     if staging is None:
         staging = output.parent / "systemds-staging" / f"{output.name}-bs{blocksize}"
     staging = Path(staging)
-    chunks = stage_chunks(raw, rows, cols, blocksize, chunk_mib << 20, staging)
+    chunks = stage_chunks(raw, rows, cols, blocksize, chunk_mib << 20, staging, dtype)
     assemble(chunks, output, rows, cols, blocksize, java, jar, config, java_heap, java_tmp)
     if not keep_staging:
         shutil.rmtree(staging)

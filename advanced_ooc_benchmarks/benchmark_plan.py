@@ -631,6 +631,15 @@ def execute_plan(plan_path, validate_only=False):
             raise ValueError(f"Run {run_id} resources.spark_threads must be a positive integer "
                              "or auto")
         resources["spark_threads"] = spark_threads
+        dask_threads = resources.get("dask_threads", threads)
+        if str(dask_threads).lower() == "auto":
+            dask_threads = threads
+        else:
+            dask_threads = int(dask_threads)
+        if dask_threads < 1:
+            raise ValueError(f"Run {run_id} resources.dask_threads must be a positive integer "
+                             "or auto")
+        resources["dask_threads"] = dask_threads
         flatten("resources", resources, run_context)
         run_context["run.entrypoint"] = expand(str(run.get("entrypoint", "")), run_context)
         for name, value in run.get("inputs", {}).items():

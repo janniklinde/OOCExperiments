@@ -28,11 +28,14 @@ def main():
     parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--learning-rate", type=float, default=0.003)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--hidden-size", type=int, default=128)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     start = time.perf_counter()
     metadata = json.loads((args.data / "metadata.json").read_text())
-    n, cols, hidden = metadata["rows"], metadata["cols"], 128
+    n, cols, hidden = metadata["rows"], metadata["cols"], args.hidden_size
+    if min(args.epochs, args.batch_size, hidden) < 1:
+        raise ValueError("epochs, batch-size, and hidden-size must be positive")
     matrix = np.memmap(args.data / "X.f64", dtype=np.float64, mode="r", shape=(n, cols))
     labels = np.memmap(args.data / "nn_y.f64", dtype=np.float64, mode="r", shape=(n, 1))
     # ffTrain seeds each affine::init call independently; its dropout calls use
@@ -70,6 +73,8 @@ def main():
               "model_checksum": float(w1.sum() + w2.sum()), "last_epoch_loss": epoch_loss}
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
+        np.save(args.output.with_name(args.output.stem + "-W1.npy"), w1)
+        np.save(args.output.with_name(args.output.stem + "-W2.npy"), w2)
         args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report))
 

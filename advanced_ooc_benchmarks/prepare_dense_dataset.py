@@ -180,7 +180,9 @@ def main():
     parser.add_argument("--classes", type=int, default=2)
     parser.add_argument("--sparsity", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--distribution", choices=("normal", "uniform"), default="normal")
+    parser.add_argument("--distribution",
+                        choices=("normal", "uniform", "uniform_nonnegative"),
+                        default="normal")
     parser.add_argument("--chunk-mib", type=int, default=256)
     parser.add_argument("--accept-legacy", action="store_true")
     args = parser.parse_args()

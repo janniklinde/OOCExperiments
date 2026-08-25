@@ -25,8 +25,12 @@ def main():
     parser.add_argument("data", type=Path)
     parser.add_argument("--rank", type=int, default=16)
     parser.add_argument("--seed", type=int, default=31)
+    parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    if args.threads < 1:
+        raise ValueError("threads must be positive")
+    compute_options = {"scheduler": "threads", "num_workers": args.threads}
     start = time.perf_counter()
     metadata = json.loads((args.data / "metadata.json").read_text())
     shape = (metadata["rows"], metadata["cols"])
@@ -34,13 +38,13 @@ def main():
     matrix = da.from_array(mapped, chunks="auto")
     omega = np.random.default_rng(args.seed).standard_normal((shape[1], args.rank))
 
-    sketch = (matrix @ omega).persist()
-    gram = (sketch.T @ sketch).compute()
+    sketch = (matrix @ omega).persist(**compute_options)
+    gram = (sketch.T @ sketch).compute(**compute_options)
     inverse = np.linalg.inv(np.linalg.cholesky(gram).T)
     basis = sketch @ inverse
-    projection = (basis.T @ matrix).compute()
+    projection = (basis.T @ matrix).compute(**compute_options)
     left_small, singular, right_transposed = np.linalg.svd(projection, full_matrices=False)
-    left = (basis @ left_small).compute()
+    left = (basis @ left_small).compute(**compute_options)
     nnz_u = int(np.count_nonzero(left))
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

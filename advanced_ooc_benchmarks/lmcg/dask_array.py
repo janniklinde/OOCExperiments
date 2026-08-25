@@ -21,10 +21,12 @@ def main():
     parser.add_argument("--iterations", type=int, default=2)
     parser.add_argument("--reg", type=float, default=1e-7)
     parser.add_argument("--tolerance", type=float, default=0.0)
+    parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    if args.iterations < 1 or args.reg < 0 or args.tolerance < 0:
-        raise ValueError("iterations must be positive and reg/tolerance non-negative")
+    if args.iterations < 1 or args.reg < 0 or args.tolerance < 0 or args.threads < 1:
+        raise ValueError("iterations/threads must be positive and reg/tolerance non-negative")
+    compute_options = {"scheduler": "threads", "num_workers": args.threads}
 
     start = time.perf_counter()
     metadata = json.loads((args.data / "metadata.json").read_text())
@@ -35,7 +37,7 @@ def main():
     matrix = da.from_array(mapped, chunks="auto")
     response = da.from_array(mapped_y, chunks=(matrix.chunks[0], (1,)))
     beta = np.zeros((shape[1], 1), dtype=np.float64)
-    residual = -(matrix.T @ response).compute()
+    residual = -(matrix.T @ response).compute(**compute_options)
     direction = -residual
     residual_sq = (residual.T @ residual).item()
     target = residual_sq * args.tolerance * args.tolerance
@@ -43,7 +45,7 @@ def main():
     completed = 0
     while completed < args.iterations and residual_sq > target:
         projected = matrix @ direction
-        curvature = (matrix.T @ projected).compute() + args.reg * direction
+        curvature = (matrix.T @ projected).compute(**compute_options) + args.reg * direction
         alpha = residual_sq / (direction.T @ curvature).item()
         beta += alpha * direction
         residual += alpha * curvature

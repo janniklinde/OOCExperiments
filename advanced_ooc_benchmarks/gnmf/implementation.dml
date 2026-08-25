@@ -1,0 +1,43 @@
+#-------------------------------------------------------------
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+#-------------------------------------------------------------
+
+# Lee-Seung multiplicative updates for Euclidean non-negative matrix
+# factorization X ~= W %*% H. Fixed iterations make the benchmark's logical
+# work independent of framework-specific convergence tests.
+m_gnmf = function(Matrix[Double] X, Integer rank, Integer iterations = 2,
+    Double epsilon = 1e-8, Integer seed = 7)
+  return (Matrix[Double] W, Matrix[Double] H)
+{
+  if(rank < 1 | iterations < 1 | epsilon <= 0)
+    stop("GNMF: rank/iterations must be positive and epsilon must be greater than zero")
+  # This deterministic, strictly positive initialization is identical in the
+  # SystemDS, NumPy, and Dask implementations and avoids RNG differences.
+  rows = seq(1, nrow(X), 1)
+  cols = seq(1, ncol(X), 1)
+  components = seq(1, rank, 1)
+  W = 0.01 + ((rows %*% t(components) + seed) %% 97) / 97
+  H = 0.01 + ((components %*% t(cols) + 3*seed) %% 89) / 89
+
+  for(i in 1:iterations) {
+    H = H * ((t(W) %*% X) / (((t(W) %*% W) %*% H) + epsilon))
+    W = W * ((X %*% t(H)) / ((W %*% (H %*% t(H))) + epsilon))
+  }
+}

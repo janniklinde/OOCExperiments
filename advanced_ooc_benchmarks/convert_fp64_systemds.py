@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert one arbitrarily large row-major FP64 matrix to SystemDS in bounded chunks."""
+"""Convert one arbitrarily large row-major numeric matrix to SystemDS in bounded chunks."""
 
 import argparse
 import sys
@@ -21,6 +21,8 @@ def main():
     parser.add_argument("--cols", type=int, required=True)
     parser.add_argument("--blocksize", type=int, required=True)
     parser.add_argument("--chunk-mib", type=int, default=128)
+    parser.add_argument("--dtype", default="float64",
+                        help="NumPy dtype of the headerless row-major input (default: float64)")
     parser.add_argument("--java", default="java")
     parser.add_argument("--systemds-jar", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
@@ -36,10 +38,15 @@ def main():
         raise RuntimeError(f"SystemDS JAR does not exist: {args.systemds_jar}")
     if not args.config.is_file():
         raise RuntimeError(f"SystemDS config does not exist: {args.config}")
+    try:
+        import numpy as np
+        dtype = np.dtype(args.dtype)
+    except TypeError as error:
+        raise ValueError(f"invalid NumPy dtype: {args.dtype}") from error
     convert_fp64(args.input, args.output, args.rows, args.cols, args.blocksize,
                  args.chunk_mib, args.java, args.systemds_jar, args.config,
                  args.java_heap, args.java_tmp, args.replace_invalid,
-                 args.keep_staging, args.staging)
+                 args.keep_staging, args.staging, dtype)
 
 
 if __name__ == "__main__":

@@ -21,7 +21,8 @@
 
 # This builtin function trains simple feed-forward neural network. The architecture of the
 # networks is: affine1 -> relu -> dropout -> affine2 -> configurable output activation function.
-# Hidden layer has 128 neurons. Dropout rate is 0.35. Input and output sizes are inferred from X and Y.
+# Hidden-layer width is configurable. Dropout rate is 0.35. Input and output
+# sizes are inferred from X and Y.
 #
 # INPUT:
 # ------------------------------------------------------------------------------------------
@@ -37,6 +38,7 @@
 # shuffle           Flag which indicates if dataset should be shuffled or not
 # validation_split  Fraction of training set used as validation set
 # seed              Seed for model initialization
+# hidden_size       Number of neurons in the hidden layer
 # verbose           Flag which indicates if function should print to stdout
 # ------------------------------------------------------------------------------------------
 #
@@ -68,7 +70,7 @@ source("mlp/nn/optim/sgd_nesterov.dml") as sgd_nesterov
 m_ffTrain = function(Matrix[double] X, Matrix[double] Y, Integer batch_size=64, 
   Integer epochs=20, Double learning_rate=0.003, String out_activation, 
   String loss_fcn, Boolean shuffle=FALSE, Double validation_split = 0.0, 
-  Integer seed=-1, Boolean verbose=FALSE) 
+  Integer seed=-1, Integer hidden_size=128, Boolean verbose=FALSE)
   return (List[unknown] model)
 {
 
@@ -95,7 +97,9 @@ m_ffTrain = function(Matrix[double] X, Matrix[double] Y, Integer batch_size=64,
     Y_val = Y[1:1,]
   }
 
-  H1 = 128 # number of layer1 neurons
+  if(hidden_size < 1)
+    stop("ffTrain: hidden_size must be positive")
+  H1 = hidden_size # number of layer1 neurons
 
   # Init layers
   [W1, b1] = affine::init(D, H1, seed)

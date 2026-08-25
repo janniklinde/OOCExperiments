@@ -20,10 +20,12 @@ def main():
     parser.add_argument("data", type=Path)
     parser.add_argument("--clusters", type=int, default=16)
     parser.add_argument("--iterations", type=int, default=2)
+    parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    if min(args.clusters, args.iterations) < 1:
-        raise ValueError("clusters and iterations must be positive")
+    if min(args.clusters, args.iterations, args.threads) < 1:
+        raise ValueError("clusters, iterations, and threads must be positive")
+    compute_options = {"scheduler": "threads", "num_workers": args.threads}
 
     start = time.perf_counter()
     metadata = json.loads((args.data / "metadata.json").read_text())
@@ -39,14 +41,16 @@ def main():
         distances = -2.0 * (matrix @ centers.T) + np.sum(centers * centers, axis=1)
         labels = da.argmin(distances, axis=1)
         membership = (labels[:, None] == cluster_ids).astype(np.float64)
-        counts, sums = da.compute(membership.sum(axis=0), membership.T @ matrix)
+        counts, sums = da.compute(membership.sum(axis=0), membership.T @ matrix,
+                                  **compute_options)
         if np.any(counts == 0):
             raise RuntimeError("an empty cluster was encountered")
         centers = sums / counts[:, None]
 
     distances = -2.0 * (matrix @ centers.T) + np.sum(centers * centers, axis=1)
     labels, min_distances, sum_x_sq = da.compute(
-        da.argmin(distances, axis=1), da.min(distances, axis=1), da.sum(matrix * matrix))
+        da.argmin(distances, axis=1), da.min(distances, axis=1), da.sum(matrix * matrix),
+        **compute_options)
     inertia = float(sum_x_sq + min_distances.sum())
     args.output.parent.mkdir(parents=True, exist_ok=True)
     np.save(args.output.with_name(args.output.stem + "-centers.npy"), centers)

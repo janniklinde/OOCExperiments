@@ -1,0 +1,277 @@
+#-------------------------------------------------------------
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+#-------------------------------------------------------------
+
+# This script implements decision trees for recoded and binned categorical and
+# numerical input features. We train a single CART (classification and
+# regression tree) decision trees depending on the provided labels y, either
+# classification (majority vote per leaf) or regression (average per leaf).
+#
+# .. code-block::
+#
+#   For example, give a feature matrix with features [a,b,c,d]
+#   and the following trees, M would look as follows:
+#
+#   (L1)               |d<5|
+#                     /     \\
+#   (L2)           P1:2    |a<7|
+#                          /   \\
+#   (L3)                 P2:2 P3:1
+#
+#   --> M :=
+#   [[4, 5, 0, 2, 1, 7, 0, 0, 0, 0, 0, 2, 0, 1]]
+#    |(L1)| |  (L2)   | |        (L3)         |
+#
+#
+#
+# INPUT:
+# ------------------------------------------------------------------------------
+# X               Feature matrix in recoded/binned representation
+# y               Label matrix in recoded/binned representation
+# ctypes          Row-Vector of column types [1 scale/ordinal, 2 categorical]
+#                 of shape 1-by-(ncol(X)+1), where the last entry is the y type
+# max_depth       Maximum depth of the learned tree (stopping criterion)
+# min_leaf        Minimum number of samples in leaf nodes (stopping criterion),
+#                 odd number recommended to avoid 50/50 leaf label decisions
+# min_split       Minimum number of samples in leaf for attempting a split
+# max_features    Parameter controlling the number of features used as split
+#                 candidates at tree nodes: m = ceil(num_features^max_features)
+# max_values      Parameter controlling the number of values per feature used
+#                 as split candidates: nb = ceil(num_values^max_values)
+# max_dataratio   Parameter in [0,1] controlling when to materialize data
+#                 subsets of X and y on node splits. When set to 0, we always
+#                 scan the original X and y, which has the benefit of avoiding
+#                 the allocation and maintenance of data for all active nodes.
+#                 When set to 0.01 we rematerialize whenever the sub-tree data
+#                 would be less than 1% of last the parent materialize data size.
+# impurity        Impurity measure: entropy, gini (default), rss (regression)
+# seed            Fixed seed for randomization of samples and split candidates
+# verbose         Flag indicating verbose debug output
+# ------------------------------------------------------------------------------
+#
+# OUTPUT:
+# ------------------------------------------------------------------------------
+# M              Matrix M containing the learned trees, in linearized form
+# ------------------------------------------------------------------------------
+
+m_decisionTree = function(Matrix[Double] X, Matrix[Double] y, Matrix[Double] ctypes,
+    Int max_depth = 10, Int min_leaf = 20, Int min_split = 50,
+    Double max_features = 0.5, Double max_values = 1.0, Double max_dataratio = 0.25,
+    String impurity = "gini", Int seed = -1, Boolean verbose = FALSE)
+  return(Matrix[Double] M)
+{
+  t1 = time();
+
+  # validation checks
+  if( max_depth > 32 )
+    stop("decisionTree: invalid max_depth > 32: "+max_depth);
+  if( sum(X<=0) != 0 )
+    stop("decisionTree: feature matrix X is not properly recoded/binned (values <= 0): "+sum(X<=0));
+  if( sum(abs(X-round(X))>1e-14) != 0 )
+    stop("decisionTree: feature matrix X is not properly recoded/binned (non-integer): "+sum(abs(X-round(X))>1e-14));
+  if( sum(y<=0) != 0 )
+    stop("decisionTree: label vector y is not properly recoded/binned: "+sum(y<=0));
+
+  # initialize input data and basic statistics
+  # (we keep y2 and the indicates I in transposed form for sparsity exploitation)
+  m = nrow(X); n = ncol(X);
+  classify = (as.scalar(ctypes[1,n+1]) == 2);
+
+  fdom = max(colMaxs(X),2);           # num distinct per feature
+  foffb = t(cumsum(t(fdom))) - fdom;  # feature begin
+  foffe = t(cumsum(t(fdom)))          # feature end
+  rix = matrix(seq(1,m)%*%matrix(1,1,n), m*n, 1)
+  cix = matrix(X + foffb, m*n, 1);
+  X2 = table(rix, cix, 1, m, as.scalar(foffe[,n]), FALSE); #one-hot encoded
+  y2 = table(seq(1,m), y);
+  cnt = colSums(X2);
+  I = matrix(1, rows=1, cols=nrow(X));
+
+  if( verbose ) {
+    print("decisionTree: initialize with max_depth=" + max_depth + ", max_features="
+      + max_features +", max_dataratio=" + max_dataratio + ", impurity="
+      + impurity + ", seed=" + seed + ".");
+    print("decisionTree: basic statistics:");
+    print("-- impurity: " + as.scalar(computeImpurity(y2, I, impurity)));
+    print("-- minFeatureCount: " + min(cnt));
+    print("-- maxFeatureCount: " + max(cnt));
+  }
+
+  # queue-based node splitting
+  M = matrix(0, rows=1, cols=2*(2^max_depth-1))
+  queue = list(list(1,I,X2,y2)); # node IDs / data indicators
+  maxPath = 1;
+  while( length(queue) > 0 ) {
+    # pop next node from queue for splitting
+    [queue, node0] = remove(queue, 1);
+    node = as.list(node0);
+    nID = as.scalar(node[1]);
+    nI = as.matrix(node[2]);
+    X2 = as.matrix(node[3]);
+    y2 = as.matrix(node[4]);
+    if(verbose)
+      print("decisionTree: attempting split of node "+nID+" ("+sum(nI)+" rows)");
+
+    # optional rematerialization of data per node
+    if( sum(nI) < max_dataratio*ncol(nI) ) {
+      if(verbose)
+        print("-- compacting data: "+ncol(nI)+" --> "+sum(nI));
+      X2 = removeEmpty(target=X2, margin="rows", select=t(nI));
+      y2 = removeEmpty(target=y2, margin="rows", select=t(nI));
+      nI = matrix(1, rows=1, cols=nrow(X2));
+    }
+
+    # find best split attribute
+    nSeed = ifelse(seed==-1, seed, seed*nID);
+    [f, v, IDleft, Ileft, IDright, Iright] = findBestSplit(
+      X2, y2, foffb, foffe, nID, nI, min_leaf, max_features, max_values, impurity, nSeed);
+    validSplit = sum(Ileft) >= min_leaf & sum(Iright) >= min_leaf;
+    if(verbose)
+      print("-- best split: f"+f+" <= "+v+" --> valid="+validSplit);
+    if( validSplit )
+      M[, 2*nID-1:2*nID] = t(as.matrix(list(f,v)));
+    else
+      M[, 2*nID] = computeLeafLabel(y2, nI, classify, verbose);
+    maxPath = max(maxPath, floor(log(nID,2)+1));
+
+    # split data, finalize or recurse
+    if( validSplit ) {
+      if( sum(Ileft) >= min_split & floor(log(IDleft,2))+2 < max_depth )
+        queue = append(queue, list(IDleft,Ileft,X2,y2));
+      else
+        M[,2*IDleft] = computeLeafLabel(y2, Ileft, classify, verbose)
+      if( sum(Iright) >= min_split & floor(log(IDright,2))+2 < max_depth )
+        queue = append(queue, list(IDright,Iright,X2,y2));
+      else
+        M[,2*IDright] = computeLeafLabel(y2, Iright, classify, verbose)
+      maxPath = max(maxPath, floor(log(IDleft,2)+1));
+    }
+  }
+
+  # summary and encoding
+  M = M[1, 1:2*(2^maxPath-1)];
+
+  if(verbose) {
+    print("decisionTree: final constructed tree (linearized):");
+    print("--" + toString(M));
+  }
+}
+
+findBestSplit = function(Matrix[Double] X2, Matrix[Double] y2, Matrix[Double] foffb, Matrix[Double] foffe,
+    Int ID, Matrix[Double] I, Int min_leaf, Double max_features, Double max_values, String impurity, Int seed)
+  return(Int f, Int v, Int IDleft, Matrix[Double] Ileft, Int IDright, Matrix[Double] Iright)
+{
+  # sample features iff max_features < 1
+  n = ncol(foffb);
+  numI = sum(I);
+  feat = seq(1,n);
+  if( max_features < 1.0 ) {
+    rI = rand(rows=n, cols=1, seed=seed) <= (n^max_features/n);
+    feat = removeEmpty(target=feat, margin="rows", select=rI);
+    if( sum(feat) == 0 ) #sample at least one
+      feat[1,1] = round(rand(rows=1, cols=1, min=1, max=n));
+  }
+
+  # evaluate features and feature splits
+  # (both categorical and numerical are treated similarly by
+  # finding a cutoff point in the recoded/binned representation)
+  R = matrix(0, rows=3, cols=nrow(feat));
+  parfor( i in 1:nrow(feat) ) {
+    f = as.scalar(feat[i]);        # feature
+    beg = as.scalar(foffb[1,f])+1; # feature start in X2
+    end = as.scalar(foffe[1,f]);   # feature end in X2
+    belen = end-beg; #numFeat - 1
+    while(FALSE){} # make beg/end known
+
+    # construct 0/1 predicate vectors with <= semantics
+    # find rows that match at least one value and appear in I
+    # (vectorized evaluation, each column in P is a split candidate)
+    fP = upper.tri(target=matrix(1,belen,belen), diag=TRUE);
+    vI = seq(1,belen);
+    if( max_values < 1.0 & ncol(fP)>10 ) {
+      rI2 = rand(rows=ncol(fP),cols=1,seed=seed) <= (ncol(fP)^max_values/ncol(fP));
+      fP = removeEmpty(target=fP, margin="cols", select=t(rI2));
+      vI = removeEmpty(target=vI, margin="rows", select=rI2);
+    }
+    P = matrix(0, ncol(X2), ncol(fP));
+    P[beg:end-1,1:ncol(fP)] = fP;
+    Ileft = (t(X2 %*% P) * I) != 0;
+    Iright = (Ileft==0) * I;
+
+    # compute information gain for all split candidates
+    ig = as.scalar(computeImpurity(y2, I, impurity))
+         - rowSums(Ileft)/numI * computeImpurity(y2, Ileft, impurity)
+         - rowSums(Iright)/numI * computeImpurity(y2, Iright, impurity);
+    ig = replace(target=ig, pattern=NaN, replacement=0);
+
+    # track best split value and index, incl validity
+    valid = (rowSums(Ileft)>=min_leaf) & (rowSums(Iright)>=min_leaf);
+    bestig = max(valid*ig);
+    bestv = ifelse(bestig>0, nrow(valid)-as.scalar(rowIndexMax(t(rev(valid*ig))))+beg, -1);
+    if( bestv >= 0 )
+      bestv = as.scalar(vI[bestv-beg+1,1])+beg-1;
+    R[,i] = as.matrix(list(f, bestig, bestv));
+  }
+  ix = as.scalar(rowIndexMax(R[2,]));
+
+  # extract indicators and IDs
+  IDleft = 2 * ID;
+  IDright= 2 * ID + 1;
+  f = as.integer(as.scalar(feat[ix,1]));
+  beg = as.scalar(foffb[1,f]);
+  v = as.integer(as.scalar(R[3,ix])-beg);
+  if( max(R[2,]) > 0 ) {
+    p = table(seq(beg+1, beg+v), 1, ncol(X2), 1);
+    Ileft = (t(X2 %*% p) * I) != 0;
+    Iright = I * (Ileft==0);
+  }
+  else { # no information gain
+    Ileft = as.matrix(0);
+    Iright = as.matrix(0);
+  }
+}
+
+computeImpurity = function(Matrix[Double] y2, Matrix[Double] I, String impurity)
+  return(Matrix[Double] score)
+{
+  f = (I %*% y2) / rowSums(I); # rel. freq. per category/bin
+  score = matrix(0, nrow(I), 1);
+  if( impurity == "gini" )
+    score = 1 - rowSums(f^2); # sum(f*(1-f));
+  else if( impurity == "entropy" )
+    score = rowSums(-f * log(f));
+  else if( impurity == "rss" ) { # residual sum of squares
+    yhat = f %*% seq(1,ncol(f));                # yhat
+    res = outer(yhat, t(rowIndexMax(y2)), "-"); # yhat-y
+    score = rowSums((I * res)^2);               # sum((yhat-y)^2)
+  }
+  else
+    stop("decisionTree: unsupported impurity measure: "+impurity);
+}
+
+computeLeafLabel = function(Matrix[Double] y2, Matrix[Double] I, Boolean classify, Boolean verbose)
+  return(Double label)
+{
+  f = (I %*% y2) / sum(I);
+  label = as.scalar(ifelse(classify,
+    rowIndexMax(f), f %*% seq(1,ncol(f))));
+  if(verbose)
+    print("-- leaf node label: " + label +" ("+sum(I)*max(f)+"/"+sum(I)+")");
+}

@@ -16,8 +16,9 @@ def prepare_numpy(output, rows, cols, sparsity=1.0, seed=7, chunk_mib=256,
         raise ValueError("rows, cols, and chunk_mib must be positive")
     if not 0.0 <= sparsity <= 1.0:
         raise ValueError("sparsity must be in [0, 1]")
-    if distribution not in ("normal", "uniform"):
-        raise ValueError("distribution must be 'normal' or 'uniform'")
+    if distribution not in ("normal", "uniform", "uniform_nonnegative"):
+        raise ValueError("distribution must be 'normal', 'uniform', or "
+                         "'uniform_nonnegative'")
     output = Path(output)
     metadata_path = Path(str(output) + ".json")
     if not force and (output.exists() or metadata_path.exists()):
@@ -41,8 +42,10 @@ def prepare_numpy(output, rows, cols, sparsity=1.0, seed=7, chunk_mib=256,
                     chunk = np.zeros((count, cols), dtype="<f8")
                 elif distribution == "normal":
                     chunk = value_rng.standard_normal((count, cols), dtype=np.float64)
-                else:
+                elif distribution == "uniform":
                     chunk = value_rng.uniform(-1.0, 1.0, size=(count, cols))
+                else:
+                    chunk = value_rng.uniform(0.0, 1.0, size=(count, cols))
                 if 0.0 < sparsity < 1.0:
                     mask = mask_rng.random((count, cols), dtype=np.float32) >= sparsity
                     chunk[mask] = 0.0
@@ -91,7 +94,9 @@ def main():
     parser.add_argument("--sparsity", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--chunk-mib", type=int, default=256)
-    parser.add_argument("--distribution", choices=("normal", "uniform"), default="normal")
+    parser.add_argument("--distribution",
+                        choices=("normal", "uniform", "uniform_nonnegative"),
+                        default="normal")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     metadata = prepare_numpy(args.output, args.rows, args.cols, args.sparsity, args.seed,

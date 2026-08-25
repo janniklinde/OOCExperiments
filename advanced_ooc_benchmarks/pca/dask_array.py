@@ -19,8 +19,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("data", type=Path)
     parser.add_argument("--components", type=int, default=16)
+    parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.threads < 1:
+        raise ValueError("threads must be positive")
+    compute_options = {"scheduler": "threads", "num_workers": args.threads}
 
     start = time.perf_counter()
     metadata = json.loads((args.data / "metadata.json").read_text())
@@ -29,14 +33,14 @@ def main():
         raise ValueError("components must be in [1, cols] and at least two rows are required")
     mapped = np.memmap(args.data / "X.f64", dtype=np.float64, mode="r", shape=shape)
     matrix = da.from_array(mapped, chunks="auto")
-    center, gram = da.compute(matrix.mean(axis=0), matrix.T @ matrix)
+    center, gram = da.compute(matrix.mean(axis=0), matrix.T @ matrix, **compute_options)
     covariance = gram / (shape[0] - 1)
     covariance -= (shape[0] / (shape[0] - 1)) * np.outer(center, center)
     values, vectors = np.linalg.eigh(covariance)
     order = np.argsort(values)[::-1][:args.components]
     eigenvalues = values[order]
     components = vectors[:, order]
-    scores = (matrix @ components - center @ components).compute()
+    scores = (matrix @ components - center @ components).compute(**compute_options)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     np.save(args.output.with_name(args.output.stem + "-scores.npy"), scores)

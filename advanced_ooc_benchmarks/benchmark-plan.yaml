@@ -7,7 +7,7 @@ tools:
   java: java
   python: /home/jannik/.venvs/systemds/bin/python
   spark_submit: /home/jannik/.venvs/spark35/bin/spark-submit
-  systemds_jar: /home/jannik/Dev/SystemDSTest/systemds/target/SystemDS.jar
+  systemds_jar: /home/jannik/Dev/SystemDSReview/systemds/target/SystemDS.jar
 
 environment:
   BENCH_ROOT: ${plan.root}
@@ -21,7 +21,8 @@ defaults:
   repetitions: 1
   resources:
     threads: auto
-    spark_threads: 8
+    dask_threads: 8
+    spark_threads: auto #8
     swap_max: 0
     timeout_seconds: 60
     timeout_grace_seconds: 30
@@ -40,7 +41,7 @@ templates:
       ${run.systemds_args}
   systemds-spark:
     comparable: true
-    enabled: false
+    enabled: true
     blocksize_sweep: spark
     required_tools: [spark_submit]
     command: >-
@@ -80,6 +81,15 @@ templates:
       OMP_NUM_THREADS: ${resources.threads}
       OPENBLAS_NUM_THREADS: ${resources.threads}
       MKL_NUM_THREADS: ${resources.threads}
+  dask:
+    comparable: true
+    enabled: false
+    environment:
+      OMP_NUM_THREADS: 1
+      OPENBLAS_NUM_THREADS: 1
+      MKL_NUM_THREADS: 1
+      VECLIB_MAXIMUM_THREADS: 1
+      NUMEXPR_NUM_THREADS: 1
 
 datasets:
   # Dense datasets share this declarative contract. Copy/merge the anchor, give
@@ -156,12 +166,160 @@ datasets:
        distribution: normal, seed: 17, generator_chunk_mib: 256, accept_legacy: false,
        systemds_chunk_mib: 128}
 
-  pagerank_synthetic:
-    directory: ${plan.root}/bench-data/pagerank-b400k
-    parameters: {vertices: 10000000, out_degree: 12, seed: 7}
+  gnmf_1m:
+    <<: *dense_dataset
+    directory: ${plan.root}/bench-data/gnmf
+    parameters:
+      {rows: 1000000, cols: 384, classes: 2, sparsity: 1.0,
+       distribution: uniform_nonnegative, seed: 23, generator_chunk_mib: 256,
+       accept_legacy: false, systemds_chunk_mib: 128}
+
+  mlp_activation_64k:
+    <<: *dense_dataset
+    directory: ${plan.root}/bench-data/mlp-activation-64k
+    parameters:
+      {rows: 65536, cols: 8, classes: 2, sparsity: 1.0,
+       distribution: normal, seed: 29, generator_chunk_mib: 64,
+       accept_legacy: false, systemds_chunk_mib: 64}
+
+  randomforest_1m:
+    directory: ${plan.root}/bench-data/randomforest
+    parameters:
+      {rows: 1000000, cols: 64, classes: 2, bins: 8, sparsity: 1.0,
+       distribution: normal, seed: 7, generator_chunk_mib: 256, accept_legacy: false,
+       systemds_chunk_mib: 128}
+    ready: [randomforest-metadata.json]
+    artifacts:
+      X_binned_raw:
+        path: X_binned.u8
+        size_bytes_product: ["${dataset.rows}", "${dataset.cols}"]
+        metadata:
+          path: randomforest-metadata.json
+          expect:
+            {rows: "${dataset.rows}", cols: "${dataset.cols}", bins: "${dataset.bins}",
+             dtype: uint8, generator: prepare_randomforest_dataset.py,
+             generator_version: 1}
+      class_y_raw: {path: class_y.u8, size_bytes_product: ["${dataset.rows}"]}
+    prepare:
+      policy: auto
+      clean:
+        [X.f64, X.f64.json, binary_y.f64, nn_y.f64, metadata.json,
+         X_binned.u8, class_y.u8, randomforest-metadata.json, systemds]
+      command: |
+        set -euo pipefail
+        legacy_args=()
+        if [ "${dataset.accept_legacy}" = true ]; then legacy_args+=(--accept-legacy); fi
+        "${tools.python}" "${plan.dir}/prepare_dense_dataset.py" --out "${dataset.dir}" --rows ${dataset.rows} --cols ${dataset.cols} --classes ${dataset.classes} --sparsity ${dataset.sparsity} --distribution ${dataset.distribution} --seed ${dataset.seed} --chunk-mib ${dataset.generator_chunk_mib} "${legacy_args[@]}"
+        "${tools.python}" "${plan.dir}/prepare_randomforest_dataset.py" --out "${dataset.dir}" --rows ${dataset.rows} --cols ${dataset.cols} --bins ${dataset.bins} --chunk-mib ${dataset.generator_chunk_mib}
+    variants:
+      blocksize:
+        artifacts:
+          X:
+            path: systemds/X_binned-bs${run.blocksize}
+            metadata: {expect: {rows: "${dataset.rows}", cols: "${dataset.cols}", rows_in_block: "${run.blocksize}", cols_in_block: "${run.blocksize}"}}
+          y:
+            path: systemds/class_y-bs${run.blocksize}
+            metadata: {expect: {rows: "${dataset.rows}", cols: 1, rows_in_block: "${run.blocksize}", cols_in_block: "${run.blocksize}"}}
+        prepare:
+          policy: auto
+          clean:
+            ["systemds/X_binned-bs${run.blocksize}",
+             "systemds/X_binned-bs${run.blocksize}.mtd",
+             "systemds/.X_binned-bs${run.blocksize}.mtd.crc",
+             "systemds/class_y-bs${run.blocksize}",
+             "systemds/class_y-bs${run.blocksize}.mtd",
+             "systemds/.class_y-bs${run.blocksize}.mtd.crc",
+             "systemds/systemds-staging/X_binned-bs${run.blocksize}-bs${run.blocksize}",
+             "systemds/systemds-staging/class_y-bs${run.blocksize}-bs${run.blocksize}"]
+          command: |
+            set -euo pipefail
+            prep_root="${dataset.dir}/.sysds-root-randomforest-bs${run.blocksize}"
+            mkdir -p "$prep_root/target" "$prep_root/conf" "${dataset.dir}/tmp/randomforest-bs${run.blocksize}" "${dataset.dir}/scratch/randomforest-bs${run.blocksize}" "${dataset.dir}/tmp/java"
+            ln -sfn "${tools.systemds_jar}" "$prep_root/target/SystemDS.jar"
+            if [ -d "$(dirname "${tools.systemds_jar}")/lib" ]; then
+              ln -sfn "$(dirname "${tools.systemds_jar}")/lib" "$prep_root/target/lib"
+            fi
+            cat > "$prep_root/conf/SystemDS-config.xml" <<EOF
+            <root>
+              <sysds.localtmpdir>${dataset.dir}/tmp/randomforest-bs${run.blocksize}</sysds.localtmpdir>
+              <sysds.scratch>${dataset.dir}/scratch/randomforest-bs${run.blocksize}</sysds.scratch>
+              <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>
+            </root>
+            EOF
+            SYSTEMDS_ROOT="$prep_root" "${tools.python}" "${plan.dir}/convert_fp64_systemds.py" "${dataset.dir}/X_binned.u8" "${dataset.dir}/systemds/X_binned-bs${run.blocksize}" --rows ${dataset.rows} --cols ${dataset.cols} --dtype uint8 --blocksize ${run.blocksize} --chunk-mib ${dataset.systemds_chunk_mib} --java "${tools.java}" --systemds-jar "${tools.systemds_jar}" --config "$prep_root/conf/SystemDS-config.xml" --java-heap 3g --java-tmp "${dataset.dir}/tmp/java" --replace-invalid
+            SYSTEMDS_ROOT="$prep_root" "${tools.python}" "${plan.dir}/convert_fp64_systemds.py" "${dataset.dir}/class_y.u8" "${dataset.dir}/systemds/class_y-bs${run.blocksize}" --rows ${dataset.rows} --cols 1 --dtype uint8 --blocksize ${run.blocksize} --chunk-mib ${dataset.systemds_chunk_mib} --java "${tools.java}" --systemds-jar "${tools.systemds_jar}" --config "$prep_root/conf/SystemDS-config.xml" --java-heap 3g --java-tmp "${dataset.dir}/tmp/java" --replace-invalid
+
+  als_1m:
+    directory: ${plan.root}/bench-data/als
+    parameters: {users: 1000000, items: 100000, ratings_per_user: 40, nnz: 40000000, seed: 19}
     ready: [metadata.json]
     artifacts:
-      G_ijv: {path: systemds/G.ijv}
+      row_ptr:
+        path: csr/row_ptr.i64
+        size_bytes_from_metadata: {path: metadata.json, key: rows, multiplier: 8, add: 8}
+      col_idx: {path: csr/col_idx.i32, size_bytes_product: ["${dataset.nnz}", 4]}
+      values: {path: csr/values.f64, size_bytes_product: ["${dataset.nnz}", 8]}
+    prepare:
+      policy: auto
+      command: |
+        "${tools.python}" "${plan.dir}/prepare_als_dataset.py" --out "${dataset.dir}" --users ${dataset.users} --items ${dataset.items} --ratings-per-user ${dataset.ratings_per_user} --seed ${dataset.seed}
+    variants:
+      blocksize:
+        artifacts:
+          X:
+            path: systemds/X-bs${run.blocksize}
+            metadata:
+              expect: {rows: "${dataset.users}", cols: "${dataset.items}", nnz: "${dataset.nnz}", rows_in_block: "${run.blocksize}", cols_in_block: "${run.blocksize}"}
+        prepare:
+          policy: auto
+          command: |
+            set -euo pipefail
+            prep_root="${dataset.dir}/.sysds-root-bs${run.blocksize}"
+            classes="$prep_root/classes"
+            sysds_cp="${tools.systemds_jar}:$(dirname "${tools.systemds_jar}")/lib/*"
+            mkdir -p "$classes" "${dataset.dir}/systemds" "${dataset.dir}/tmp/java"
+            java_bin="$(command -v "${tools.java}")"
+            javac_bin="$(dirname "$java_bin")/javac"
+            "$javac_bin" -cp "$sysds_cp" -d "$classes" "${plan.dir}/ALSCSRToSystemDS.java"
+            native_x="${dataset.dir}/systemds/X-bs${run.blocksize}"
+            staging_x="${dataset.dir}/systemds/.X-bs${run.blocksize}.tmp-$$"
+            mkdir -p "$staging_x"
+            "${tools.java}" -Xmx1g -Djava.io.tmpdir="${dataset.dir}/tmp/java" -cp "$classes:$sysds_cp" ALSCSRToSystemDS "${dataset.dir}/csr" "$staging_x/part-00000" ${dataset.users} ${dataset.items} ${run.blocksize} ${dataset.nnz}
+            invalid_stamp="$(date +%Y%m%dT%H%M%S)"
+            if [ -e "$native_x" ]; then mv "$native_x" "$native_x.invalid-$invalid_stamp"; fi
+            if [ -e "$native_x.mtd" ]; then mv "$native_x.mtd" "$native_x.mtd.invalid-$invalid_stamp"; fi
+            mv "$staging_x" "$native_x"
+            cat > "$native_x.mtd" <<EOF
+            {
+              "data_type": "matrix",
+              "value_type": "double",
+              "rows": ${dataset.users},
+              "cols": ${dataset.items},
+              "nnz": ${dataset.nnz},
+              "format": "binary",
+              "rows_in_block": ${run.blocksize},
+              "cols_in_block": ${run.blocksize}
+            }
+            EOF
+
+  twitter_400k:
+    directory: ${plan.root}/bench-data/twitter-2010
+    parameters:
+      {vertices: 41652230, edges: 1468365182, blocksize: 400000,
+       seed: deterministic-affine-104729-12345, prepare_workers: 16,
+       prepare_concurrency: 6}
+    ready: [metadata.json]
+    artifacts:
+      G:
+        path: systemds/G
+        metadata:
+          expect:
+            {rows: "${dataset.vertices}", cols: "${dataset.vertices}", nnz: "${dataset.edges}",
+             rows_in_block: "${dataset.blocksize}", cols_in_block: "${dataset.blocksize}"}
+      dangling:
+        path: systemds/dangling
+        metadata:
+          expect: {rows: "${dataset.vertices}", rows_in_block: "${dataset.blocksize}"}
       csr_row_ptr:
         path: csr/row_ptr.i64
         size_bytes_from_metadata: {path: metadata.json, key: vertices, multiplier: 8, add: 8}
@@ -173,45 +331,24 @@ datasets:
         size_bytes_from_metadata: {path: metadata.json, key: edges, multiplier: 8}
         metadata:
           path: metadata.json
-          expect:
-            {vertices: "${dataset.vertices}", out_degree: "${dataset.out_degree}",
-             seed: "${dataset.seed}"}
+          expect: {vertices: "${dataset.vertices}", edges: "${dataset.edges}"}
       dangling_raw:
         path: dangling.u8
         size_bytes_from_metadata: {path: metadata.json, key: vertices}
     prepare:
-      policy: ask
-      clean:
-        [SystemDS-config.xml, scratch, tmp]
-      command: |
-        "${tools.python}" "${plan.dir}/pagerank/prepare.py" --vertices ${dataset.vertices} --out-degree ${dataset.out_degree} --seed ${dataset.seed} --out "${dataset.dir}"
-    variants:
-      blocksize:
-        artifacts:
-          G:
-            path: systemds/G-bs${run.blocksize}
-            metadata: {expect: {rows: "${dataset.vertices}", cols: "${dataset.vertices}", rows_in_block: "${run.blocksize}", cols_in_block: "${run.blocksize}"}}
-          dangling:
-            path: systemds/dangling-bs${run.blocksize}
-            metadata: {expect: {rows: "${dataset.vertices}", cols: 1, rows_in_block: "${run.blocksize}", cols_in_block: "${run.blocksize}"}}
-        prepare:
-          policy: ask
-          clean:
-            ["systemds/G-bs${run.blocksize}", "systemds/G-bs${run.blocksize}.mtd",
-             "systemds/.G-bs${run.blocksize}.crc", "systemds/.G-bs${run.blocksize}.mtd.crc",
-             "systemds/dangling-bs${run.blocksize}", "systemds/dangling-bs${run.blocksize}.mtd",
-             "systemds/.dangling-bs${run.blocksize}.crc",
-             "systemds/.dangling-bs${run.blocksize}.mtd.crc"]
-          command: |
-            mkdir -p "${dataset.dir}/scratch" "${dataset.dir}/tmp"
-            cat > "${dataset.dir}/SystemDS-config-bs${run.blocksize}.xml" <<EOF
-            <root>
-              <sysds.localtmpdir>${dataset.dir}/tmp</sysds.localtmpdir>
-              <sysds.scratch>${dataset.dir}/scratch</sysds.scratch>
-              <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>
-            </root>
-            EOF
-            "${tools.java}" -Xmx8g --add-modules=jdk.incubator.vector -jar "${tools.systemds_jar}" -f "${plan.dir}/pagerank/prepare_systemds.dml" -exec singlenode -config "${dataset.dir}/SystemDS-config-bs${run.blocksize}.xml" -args "${dataset.dir}/systemds/G.ijv" ${dataset.vertices} "${dataset.dir}/systemds/G-bs${run.blocksize}" "${dataset.dir}/systemds/dangling-bs${run.blocksize}"
+      policy: auto
+      clean: [systemds/G, systemds/G.mtd, systemds/dangling, systemds/dangling.mtd]
+      env:
+        PYTHON: ${tools.python}
+        SYSDS_JAR: ${tools.systemds_jar}
+        BENCH_DATA_DIR: ${plan.root}/bench-data
+        REAL_WORLD_BLOCKSIZE: ${dataset.blocksize}
+        REAL_WORLD_NATIVE_SUFFIX: ""
+        PREP_WORKERS: ${dataset.prepare_workers}
+        PREP_CONCURRENCY: ${dataset.prepare_concurrency}
+        PREP_JAVA_HEAP: 2g
+      command: >-
+        ../experiments/real_world/prepare.sh twitter-2010 "${dataset.dir}"
 
 systemds_setup: &systemds_setup
   command: |
@@ -221,7 +358,7 @@ systemds_setup: &systemds_setup
       <sysds.localtmpdir>${plan.root}/tmp/systemds</sysds.localtmpdir>
       <sysds.scratch>${plan.root}/scratch_space</sysds.scratch>
       <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>
-      <sysds.native.blas>openblas</sysds.native.blas>
+      <!--<sysds.native.blas>openblas</sysds.native.blas>-->
     </root>
     EOF
 
@@ -231,17 +368,17 @@ runs:
   # separate <run-id>-baseline case.
   - id: pagerank_3g
     enabled: false
-    dataset: pagerank_synthetic
+    dataset: twitter_400k
     entrypoint: ${plan.dir}/pagerank/systemds.dml
     blocksize_sweeps: {ooc: [400000], spark: [400000]}
     parameters:
-      iterations: 20
+      iterations: 15
       alpha: 0.85
       systemds_args: >-
         -args "${input.G}" "${input.dangling}" ${run.alpha} ${run.iterations}
         "${run.outputs}/systemds-r${rep}"
     inputs: {G: {artifact: G}, dangling: {artifact: dangling}}
-    resources: {memory_max: 4G, java_heap: 3g, timeout_seconds: 180, timeout_grace_seconds: 30}
+    resources: {memory_max: 4G, java_heap: 3g, timeout_seconds: 3600, timeout_grace_seconds: 30}
     setup: *systemds_setup
     cold_cache: ["${dataset.dir}", "${plan.root}/tmp/systemds", "${plan.root}/tmp/spark"]
     implementations:
@@ -255,7 +392,7 @@ runs:
           --output "${run.outputs}/scipy-r${rep}.npy"
 
   - id: multilogreg_3g
-    enabled: true
+    enabled: false
     dataset: dense_1m
     entrypoint: ${plan.dir}/multilogreg/systemds.dml
     blocksize_sweeps: {ooc: [500], spark: [1000]}
@@ -283,7 +420,7 @@ runs:
           --output "${run.outputs}/python-r${rep}.json"
 
   - id: randomized_svd_3g
-    enabled: true
+    enabled: false
     dataset: dense_1m
     entrypoint: ${plan.dir}/randomized_svd/systemds.dml
     blocksize_sweeps: {ooc: [500], spark: [1000]}
@@ -306,26 +443,29 @@ runs:
           "${tools.python}" "${plan.dir}/randomized_svd/numpy.py" "${dataset.dir}"
           --rank ${run.rank} --seed ${run.seed} --output "${run.outputs}/numpy-r${rep}.json"
       - id: dask-two-pass
-        template: python
+        template: dask
         command: >-
           "${tools.python}" "${plan.dir}/randomized_svd/dask_array.py" "${dataset.dir}"
-          --rank ${run.rank} --seed ${run.seed} --output "${run.outputs}/dask-r${rep}.json"
+          --rank ${run.rank} --seed ${run.seed} --threads ${resources.dask_threads}
+          --output "${run.outputs}/dask-r${rep}.json"
 
   - id: mlp_3g
-    enabled: true
-    dataset: dense_1m
+    enabled: false
+    dataset: mlp_activation_64k
     entrypoint: ${plan.dir}/mlp/systemds.dml
     blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
       epochs: 1
-      batch_size: 4096
+      batch_size: 65536
+      hidden_size: 9216
       learning_rate: 0.003
       seed: 7
       systemds_args: >-
         -args "${input.X}" "${input.y}" ${run.batch_size} ${run.epochs}
-        ${run.learning_rate} ${run.seed}
+        ${run.learning_rate} ${run.seed} ${run.hidden_size}
+        "${run.outputs}/systemds-W1-r${rep}" "${run.outputs}/systemds-W2-r${rep}"
     inputs: {X: {artifact: X}, y: {artifact: nn_y}}
-    resources: {memory_max: 4G, java_heap: 3g}
+    resources: {memory_max: 4G, java_heap: 3g, timeout_seconds: 600}
     setup: *systemds_setup
     cold_cache: ["${dataset.dir}", "${plan.root}/tmp/systemds", "${plan.root}/tmp/spark"]
     implementations:
@@ -336,11 +476,53 @@ runs:
         command: >-
           "${tools.python}" "${plan.dir}/mlp/numpy.py" "${dataset.dir}"
           --epochs ${run.epochs} --batch-size ${run.batch_size}
-          --learning-rate ${run.learning_rate} --seed ${run.seed}
+          --hidden-size ${run.hidden_size} --learning-rate ${run.learning_rate} --seed ${run.seed}
           --output "${run.outputs}/python-r${rep}.json"
+      - id: dask-minibatch
+        template: dask
+        command: >-
+          "${tools.python}" "${plan.dir}/mlp/dask_array.py" "${dataset.dir}"
+          --epochs ${run.epochs} --batch-size ${run.batch_size}
+          --hidden-size ${run.hidden_size} --learning-rate ${run.learning_rate} --seed ${run.seed}
+          --threads ${resources.dask_threads}
+          --output "${run.outputs}/dask-r${rep}.json"
+
+  - id: gnmf_3g
+    enabled: false
+    dataset: gnmf_1m
+    entrypoint: ${plan.dir}/gnmf/systemds.dml
+    blocksize_sweeps: {ooc: [500], spark: [1000]}
+    parameters:
+      rank: 16
+      iterations: 2
+      epsilon: 1e-8
+      seed: 23
+      systemds_args: >-
+        -args "${input.X}" ${run.rank} ${run.iterations} ${run.epsilon} ${run.seed}
+        "${run.outputs}/systemds-W-r${rep}" "${run.outputs}/systemds-H-r${rep}"
+    inputs: {X: {artifact: X}}
+    resources: {memory_max: 4G, java_heap: 3g, timeout_seconds: 600}
+    setup: *systemds_setup
+    cold_cache: ["${dataset.dir}", "${plan.root}/tmp/systemds", "${plan.root}/tmp/spark"]
+    implementations:
+      - {id: systemds-ooc, template: systemds-ooc}
+      - {id: systemds-spark, template: systemds-spark}
+      - id: numpy-multiplicative-updates
+        template: python
+        command: >-
+          "${tools.python}" "${plan.dir}/gnmf/numpy.py" "${dataset.dir}"
+          --rank ${run.rank} --iterations ${run.iterations} --epsilon ${run.epsilon}
+          --seed ${run.seed} --output "${run.outputs}/numpy-r${rep}.json"
+      - id: dask-multiplicative-updates
+        template: dask
+        command: >-
+          "${tools.python}" "${plan.dir}/gnmf/dask_array.py" "${dataset.dir}"
+          --rank ${run.rank} --iterations ${run.iterations} --epsilon ${run.epsilon}
+          --seed ${run.seed} --threads ${resources.dask_threads}
+          --output "${run.outputs}/dask-r${rep}.json"
 
   - id: gmm_vvi_3g
-    enabled: true
+    enabled: false
     dataset: dense_1m
     entrypoint: ${plan.dir}/gmm/systemds.dml
     blocksize_sweeps: {ooc: [500], spark: [1000]}
@@ -373,10 +555,10 @@ runs:
   # Newly added workloads are disabled until one blocksize/backend at a time has
   # completed a host smoke run under the 3 GiB heap and 4 GiB cgroup.
   - id: kmeans_3g
-    enabled: true
+    enabled: false
     dataset: dense_1m
     entrypoint: ${plan.dir}/kmeans/systemds.dml
-    blocksize_sweeps: {ooc: [250, 500, 1000], spark: [1000]}
+    blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
       clusters: 16
       iterations: 2
@@ -398,17 +580,18 @@ runs:
           --clusters ${run.clusters} --iterations ${run.iterations}
           --output "${run.outputs}/numpy-r${rep}.json"
       - id: dask-lloyd
-        template: python
+        template: dask
         command: >-
           "${tools.python}" "${plan.dir}/kmeans/dask_array.py" "${dataset.dir}"
           --clusters ${run.clusters} --iterations ${run.iterations}
+          --threads ${resources.dask_threads}
           --output "${run.outputs}/dask-r${rep}.json"
 
   - id: pca_3g
-    enabled: true
+    enabled: false
     dataset: dense_1m
     entrypoint: ${plan.dir}/pca/systemds.dml
-    blocksize_sweeps: {ooc: [250, 500, 1000], spark: [1000]}
+    blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
       components: 16
       systemds_args: >-
@@ -429,16 +612,17 @@ runs:
           "${tools.python}" "${plan.dir}/pca/numpy.py" "${dataset.dir}"
           --components ${run.components} --output "${run.outputs}/numpy-r${rep}.json"
       - id: dask-covariance
-        template: python
+        template: dask
         command: >-
           "${tools.python}" "${plan.dir}/pca/dask_array.py" "${dataset.dir}"
-          --components ${run.components} --output "${run.outputs}/dask-r${rep}.json"
+          --components ${run.components} --threads ${resources.dask_threads}
+          --output "${run.outputs}/dask-r${rep}.json"
 
   - id: lmcg_3g
-    enabled: true
+    enabled: false
     dataset: dense_1m
     entrypoint: ${plan.dir}/lmcg/systemds.dml
-    blocksize_sweeps: {ooc: [250, 500, 1000], spark: [1000]}
+    blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
       iterations: 2
       reg: 1e-7
@@ -460,8 +644,67 @@ runs:
           --iterations ${run.iterations} --reg ${run.reg} --tolerance ${run.tolerance}
           --output "${run.outputs}/numpy-r${rep}.json"
       - id: dask-cg
-        template: python
+        template: dask
         command: >-
           "${tools.python}" "${plan.dir}/lmcg/dask_array.py" "${dataset.dir}"
           --iterations ${run.iterations} --reg ${run.reg} --tolerance ${run.tolerance}
+          --threads ${resources.dask_threads}
           --output "${run.outputs}/dask-r${rep}.json"
+
+  - id: randomforest_3g
+    enabled: false
+    dataset: randomforest_1m
+    entrypoint: ${plan.dir}/randomforest/systemds.dml
+    blocksize_sweeps: {ooc: [500], spark: [1000]}
+    parameters:
+      trees: 20
+      depth: 6
+      sample_fraction: 1.0
+      min_leaf: 20
+      min_split: 50
+      seed: 7
+      systemds_args: >-
+        -args "${input.X}" "${input.y}" ${run.trees} ${run.sample_fraction}
+        ${run.depth} ${run.min_leaf} ${run.min_split} ${run.seed}
+        "${run.outputs}/systemds-r${rep}"
+    inputs: {X: {artifact: X}, y: {artifact: y}}
+    resources: {memory_max: 4G, java_heap: 3g, timeout_seconds: 300}
+    setup: *systemds_setup
+    cold_cache: ["${dataset.dir}", "${plan.root}/tmp/systemds", "${plan.root}/tmp/spark"]
+    implementations:
+      - {id: systemds-ooc, template: systemds-ooc}
+      - {id: systemds-spark, template: systemds-spark}
+      - id: sklearn-random-forest
+        template: python
+        command: >-
+          "${tools.python}" "${plan.dir}/randomforest/numpy.py" "${dataset.dir}"
+          --trees ${run.trees} --depth ${run.depth} --min-leaf ${run.min_leaf}
+          --min-split ${run.min_split} --seed ${run.seed} --threads ${resources.threads}
+          --output "${run.outputs}/sklearn-r${rep}.json"
+
+  - id: als_3g
+    enabled: true
+    dataset: als_1m
+    entrypoint: ${plan.dir}/als/systemds.dml
+    blocksize_sweeps: {ooc: [8000], spark: [4000]}
+    parameters:
+      rank: 16
+      iterations: 1
+      reg: 1e-6
+      seed: 19
+      systemds_args: >-
+        -args "${input.X}" ${run.rank} ${run.reg} ${run.iterations} ${run.seed}
+        "${run.outputs}/systemds-U-r${rep}" "${run.outputs}/systemds-V-r${rep}"
+    inputs: {X: {artifact: X}}
+    resources: {memory_max: 16G, java_heap: 14g, timeout_seconds: 300}
+    setup: *systemds_setup
+    cold_cache: ["${dataset.dir}", "${plan.root}/tmp/systemds", "${plan.root}/tmp/spark"]
+    implementations:
+      - {id: systemds-ooc, template: systemds-ooc}
+      - {id: systemds-spark, template: systemds-spark}
+      - id: scipy-als-cg
+        template: python
+        command: >-
+          "${tools.python}" "${plan.dir}/als/numpy.py" "${dataset.dir}"
+          --rank ${run.rank} --iterations ${run.iterations} --reg ${run.reg} --seed ${run.seed}
+          --output "${run.outputs}/scipy-r${rep}.json"

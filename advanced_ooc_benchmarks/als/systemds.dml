@@ -23,7 +23,7 @@ source("als/implementation.dml") as als_impl;
 
 X = read($1);
 
-[U, V] = als_impl::m_als(X=X, rank=$2, regType="L2", reg=$3, maxi=$4, check=FALSE,
+[U, V] = als_impl::m_alsCG(X=X, rank=$2, regType="L2", reg=$3, maxi=$4, check=FALSE,
   seed=$5, verbose=FALSE);
 
 write(U, $6, format="binary");

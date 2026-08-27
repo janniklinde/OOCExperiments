@@ -14,4 +14,4 @@ X = read($1);
 write(scores, $3, format="binary");
 write(components, $4, format="binary");
 write(eigenvalues, $5, format="binary");
-print("score_checksum=" + sum(scores));
+print("score_norm_sq=" + sum(scores^2));

@@ -22,6 +22,24 @@ class RunExpansionTest(unittest.TestCase):
 
         self.assertEqual(timestamp, "20260824T172516.123456+0000")
 
+    def test_invocation_metadata_hashes_suite_sources_and_tool(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            suite = root / "suite"
+            suite.mkdir()
+            (suite / "workload.dml").write_text("print('ok');\n")
+            tool = root / "SystemDS.jar"
+            tool.write_bytes(b"jar")
+            destination = root / "metadata.json"
+
+            benchmark_plan.write_invocation_metadata(
+                destination, suite, root, {"tools.systemds_jar": str(tool)})
+
+            metadata = json.loads(destination.read_text())
+            self.assertEqual(metadata["suite_sources"]["workload.dml"]["bytes"], 13)
+            self.assertEqual(metadata["tool_files"]["systemds_jar"]["sha256"],
+                             benchmark_plan.file_digest(tool))
+
     def test_blocksize_list_expands_without_mutating_source(self):
         source = [{"id": "workload", "parameters": {"blocksize": [500, 1000]}}]
 
@@ -323,6 +341,60 @@ class TemporaryCleanupTest(unittest.TestCase):
                     [str(Path(temporary) / "outside")], context, run_dir)
 
 
+class OutputRetentionTest(unittest.TestCase):
+    def _record(self, root, case, implementation, value, status="ok"):
+        run_dir = root / case
+        outputs = run_dir / "outputs"
+        logs = run_dir / "logs"
+        outputs.mkdir(parents=True)
+        logs.mkdir()
+        (outputs / f"{implementation}-artifact-r1").write_bytes(b"large result")
+        log = logs / "run.log"
+        if implementation.startswith("systemds-"):
+            log.write_text(f"inertia={value}\n", encoding="utf-8")
+        else:
+            log.write_text("", encoding="utf-8")
+            (outputs / f"{implementation}-r1.json").write_text(
+                json.dumps({"inertia": value}), encoding="utf-8")
+        return {
+            "base_id": "kmeans_scaling", "dataset": "dense", "resource_profile": "mem4",
+            "parameter_case": None, "rep": 1, "impl_id": implementation,
+            "status": status, "log": log, "outputs": outputs, "run_dir": run_dir,
+        }
+
+    def test_matching_outputs_are_compacted_after_validation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            records = [
+                self._record(root, "ooc", "systemds-ooc", 42.0),
+                self._record(root, "baseline", "numpy-lloyd", 42.00001),
+            ]
+
+            benchmark_plan.apply_output_retention(records, root)
+
+            self.assertFalse(any(records[0]["outputs"].iterdir()))
+            self.assertEqual([path.name for path in records[1]["outputs"].iterdir()],
+                             ["numpy-lloyd-r1.json"])
+            self.assertEqual(json.loads((records[0]["run_dir"] /
+                                         "output-retention.json").read_text())["retention"],
+                             "compact")
+
+    def test_divergent_outputs_are_preserved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            records = [
+                self._record(root, "ooc", "systemds-ooc", 42.0),
+                self._record(root, "baseline", "numpy-lloyd", 84.0),
+            ]
+
+            benchmark_plan.apply_output_retention(records, root)
+
+            self.assertTrue((records[0]["outputs"] / "systemds-ooc-artifact-r1").exists())
+            self.assertTrue((records[1]["outputs"] / "numpy-lloyd-artifact-r1").exists())
+            report = json.loads((records[0]["run_dir"] / "output-retention.json").read_text())
+            self.assertEqual(report["reason"], "numerical outputs diverged")
+
+
 class ScopeRunnerTest(unittest.TestCase):
     def test_payload_failure_is_recorded_by_accounting_wrapper(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -333,11 +405,15 @@ class ScopeRunnerTest(unittest.TestCase):
             benchmark_plan.write_scope_runner(runner)
 
             result = subprocess.run(
-                [runner, log, metrics, "10", "1", "echo payload-started; exit 23"])
+                [runner, log, metrics, directory / "telemetry.csv", "0.05", "10", "1",
+                 "echo payload-started; exit 23"])
 
             self.assertEqual(result.returncode, 23)
             self.assertIn("payload-started", log.read_text())
             self.assertIn("exit_status=23", metrics.read_text())
+            telemetry = (directory / "telemetry.csv").read_text().splitlines()
+            self.assertIn("cpu_usage_usec", telemetry[0])
+            self.assertGreaterEqual(len(telemetry), 2)
 
 
 if __name__ == "__main__":

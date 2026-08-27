@@ -12,6 +12,7 @@ import csv
 from datetime import datetime
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -36,11 +37,220 @@ _DEFAULT_TEMPORARY_PATHS = [
     "${run.results}/python-tmp",
 ]
 
+_RETENTION_METRICS = {
+    "multilogreg": ("coefficient_norm",),
+    "gnmf": ("w_checksum", "h_checksum"),
+    "kmeans": ("inertia",),
+    "pca": ("score_norm_sq",),
+    "lmcg": ("residual_norm",),
+    "l2svm": ("model_norm",),
+}
+
+
+def _validation_workload(base_id):
+    for prefix, metrics in _RETENTION_METRICS.items():
+        if base_id == prefix or base_id.startswith(prefix + "_"):
+            return prefix, metrics
+    return None, ()
+
+
+def _log_validation_values(log, metric_names):
+    aliases = {
+        "w_checksum": r"W checksum:\s*([^\s]+)",
+        "h_checksum": r"H checksum:\s*([^\s]+)",
+    }
+    text = log.read_text(encoding="utf-8", errors="replace")
+    values = {}
+    for name in metric_names:
+        pattern = aliases.get(name, rf"{re.escape(name)}=([^\s]+)")
+        matches = re.findall(pattern, text)
+        if matches:
+            try:
+                values[name] = float(matches[-1])
+            except ValueError:
+                pass
+    return values
+
+
+def _json_validation_values(outputs, impl_id, rep, metric_names):
+    candidates = sorted(outputs.glob(f"*-r{rep}.json"))
+    if "dask" in impl_id:
+        candidates = [path for path in candidates if path.name.startswith("dask-")]
+    else:
+        candidates = [path for path in candidates if not path.name.startswith("dask-")]
+    for path in candidates:
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if all(name in report for name in metric_names):
+            try:
+                return {name: float(report[name]) for name in metric_names}
+            except (TypeError, ValueError):
+                continue
+    return {}
+
+
+def _values_agree(summaries, relative_tolerance=1e-5, absolute_tolerance=1e-8):
+    reference = summaries[0]
+    return all(
+        math.isclose(summary[name], reference[name], rel_tol=relative_tolerance,
+                     abs_tol=absolute_tolerance)
+        for summary in summaries[1:] for name in reference
+    )
+
+
+def apply_output_retention(records, invocation_dir):
+    """Discard validated numeric artifacts while preserving anything diagnostically useful."""
+    groups = {}
+    for record in records:
+        key = (record["base_id"], record["dataset"], record.get("resource_profile"),
+               record.get("parameter_case"), record["rep"])
+        groups.setdefault(key, []).append(record)
+
+    invocation_report = []
+    for key, members in groups.items():
+        _, metric_names = _validation_workload(key[0])
+        summaries = []
+        reason = "validated"
+        if not metric_names:
+            reason = "no validation contract"
+        elif len(members) < 2:
+            reason = "fewer than two comparable executions"
+        elif any(member["status"] != "ok" for member in members):
+            reason = "one or more executions did not complete"
+        else:
+            for member in members:
+                if member["impl_id"].startswith("systemds-"):
+                    values = _log_validation_values(member["log"], metric_names)
+                else:
+                    values = _json_validation_values(
+                        member["outputs"], member["impl_id"], member["rep"], metric_names)
+                member["validation_values"] = values
+                if set(values) != set(metric_names) or not all(
+                        math.isfinite(value) for value in values.values()):
+                    reason = f"missing or non-finite validation evidence for {member['impl_id']}"
+                    break
+                summaries.append(values)
+            if reason == "validated" and not _values_agree(summaries):
+                reason = "numerical outputs diverged"
+
+        discard = reason == "validated"
+        run_reports = {}
+        for member in members:
+            removed_bytes = 0
+            if discard:
+                for artifact in list(member["outputs"].iterdir()):
+                    if artifact.suffix == ".json":
+                        continue
+                    if artifact.is_dir():
+                        removed_bytes += sum(path.stat().st_size for path in artifact.rglob("*")
+                                             if path.is_file())
+                        shutil.rmtree(artifact)
+                    else:
+                        removed_bytes += artifact.stat().st_size
+                        artifact.unlink()
+            report = run_reports.setdefault(member["run_dir"], {
+                "retention": "compact" if discard else "full", "reason": reason,
+                "removed_bytes": 0, "executions": [],
+            })
+            report["removed_bytes"] += removed_bytes
+            report["executions"].append({
+                "implementation": member["impl_id"],
+                "validation_values": member.get("validation_values", {}),
+            })
+        for run_dir, report in run_reports.items():
+            (run_dir / "output-retention.json").write_text(
+                json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        invocation_report.append({
+            "group": {"base_id": key[0], "dataset": key[1], "resource_profile": key[2],
+                      "parameter_case": key[3], "rep": key[4]},
+            "retention": "compact" if discard else "full",
+            "reason": reason,
+        })
+    (invocation_dir / "output-validation.json").write_text(
+        json.dumps(invocation_report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
 
 def execution_timestamp(moment=None):
     """Return a filesystem-safe, timezone-qualified benchmark invocation ID."""
     moment = moment or datetime.now().astimezone()
     return moment.strftime("%Y%m%dT%H%M%S.%f%z")
+
+
+def file_digest(path, chunk_size=1024 * 1024):
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_invocation_metadata(path, plan_dir, root, context):
+    """Record compact host/tool/source provenance once per benchmark invocation."""
+    source_files = {}
+    for source in sorted(plan_dir.rglob("*")):
+        if (not source.is_file() or source.is_symlink() or "__pycache__" in source.parts
+                or source.suffix in {".pyc", ".pyo"}):
+            continue
+        source_files[str(source.relative_to(plan_dir))] = {
+            "bytes": source.stat().st_size,
+            "sha256": file_digest(source),
+        }
+    tool_files = {}
+    for tool_id in ("systemds_jar",):
+        configured = context.get(f"tools.{tool_id}")
+        if not configured:
+            continue
+        candidate = Path(expand(configured, context)).resolve()
+        if candidate.is_file():
+            tool_files[tool_id] = {
+                "path": str(candidate), "bytes": candidate.stat().st_size,
+                "sha256": file_digest(candidate),
+            }
+    statvfs = os.statvfs(root)
+    uname = os.uname()
+    metadata = {
+        "recorded_at": datetime.now().astimezone().isoformat(),
+        "host": {
+            "hostname": uname.nodename,
+            "kernel": {"sysname": uname.sysname, "release": uname.release,
+                       "version": uname.version, "machine": uname.machine},
+            "logical_cpus": os.cpu_count(),
+            "runner_cpu_affinity": sorted(os.sched_getaffinity(0)),
+            "page_size_bytes": os.sysconf("SC_PAGE_SIZE"),
+            "load_average": os.getloadavg(),
+        },
+        "filesystem": {
+            "path": str(root),
+            "block_size_bytes": statvfs.f_frsize,
+            "total_bytes": statvfs.f_blocks * statvfs.f_frsize,
+            "available_bytes": statvfs.f_bavail * statvfs.f_frsize,
+        },
+        "runner": {"python": sys.executable, "version": sys.version},
+        "configured_tools": {key.removeprefix("tools."): value
+                             for key, value in context.items() if key.startswith("tools.")},
+        "tool_files": tool_files,
+        "suite_sources": source_files,
+    }
+    for proc_name in ("meminfo", "cpuinfo"):
+        proc_path = Path("/proc") / proc_name
+        try:
+            text = proc_path.read_text(errors="replace")
+        except OSError:
+            continue
+        if proc_name == "cpuinfo":
+            model = next((line.partition(":")[2].strip() for line in text.splitlines()
+                          if line.lower().startswith("model name")), None)
+            metadata["host"]["cpu_model"] = model
+        else:
+            wanted = {"MemTotal", "SwapTotal", "HugePages_Total", "Hugepagesize"}
+            metadata["host"]["memory"] = {
+                key.rstrip(":"): value.strip()
+                for line in text.splitlines() if (key := line.partition(":")[0]) in wanted
+                for value in [line.partition(":")[2]]
+            }
+    path.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def flatten(prefix, value, out):
@@ -570,33 +780,124 @@ def validate_blocksize(run_id, value):
 def write_scope_runner(path):
     path.write_text(r"""#!/usr/bin/env bash
 set +e
-log="$1"; metrics="$2"; run_timeout="$3"; grace="$4"; shift 4
+log="$1"; metrics="$2"; telemetry="$3"; telemetry_interval="$4"
+run_timeout="$5"; grace="$6"; shift 6
 time_bin="${TIME_BIN:-/usr/bin/time}"
 printf 'started_at=%s timeout_seconds=%s grace_seconds=%s\n' "$(date -Is)" "$run_timeout" "$grace" >"$log"
 printf 'exit_status=running\n' >"$metrics"
+cg=$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup)
+root="/sys/fs/cgroup${cg}"
+
+stat_value() {
+  awk -v key="$2" '$1 == key {print $2; found=1; exit} END {if (!found) print 0}' "$1" 2>/dev/null
+}
+
+io_totals() {
+  awk '{for (i=2; i<=NF; i++) {split($i, value, "="); totals[value[1]] += value[2]}} END {printf "%d,%d,%d,%d,%d,%d", totals["rbytes"], totals["wbytes"], totals["rios"], totals["wios"], totals["dbytes"], totals["dios"]}' "$1" 2>/dev/null
+}
+
+cgroup_values() {
+  local files=() candidate
+  for candidate in "$root/memory.stat" "$root/cpu.stat" "$root/io.stat" \
+      "$root/cpu.pressure" "$root/memory.pressure" "$root/io.pressure"; do
+    [[ -r "$candidate" ]] && files+=("$candidate")
+  done
+  awk -v pids="$1" '
+    FILENAME ~ /memory\.stat$/ {mem[$1]=$2; next}
+    FILENAME ~ /cpu\.stat$/ {cpu[$1]=$2; next}
+    FILENAME ~ /io\.stat$/ {
+      for (i=2; i<=NF; i++) {split($i, value, "="); io[value[1]] += value[2]}
+      next
+    }
+    FILENAME ~ /\.pressure$/ {
+      for (i=2; i<=NF; i++) if ($i ~ /^total=/) {
+        split($i, value, "=")
+        if (FILENAME ~ /cpu\.pressure$/) kind="cpu"
+        else if (FILENAME ~ /memory\.pressure$/) kind="memory"
+        else kind="io"
+        pressure[kind ":" $1]=value[2]
+      }
+    }
+    END {
+      printf "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d", mem["anon"], mem["file"],
+        mem["shmem"], mem["file_dirty"], mem["file_writeback"], mem["pgfault"],
+        mem["pgmajfault"], mem["workingset_refault_anon"],
+        mem["workingset_refault_file"], mem["workingset_activate_file"]
+      printf ",%d,%d,%d,%d,%d,%d", cpu["usage_usec"], cpu["user_usec"],
+        cpu["system_usec"], cpu["nr_periods"], cpu["nr_throttled"],
+        cpu["throttled_usec"]
+      printf ",%d,%d,%d,%d,%d,%d,%d", pids, io["rbytes"], io["wbytes"], io["rios"],
+        io["wios"], io["dbytes"], io["dios"]
+      printf ",%d,%d,%d,%d,%d,%d", pressure["cpu:some"], pressure["cpu:full"],
+        pressure["memory:some"], pressure["memory:full"], pressure["io:some"],
+        pressure["io:full"]
+    }
+  ' "${files[@]}" 2>/dev/null
+}
+
+sample_cgroup() {
+  local now_ns elapsed_ms memory_current memory_peak memory_swap pids values
+  now_ns=$(date +%s%N)
+  elapsed_ms=$(( (now_ns - telemetry_start_ns) / 1000000 ))
+  read -r memory_current <"$root/memory.current" 2>/dev/null || memory_current=0
+  read -r memory_peak <"$root/memory.peak" 2>/dev/null || memory_peak=0
+  read -r memory_swap <"$root/memory.swap.current" 2>/dev/null || memory_swap=0
+  read -r pids <"$root/pids.current" 2>/dev/null || pids=0
+  values=$(cgroup_values "$pids")
+  printf '%s,%s,%s,%s,%s\n' "$elapsed_ms" "$memory_current" "$memory_peak" \
+    "$memory_swap" "$values" >>"$telemetry"
+}
+
+monitor_cgroup() {
+  local monitored_pid="$1"
+  while kill -0 "$monitored_pid" 2>/dev/null; do
+    sample_cgroup
+    sleep "$telemetry_interval" || break
+  done
+}
+
+printf '%s\n' 'elapsed_ms,memory_current_bytes,memory_peak_bytes,memory_swap_current_bytes,anon_bytes,file_bytes,shmem_bytes,file_dirty_bytes,file_writeback_bytes,pgfault,pgmajfault,workingset_refault_anon,workingset_refault_file,workingset_activate_file,cpu_usage_usec,cpu_user_usec,cpu_system_usec,cpu_nr_periods,cpu_nr_throttled,cpu_throttled_usec,pids_current,io_read_bytes,io_write_bytes,io_read_ops,io_write_ops,io_discard_bytes,io_discard_ops,cpu_pressure_some_usec,cpu_pressure_full_usec,memory_pressure_some_usec,memory_pressure_full_usec,io_pressure_some_usec,io_pressure_full_usec' >"$telemetry"
+telemetry_start_ns=$(date +%s%N)
 # Give the benchmark payload a higher OOM score than this small accounting
 # wrapper. If MemoryMax is exhausted, the kernel can kill the payload while
 # timeout, GNU time, and this wrapper remain alive to record the failure.
 payload=(bash -c 'echo 500 > /proc/self/oom_score_adj 2>/dev/null || true; exec bash -lc "$1"' benchmark "$1")
 if [[ -x "$time_bin" ]]; then
   if [[ "$run_timeout" == 0 ]]; then
-    "$time_bin" -v -o "${metrics}.time" "${payload[@]}" >>"$log" 2>&1
+    "$time_bin" -v -o "${metrics}.time" "${payload[@]}" >>"$log" 2>&1 &
   else
-    "$time_bin" -v -o "${metrics}.time" timeout --kill-after="$grace" "$run_timeout" "${payload[@]}" >>"$log" 2>&1
+    "$time_bin" -v -o "${metrics}.time" timeout --kill-after="$grace" "$run_timeout" "${payload[@]}" >>"$log" 2>&1 &
   fi
 elif [[ "$run_timeout" == 0 ]]; then
-  "${payload[@]}" >>"$log" 2>&1
+  "${payload[@]}" >>"$log" 2>&1 &
 else
-  timeout --kill-after="$grace" "$run_timeout" "${payload[@]}" >>"$log" 2>&1
+  timeout --kill-after="$grace" "$run_timeout" "${payload[@]}" >>"$log" 2>&1 &
 fi
+timed_pid=$!
+monitor_cgroup "$timed_pid" &
+monitor_pid=$!
+wait "$timed_pid"
 rc=$?
-cg=$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup)
-root="/sys/fs/cgroup${cg}"
+kill "$monitor_pid" 2>/dev/null
+wait "$monitor_pid" 2>/dev/null
+sample_cgroup
+io=$(io_totals "$root/io.stat")
+IFS=, read -r io_read_bytes io_write_bytes io_read_ops io_write_ops io_discard_bytes io_discard_ops <<<"$io"
 {
   echo "exit_status=$rc"
   echo "memory_current_bytes=$(cat "$root/memory.current")"
   echo "memory_peak_bytes=$(cat "$root/memory.peak")"
+  echo "memory_swap_current_bytes=$(cat "$root/memory.swap.current" 2>/dev/null || echo 0)"
   echo "memory_events=$(tr '\n' ';' < "$root/memory.events")"
+  echo "cpu_usage_usec=$(stat_value "$root/cpu.stat" usage_usec)"
+  echo "cpu_user_usec=$(stat_value "$root/cpu.stat" user_usec)"
+  echo "cpu_system_usec=$(stat_value "$root/cpu.stat" system_usec)"
+  echo "cpu_nr_throttled=$(stat_value "$root/cpu.stat" nr_throttled)"
+  echo "cpu_throttled_usec=$(stat_value "$root/cpu.stat" throttled_usec)"
+  echo "io_read_bytes=$io_read_bytes"
+  echo "io_write_bytes=$io_write_bytes"
+  echo "io_read_ops=$io_read_ops"
+  echo "io_write_ops=$io_write_ops"
   [[ -r "$root/io.stat" ]] && echo "io_stat=$(tr '\n' ';' < "$root/io.stat")"
 } > "$metrics"
 exit "$rc"
@@ -863,9 +1164,12 @@ def execute_plan(plan_path, validate_only=False):
     invocation_dir = results_root / invocation_id
     invocation_dir.mkdir()
     shutil.copy2(plan_path, invocation_dir / "benchmark-plan.yaml")
+    write_invocation_metadata(
+        invocation_dir / "invocation-metadata.json", plan_dir, root, context)
     manifest = expanded_plan_manifest(plan, enabled_runs, invocation_id)
     (invocation_dir / "expanded-plan.yaml").write_text(
         yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8")
+    execution_records = []
 
     for run in enabled_runs:
         run_id = str(run["id"])
@@ -996,6 +1300,7 @@ def execute_plan(plan_path, validate_only=False):
                        if key.startswith("input.")},
             "cold_cache": [expand(str(path), run_context)
                            for path in run.get("cold_cache", ["${dataset.dir}"])],
+            "telemetry": {**plan.get("telemetry", {}), **run.get("telemetry", {})},
             "temporary_paths": [str(path) for path in temporary_paths],
             "setup": resolved_setup,
             "implementations": resolved_implementations,
@@ -1013,12 +1318,17 @@ def execute_plan(plan_path, validate_only=False):
         (run_dir / "resolved-context.json").write_text(json.dumps(run_context, indent=2, sort_keys=True))
         scope_runner = run_dir / ".scope-runner.sh"
         write_scope_runner(scope_runner)
+        io_stat_warning_printed = False
         csv_path = run_dir / "results.csv"
         with open(csv_path, "w", newline="", encoding="utf-8") as csv_file:
             writer = csv.writer(csv_file)
             writer.writerow(["run", "implementation", "comparable", "rep", "status", "wall_seconds",
                              "algorithm_seconds", "memory_peak_bytes", "major_faults",
-                             "file_system_inputs", "log", "metrics"])
+                             "file_system_inputs", "cpu_usage_usec", "cpu_user_usec",
+                             "cpu_system_usec", "cpu_nr_throttled", "cpu_throttled_usec",
+                             "io_read_bytes", "io_write_bytes", "io_read_ops", "io_write_ops",
+                             "memory_max_events", "oom_kill_events", "log", "metrics",
+                             "telemetry"])
             timeout_seconds = int(resources.get("timeout_seconds", 0))
             grace_seconds = int(resources.get("timeout_grace_seconds", 30))
             if timeout_seconds < 0 or grace_seconds < 0:
@@ -1026,6 +1336,11 @@ def execute_plan(plan_path, validate_only=False):
             timeout = str(timeout_seconds)
             memory = str(resources["memory_max"])
             swap = str(resources.get("swap_max", 0))
+            telemetry = dict(plan.get("telemetry", {}))
+            telemetry.update(run.get("telemetry", {}))
+            telemetry_interval = float(telemetry.get("interval_seconds", 1.0))
+            if telemetry_interval <= 0:
+                raise ValueError(f"Run {run_id} telemetry.interval_seconds must be positive")
             cache_paths = run.get("cold_cache", ["${dataset.dir}"])
             for configured_implementation in run.get("implementations", []):
                 implementation = resolve_implementation(configured_implementation, templates)
@@ -1040,6 +1355,7 @@ def execute_plan(plan_path, validate_only=False):
                     tag = f"{run_id}-{impl_id}-r{rep}"
                     log = logs / f"{tag}.log"
                     metrics = logs / f"{tag}.metrics"
+                    telemetry_path = logs / f"{tag}.telemetry.csv"
                     print(f"Starting {tag} (timeout={timeout_seconds}s, memory={memory}, "
                           f"results={run_dir})", flush=True)
                     _, reset_errors = cleanup_temporary_paths(temporary_paths)
@@ -1055,13 +1371,15 @@ def execute_plan(plan_path, validate_only=False):
                     env.update(expand_map(implementation.get("environment"), local_context))
                     unit = re.sub(r"[^A-Za-z0-9_.-]", "-", f"ooc-{tag}-{os.getpid()}")
                     scope = ["systemd-run", "--user", "--scope", "--collect", "--quiet", f"--unit={unit}",
-                             "-p", "MemoryAccounting=yes", "-p", f"MemoryMax={memory}",
+                             "-p", "MemoryAccounting=yes", "-p", "IOAccounting=yes",
+                             "-p", f"MemoryMax={memory}",
                              "-p", f"MemorySwapMax={swap}", "-p", "TasksMax=infinity",
                              "-p", "KillMode=control-group", "-p", "SendSIGKILL=yes",
                              "-p", f"TimeoutStopSec={grace_seconds}s"]
                     if timeout_seconds:
                         scope += ["-p", f"RuntimeMaxSec={timeout_seconds + grace_seconds + 15}s"]
-                    scope += [str(scope_runner), str(log), str(metrics), timeout, str(grace_seconds), command]
+                    scope += [str(scope_runner), str(log), str(metrics), str(telemetry_path),
+                              str(telemetry_interval), timeout, str(grace_seconds), command]
                     try:
                         with open(log, "a", encoding="utf-8") as scope_output:
                             rc = subprocess.run(scope, cwd=plan_dir, env=env,
@@ -1076,6 +1394,13 @@ def execute_plan(plan_path, validate_only=False):
                         if cleanup_errors:
                             print(f"WARNING: {tag} temporary cleanup was incomplete; see {log}",
                                   file=sys.stderr, flush=True)
+                    if (not io_stat_warning_printed and
+                            metric(metrics, r"^io_read_bytes=([0-9]+)$", "") == ""):
+                        print("WARNING: cgroup io.stat is unavailable in the benchmark scope; "
+                              "byte-accurate read/write I/O metrics will not be recorded. "
+                              "Ensure the cgroup-v2 io controller is delegated through the "
+                              "systemd user hierarchy.", file=sys.stderr, flush=True)
+                        io_stat_warning_printed = True
                     status = "ok" if rc == 0 else "timeout" if rc == 124 else "killed" if rc == 137 else "failed"
                     if metric(metrics, r"^exit_status=(.+)$") == "running":
                         status = "killed"
@@ -1090,10 +1415,36 @@ def execute_plan(plan_path, validate_only=False):
                     peak = metric(metrics, r"^memory_peak_bytes=([0-9]+)$")
                     faults = metric(time_path, r"Major \(requiring I/O\) page faults:\s*([0-9]+)")
                     inputs = metric(time_path, r"File system inputs:\s*([0-9]+)")
+                    cpu_usage = metric(metrics, r"^cpu_usage_usec=([0-9]+)$")
+                    cpu_user = metric(metrics, r"^cpu_user_usec=([0-9]+)$")
+                    cpu_system = metric(metrics, r"^cpu_system_usec=([0-9]+)$")
+                    cpu_nr_throttled = metric(metrics, r"^cpu_nr_throttled=([0-9]+)$")
+                    cpu_throttled = metric(metrics, r"^cpu_throttled_usec=([0-9]+)$")
+                    io_read_bytes = metric(metrics, r"^io_read_bytes=([0-9]+)$")
+                    io_write_bytes = metric(metrics, r"^io_write_bytes=([0-9]+)$")
+                    io_read_ops = metric(metrics, r"^io_read_ops=([0-9]+)$")
+                    io_write_ops = metric(metrics, r"^io_write_ops=([0-9]+)$")
+                    memory_max_events = metric(
+                        metrics, r"^memory_events=.*(?:^|;)max ([0-9]+)(?:;|$)")
+                    oom_kill_events = metric(
+                        metrics, r"^memory_events=.*(?:^|;)oom_kill ([0-9]+)(?:;|$)")
                     writer.writerow([run_id, impl_id, implementation.get("comparable", True), rep, status,
-                                     wall_seconds, algorithm_seconds, peak, faults, inputs, log, metrics])
+                                     wall_seconds, algorithm_seconds, peak, faults, inputs,
+                                     cpu_usage, cpu_user, cpu_system, cpu_nr_throttled,
+                                     cpu_throttled, io_read_bytes, io_write_bytes, io_read_ops,
+                                     io_write_ops, memory_max_events, oom_kill_events, log,
+                                     metrics, telemetry_path])
                     csv_file.flush()
+                    if implementation.get("comparable", True):
+                        execution_records.append({
+                            "base_id": run_context["run.base_id"], "dataset": dataset_id,
+                            "resource_profile": run.get("resource_profile"),
+                            "parameter_case": run.get("parameter_case"), "rep": rep,
+                            "impl_id": impl_id, "status": status, "log": log,
+                            "outputs": outputs, "run_dir": run_dir,
+                        })
                     print(f"{tag}: {status} (wall={wall_seconds}s, peak={peak})")
+    apply_output_retention(execution_records, invocation_dir)
     return 0
 
 

@@ -28,3 +28,4 @@ B = multilogreg_impl::m_multiLogReg(X=X, Y=Y, icpt=0, tol=$3, reg=$4,
   maxi=$5, maxii=$6, verbose=FALSE);
 
 write(B, $7, format="binary");
+print("coefficient_norm=" + sqrt(sum(B^2)));

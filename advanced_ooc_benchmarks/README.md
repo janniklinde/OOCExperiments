@@ -239,12 +239,11 @@ these selectors retain their previous names and behavior. Dataset groups, profil
 IDs, duplicates, and all referenced datasets are validated even when the corresponding run is
 disabled.
 
-The current plan enables MultiLogReg, KMeans, LMCG, and L2-SVM. With `dense_scaling` currently
-narrowed to `dense_d16`, three resource profiles and three backend case types expand these to 36
-run cases and 48 implementation executions per repetition. The other supported scaling workloads
-remain declared but disabled, and GNMF uses a separate size-matched nonnegative dataset group. For
-an initial host smoke test, disable the other workloads and retain one dataset and profile, for
-example:
+The current plan enables MultiLogReg, randomized SVD, GNMF, KMeans, PCA, LMCG, and L2-SVM. With
+`dense_scaling` and `gnmf_scaling` currently narrowed to their 16 GB members, three resource
+profiles and three backend case types expand these to 63 run cases and 81 implementation executions
+per repetition. GNMF uses its separate size-matched nonnegative dataset. For an initial host smoke
+test, disable the other workloads and retain one dataset and profile, for example:
 
 ```yaml
 - id: lmcg_scaling
@@ -312,7 +311,9 @@ are append-only and written under
 `${plan.root}/bench-results/<YYYYMMDDTHHMMSS.microseconds+timezone>/<run-case-id>/`. The
 timestamped invocation directory contains its benchmark-plan snapshot and `expanded-plan.yaml`,
 whose runs have no remaining group/profile/case selectors and whose implementations have their
-templates resolved. Each case directory contains its logs,
+templates resolved. Its compact `invocation-metadata.json` records the host CPU/kernel/memory and
+filesystem, runner and configured tool paths, the SystemDS JAR SHA-256, and SHA-256 provenance for
+every benchmark-suite source file. Each case directory contains its logs,
 outputs, `results.csv`, `resolved-context.json`, and `resolved-run.json`. The latter records concrete
 inputs, resource settings, setup commands, and per-repetition commands without copying the inherited
 host environment.
@@ -325,8 +326,31 @@ but the runner rejects the case directory itself and every path outside it.
 `results.csv` reports `wall_seconds` from GNU `time`, enclosing process startup, mapping, execution,
 and output. For Spark this includes `spark-submit`, JVM startup, and Spark-context initialization.
 This is the primary comparison metric. `algorithm_seconds` includes workload input
-setup, computation, checksums, and materialized numeric outputs, but remains a secondary metric
+setup, computation, validation invariants, and materialized numeric outputs, but remains a secondary metric
 because framework startup boundaries differ.
+
+Each execution also writes a compact `*.telemetry.csv` sampled from its cgroup every second. It
+records current and peak charged memory; anonymous, file-cache, shared, dirty, and writeback bytes;
+page faults and working-set refaults; CPU user/system time and throttling; process count; physical
+read/write bytes and operations; and CPU, memory, and I/O pressure-stall totals. The final counter
+values are copied into `results.csv` beside GNU time's faults and filesystem-I/O counters, while the
+raw cgroup `memory.events` and per-device `io.stat` remain in `*.metrics`. These measurements cover
+the complete process tree, including Spark threads and child processes. Generic Linux page-cache
+hits are inferred from physical I/O and refault counters; SystemDS's exact buffer-pool cache hits,
+evictions, spill volume, OOC heavy hitters, and timings remain in its `-oocStats` log.
+
+After every comparable backend for a workload/dataset/memory/repetition group has run, the runner
+compares compact numerical invariants. If all expected executions completed and agree within the
+declared tolerance, it deletes their materialized numeric artifacts outside the measured interval
+and retains JSON summaries plus `output-retention.json`. A failure, missing validation evidence, or
+numerical divergence preserves every artifact in that comparison group. Unsupported workloads are
+also preserved conservatively. The invocation-wide decisions are recorded in
+`output-validation.json`.
+
+At one sample per second a row is roughly a few hundred bytes: even 81 executions that each consume
+their full 3,600-second timeout remain well below 250 MiB of telemetry. This estimate excludes
+declared numeric model/output artifacts. In particular, PCA scores and GNMF factors are deliberately
+materialized for comparability and can themselves consume several GiB across the complete sweep.
 
 When Python or Dask templates are enabled, the runner checks their
 declared modules in `tools.python` and reports a single plan error for missing NumPy, SciPy,

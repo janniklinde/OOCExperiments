@@ -494,6 +494,15 @@ runs:
           --tolerance ${run.tolerance} --reg ${run.reg}
           --output "${run.outputs}/python-r${rep}.json"
 
+      - id: dask-tron
+        template: dask
+        command: >-
+          "${tools.python}" "${plan.dir}/multilogreg/dask_array.py" "${dataset.dir}"
+          --iterations ${run.iterations} --inner-iterations ${run.inner_iterations}
+          --tolerance ${run.tolerance} --reg ${run.reg} --threads ${resources.dask_threads}
+          --memory-limit ${resources.dask_memory_limit} --temporary-directory "${run.results}/dask-spill"
+          --output "${run.outputs}/dask-r${rep}.json"
+
   - id: randomized_svd_3g
     enabled: false
     dataset: dense_1m

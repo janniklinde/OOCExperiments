@@ -52,12 +52,12 @@ def main():
     # Do not materialize the tall score matrix in the Python heap.  Returning
     # the stored chunks lets Dask share their computation with the checksum.
     stored = da.store(score_array, scores, lock=False, compute=False, return_stored=True)
-    score_checksum = float(stored.sum().compute(**compute_options))
+    score_norm_sq = float((stored * stored).sum().compute(**compute_options))
     scores.flush()
     np.save(args.output.with_name(args.output.stem + "-components.npy"), components)
     np.save(args.output.with_name(args.output.stem + "-eigenvalues.npy"), eigenvalues.reshape(-1, 1))
     report = {"implementation": "dask-pca", "seconds": time.perf_counter() - start,
-              "components": args.components, "score_checksum": score_checksum,
+              "components": args.components, "score_norm_sq": score_norm_sq,
               "eigenvalues": eigenvalues.tolist()}
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report))

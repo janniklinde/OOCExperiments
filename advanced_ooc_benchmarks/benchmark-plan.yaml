@@ -30,6 +30,11 @@ defaults:
     timeout_seconds: 60
     timeout_grace_seconds: 30
 
+# A one-second cgroup-v2 sample is small enough for long sweeps while retaining
+# CPU, memory/page-cache, pressure-stall, and physical-I/O trajectories.
+telemetry:
+  interval_seconds: 3
+
 # Named profiles keep correlated cgroup and JVM settings together. A run may
 # select one or a list with `resource_profiles: [mem16, mem8, mem4]`.
 resource_profiles:
@@ -61,7 +66,7 @@ templates:
       ${run.systemds_args}
   systemds-spark:
     comparable: true
-    enabled: true
+    enabled: false
     blocksize_sweep: spark
     required_tools: [spark_submit]
     # In local[N] there is no executor JVM: Spark's unified pool and SystemDS's own
@@ -107,7 +112,7 @@ templates:
       ${run.systemds_args}
   python:
     comparable: true
-    enabled: true
+    enabled: false
     required_python_modules: [numpy]
     environment:
       OMP_NUM_THREADS: ${resources.threads}
@@ -116,7 +121,7 @@ templates:
       MALLOC_ARENA_MAX: 2
   dask:
     comparable: true
-    enabled: true
+    enabled: false
     required_python_modules: [numpy, dask.array, distributed]
     environment:
       OMP_NUM_THREADS: 1
@@ -191,7 +196,10 @@ datasets:
               <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>
             </root>
             EOF
-            SYSTEMDS_ROOT="$prep_root" JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=${plan.root}/tmp/java" "${tools.python}" "${plan.dir}/prepare_dense_systemds.py" "${dataset.dir}" --rows ${dataset.rows} --cols ${dataset.cols} --blocksize ${run.blocksize} --chunk-mib ${dataset.systemds_chunk_mib} --java "${tools.java}" --systemds-jar "${tools.systemds_jar}" --config "$prep_root/conf/SystemDS-config.xml" --java-heap 3g --java-tmp "${plan.root}/tmp/java" --replace-invalid --x-output "${dataset.dir}/systemds/X-bs${run.blocksize}" --binary-y-output "${dataset.dir}/systemds/binary_y-bs${run.blocksize}" --nn-y-output "${dataset.dir}/systemds/nn_y-bs${run.blocksize}"
+            # 8g, raised from 3g: the reblock is itself an OOC job, and at blocksize 1000 each
+            # block is 8MB against 2MB at 500. 3g survived the 16GB datasets and OOMed
+            # assembling X-bs1000 for the 32GB ones. Prepare runs outside the run cgroups.
+            SYSTEMDS_ROOT="$prep_root" JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=${plan.root}/tmp/java" "${tools.python}" "${plan.dir}/prepare_dense_systemds.py" "${dataset.dir}" --rows ${dataset.rows} --cols ${dataset.cols} --blocksize ${run.blocksize} --chunk-mib ${dataset.systemds_chunk_mib} --java "${tools.java}" --systemds-jar "${tools.systemds_jar}" --config "$prep_root/conf/SystemDS-config.xml" --java-heap 8g --java-tmp "${plan.root}/tmp/java" --replace-invalid --x-output "${dataset.dir}/systemds/X-bs${run.blocksize}" --binary-y-output "${dataset.dir}/systemds/binary_y-bs${run.blocksize}" --nn-y-output "${dataset.dir}/systemds/nn_y-bs${run.blocksize}"
 
   # This definition consumes no space until an enabled run references dense_2m.
   dense_2m:
@@ -228,6 +236,14 @@ datasets:
        distribution: normal, seed: 103, generator_chunk_mib: 256,
        accept_legacy: false, systemds_chunk_mib: 128}
 
+  dense_d32:
+    <<: *dense_dataset
+    directory: ${plan.root}/bench-data/dense-d32
+    parameters:
+      {rows: 4000000, cols: 1000, classes: 2, sparsity: 1.0,
+       distribution: normal, seed: 104, generator_chunk_mib: 256,
+       accept_legacy: false, systemds_chunk_mib: 128}
+
   gnmf_1m:
     <<: *dense_dataset
     directory: ${plan.root}/bench-data/gnmf
@@ -260,6 +276,14 @@ datasets:
     parameters:
       {rows: 2000000, cols: 1000, classes: 2, sparsity: 1.0,
        distribution: uniform_nonnegative, seed: 203, generator_chunk_mib: 256,
+       accept_legacy: false, systemds_chunk_mib: 128}
+
+  gnmf_d32:
+    <<: *dense_dataset
+    directory: ${plan.root}/bench-data/gnmf-d32
+    parameters:
+      {rows: 4000000, cols: 1000, classes: 2, sparsity: 1.0,
+       distribution: uniform_nonnegative, seed: 204, generator_chunk_mib: 256,
        accept_legacy: false, systemds_chunk_mib: 128}
 
   mlp_activation_64k:
@@ -439,8 +463,12 @@ datasets:
         ../experiments/real_world/prepare.sh twitter-2010 "${dataset.dir}"
 
 dataset_groups:
-  dense_scaling: [dense_d16] #[dense_d4, dense_d8, dense_d16]
-  gnmf_scaling: [gnmf_d16] #[gnmf_d4, gnmf_d8, gnmf_d16]
+  # 32 GB instances: at 16 GB the data barely exceeded the largest budget, and the
+  # per-JVM warmup (~15s, measured) was 65-78% of an OOC run. Doubling the data makes
+  # data:memory the real variable and shrinks the fixed cost to a proportionate term
+  # without warming any cache the measurement depends on.
+  dense_scaling: [dense_d32] #[dense_d4, dense_d8, dense_d16, dense_d32]
+  gnmf_scaling: [gnmf_d32] #[gnmf_d4, gnmf_d8, gnmf_d16, gnmf_d32]
   dense_legacy_scaling: [dense_2m] #[dense_1m, dense_2m]
 
 systemds_setup: &systemds_setup
@@ -462,6 +490,7 @@ runs:
   - id: pagerank_3g
     enabled: false
     dataset: twitter_400k
+    resource_profiles: [mem16, mem8, mem4]
     entrypoint: ${plan.dir}/pagerank/systemds.dml
     blocksize_sweeps: {ooc: [400000], spark: [400000]}
     parameters:
@@ -471,7 +500,7 @@ runs:
         -args "${input.G}" "${input.dangling}" ${run.alpha} ${run.iterations}
         "${run.outputs}/systemds-r${rep}"
     inputs: {G: {artifact: G}, dangling: {artifact: dangling}}
-    resources: {memory_max: 4G, java_heap: 3g, timeout_seconds: 3600, timeout_grace_seconds: 30}
+    resources: {timeout_seconds: 3600, timeout_grace_seconds: 30}
     setup: *systemds_setup
     cold_cache: ["${dataset.dir}"]
     implementations:
@@ -492,15 +521,19 @@ runs:
     entrypoint: ${plan.dir}/multilogreg/systemds.dml
     blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
-      iterations: 1
-      inner_iterations: 1
+      # Raised from 1/1: one outer and one inner step is a single gradient step, not
+      # multinomial logistic regression. TRON costs roughly outer*(2+2*inner) passes
+      # over X, so 1/1 was 4 passes and 5/10 would be 110 -- 3/5 gives 36, a real fit
+      # that keeps the case inside a sane timeout at 32 GB.
+      iterations: 3
+      inner_iterations: 5
       tolerance: 1e-8
       reg: 1.0
       systemds_args: >-
         -args "${input.X}" "${input.y}" ${run.tolerance} ${run.reg}
         ${run.iterations} ${run.inner_iterations} "${run.outputs}/systemds-r${rep}"
     inputs: {X: {artifact: X}, y: {artifact: binary_y}}
-    resources: {timeout_seconds: 300}
+    resources: {timeout_seconds: 1800}
     setup: *systemds_setup
     cold_cache: ["${dataset.dir}"]
     implementations:
@@ -513,6 +546,15 @@ runs:
           --iterations ${run.iterations} --inner-iterations ${run.inner_iterations}
           --tolerance ${run.tolerance} --reg ${run.reg}
           --output "${run.outputs}/python-r${rep}.json"
+
+      - id: dask-tron
+        template: dask
+        command: >-
+          "${tools.python}" "${plan.dir}/multilogreg/dask_array.py" "${dataset.dir}"
+          --iterations ${run.iterations} --inner-iterations ${run.inner_iterations}
+          --tolerance ${run.tolerance} --reg ${run.reg} --threads ${resources.dask_threads}
+          --memory-limit ${resources.dask_memory_limit} --temporary-directory "${run.results}/dask-spill"
+          --output "${run.outputs}/dask-r${rep}.json"
 
   - id: randomized_svd_scaling
     enabled: true
@@ -527,7 +569,7 @@ runs:
         -args "${input.X}" ${run.rank} ${run.seed}
         "${run.outputs}/systemds-S-r${rep}" "${run.outputs}/systemds-V-r${rep}"
     inputs: {X: {artifact: X}}
-    resources: {timeout_seconds: 300}
+    resources: {timeout_seconds: 900}
     setup: *systemds_setup
     cold_cache: ["${dataset.dir}"]
     implementations:
@@ -593,14 +635,15 @@ runs:
     blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
       rank: 16
-      iterations: 2
+      # raised from 2: multiplicative updates conventionally run 50-200; 20 is a floor.
+      iterations: 20
       epsilon: 1e-8
       seed: 23
       systemds_args: >-
         -args "${input.X}" ${run.rank} ${run.iterations} ${run.epsilon} ${run.seed}
         "${run.outputs}/systemds-W-r${rep}" "${run.outputs}/systemds-H-r${rep}"
     inputs: {X: {artifact: X}}
-    resources: {timeout_seconds: 600}
+    resources: {timeout_seconds: 1800}
     setup: *systemds_setup
     cold_cache: ["${dataset.dir}"]
     implementations:
@@ -663,13 +706,14 @@ runs:
     blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
       clusters: 16
-      iterations: 2
+      # raised from 2: Lloyd's algorithm runs to convergence; 2 steps is one refinement.
+      iterations: 10
       systemds_args: >-
         -args "${input.X}" ${run.clusters} ${run.iterations}
         "${run.outputs}/systemds-centers-r${rep}"
         "${run.outputs}/systemds-labels-r${rep}"
     inputs: {X: {artifact: X}}
-    resources: {timeout_seconds: 300}
+    resources: {timeout_seconds: 1200}
     setup: *systemds_setup
     cold_cache: ["${dataset.dir}"]
     implementations:
@@ -704,7 +748,7 @@ runs:
         "${run.outputs}/systemds-components-r${rep}"
         "${run.outputs}/systemds-eigenvalues-r${rep}"
     inputs: {X: {artifact: X}}
-    resources: {timeout_seconds: 600}
+    resources: {timeout_seconds: 900}
     setup: *systemds_setup
     cold_cache: ["${dataset.dir}"]
     implementations:
@@ -730,14 +774,15 @@ runs:
     entrypoint: ${plan.dir}/lmcg/systemds.dml
     blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
-      iterations: 2
+      # raised from 2: conjugate gradient needs ~10-100 steps to be CG at all.
+      iterations: 10
       reg: 1e-7
       tolerance: 0.0
       systemds_args: >-
         -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance}
         "${run.outputs}/systemds-beta-r${rep}"
     inputs: {X: {artifact: X}, y: {artifact: binary_y}}
-    resources: {timeout_seconds: 300}
+    resources: {timeout_seconds: 1200}
     setup: *systemds_setup
     cold_cache: ["${dataset.dir}"]
     implementations:
@@ -765,7 +810,9 @@ runs:
     entrypoint: ${plan.dir}/l2svm/systemds.dml
     blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
-      iterations: 3
+      # raised from 3: an SVM solved in 3 outer steps is not a converged fit, and at
+      # 3 the ~15s JVM warmup dominated the measurement rather than the OOC path.
+      iterations: 10
       inner_iterations: 20
       tolerance: 0.0
       reg: 1.0
@@ -774,7 +821,7 @@ runs:
         ${run.iterations} ${run.inner_iterations}
         "${run.outputs}/systemds-model-r${rep}"
     inputs: {X: {artifact: X}, y: {artifact: binary_y}}
-    resources: {timeout_seconds: 300}
+    resources: {timeout_seconds: 1800}
     setup: *systemds_setup
     cold_cache: ["${dataset.dir}"]
     implementations:
@@ -832,6 +879,7 @@ runs:
   - id: als_3g
     enabled: false
     dataset: als_1m
+    resource_profiles: [mem16, mem8, mem4]
     entrypoint: ${plan.dir}/als/systemds.dml
     blocksize_sweeps: {ooc: [8000], spark: [8000]}
     parameters:
@@ -843,7 +891,7 @@ runs:
         -args "${input.X}" ${run.rank} ${run.reg} ${run.iterations} ${run.seed}
         "${run.outputs}/systemds-U-r${rep}" "${run.outputs}/systemds-V-r${rep}"
     inputs: {X: {artifact: X}}
-    resources: {memory_max: 16G, java_heap: 14g, timeout_seconds: 300}
+    resources: {timeout_seconds: 300}
     setup: *systemds_setup
     cold_cache: ["${dataset.dir}"]
     implementations:

@@ -40,12 +40,12 @@ def main():
         score_path, mode="w+", dtype=np.float64, shape=(shape[0], args.components))
     np.matmul(matrix, components, out=scores)
     np.subtract(scores, center @ components, out=scores)
-    score_checksum = float(scores.sum())
+    score_norm_sq = float(np.einsum("ij,ij->", scores, scores, optimize=True))
     scores.flush()
     np.save(args.output.with_name(args.output.stem + "-components.npy"), components)
     np.save(args.output.with_name(args.output.stem + "-eigenvalues.npy"), eigenvalues.reshape(-1, 1))
     report = {"implementation": "numpy-pca", "seconds": time.perf_counter() - start,
-              "components": args.components, "score_checksum": score_checksum,
+              "components": args.components, "score_norm_sq": score_norm_sq,
               "eigenvalues": eigenvalues.tolist()}
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report))

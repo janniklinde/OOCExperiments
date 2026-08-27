@@ -12,6 +12,9 @@ from the raw memmaps without modifying the raw inputs.
 - `benchmark-plan2.yaml`: the previous single-configuration plan preserved unchanged.
 - `run_cgroup_baselines.sh`, `benchmark_plan.py`, `drop_caches.py`: all runner support required
   by the plan.
+- `docker/`: a systemd-based container that runs `run_cgroup_baselines.sh` with no host setup
+  beyond a mounted dataset root and a prebuilt `SystemDS.jar`. See `docker/README.md`;
+  `cd docker && cp .env.example .env && ./bench.sh build && ./bench.sh run`.
 - `prepare_numpy.py`: generates arbitrary-shape synthetic row-major FP64 matrices with bounded RAM
   and configurable Bernoulli sparsity.
 - `prepare_dense_dataset.py`: generates the complete benchmark bundle (`X.f64`, `binary_y.f64`,
@@ -295,6 +298,58 @@ systemd-run --user --scope -p MemoryMax=4G true
 
 Install the requirements with the same interpreter configured as `tools.python`; the command above
 is illustrative when that interpreter is the active `python3`.
+
+### Enable cgroup-v2 `io.stat` accounting
+
+The runner already creates every timed scope with `IOAccounting=yes`; no YAML setting is needed.
+For `io.stat` to exist inside a *user* scope, however, the host system manager must delegate the
+`io` controller through `user@<uid>.service`. On this host the vendor unit delegated only `cpu`,
+`memory`, and `pids`, so `IOAccounting=yes` alone could not create an `io.stat` file.
+
+As an administrator, create `/etc/systemd/system/user@.service.d/90-io-delegation.conf`:
+
+```ini
+[Service]
+Delegate=
+Delegate=cpu io memory pids
+```
+
+The empty `Delegate=` resets the vendor setting before the replacement list is applied. Reload the
+system manager and restart the user manager/session (a reboot is the simplest reliable choice when
+running a graphical login):
+
+```bash
+systemctl daemon-reload
+# reboot, or otherwise restart the affected user@<uid>.service and log in again
+```
+
+After re-login, verify that the effective delegation includes `io`:
+
+```bash
+systemctl show "user@$(id -u).service" --no-pager \
+  -p Delegate -p DelegateControllers
+# expected: DelegateControllers=cpu io memory pids
+```
+
+Finally, verify the exact kind of scope used by the runner rather than inspecting only the terminal
+scope. This command should print `io.stat available`; an empty `io.stat` is valid for a command
+that did no physical block I/O, while a missing file is not.
+
+```bash
+systemd-run --user --scope --expand-environment=no -p IOAccounting=yes \
+  bash -c '
+    cg=$(grep "^0::" /proc/self/cgroup | cut -d: -f3-)
+    root="/sys/fs/cgroup${cg}"
+    test -e "$root/io.stat" && echo "io.stat available" || exit 1
+    cat "$root/io.stat"
+  '
+```
+
+If this still fails, inspect the controller chain at
+`/sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service`: `io` must be available to the
+user manager. The benchmark emits a one-time warning when its actual timed scope lacks
+`io.stat`; in that state GNU `time` remains available, but `results.csv` cannot report
+byte-accurate cgroup read/write counters.
 
 `tools.systemds_jar` must point to an existing JAR. PageRank preparation delegates to
 `experiments/real_world/prepare.sh`, whose downloads are resumable and whose expensive CSR data is

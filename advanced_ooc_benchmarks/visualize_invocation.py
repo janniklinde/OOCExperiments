@@ -25,6 +25,17 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 
+# Keep every typographic element 1.5x larger than Matplotlib's standard style.
+plt.rcParams.update({
+    "font.size": 15,
+    "axes.labelsize": "medium",
+    "axes.titlesize": "large",
+    "xtick.labelsize": "medium",
+    "ytick.labelsize": "medium",
+    "legend.fontsize": "medium",
+    "figure.titlesize": "large",
+})
+
 
 _SYSTEM_STYLES = {
     "systemds-ooc": ("#202020", ""),
@@ -143,7 +154,7 @@ def grouped_bars(axis, rows, value_key, title, ylabel, log_scale=False, log_limi
     profiles = sorted({row["memory_profile"] for row in rows}, key=profile_key, reverse=True)
     implementations = sorted({row["implementation"] for row in rows}, key=implementation_key)
     lookup = {(row["memory_profile"], row["implementation"]): row for row in rows}
-    width = 0.78 / max(1, len(implementations))
+    width = 0.60 / max(1, len(implementations))
     centers = list(range(len(profiles)))
     for index, implementation in enumerate(implementations):
         offset = (index - (len(implementations) - 1) / 2) * width
@@ -158,7 +169,7 @@ def grouped_bars(axis, rows, value_key, title, ylabel, log_scale=False, log_limi
             elif row and row["failure_label"]:
                 axis.text(center + offset, 0.04, row["failure_label"],
                           transform=axis.get_xaxis_transform(), ha="center", va="bottom",
-                          fontsize=7, color="#b00020", fontweight="bold", rotation=90,
+                          fontsize=10.5, color="#b00020", fontweight="bold", rotation=90,
                           clip_on=True)
     labels = [f"{profile_key(profile):g}GB" if math.isfinite(profile_key(profile)) else profile
               for profile in profiles]
@@ -179,12 +190,12 @@ def grouped_bars(axis, rows, value_key, title, ylabel, log_scale=False, log_limi
     legend = [Patch(facecolor=implementation_style(name)[0], hatch=implementation_style(name)[1],
                     edgecolor="black", label=implementation_label(name))
               for name in implementations]
-    axis.legend(handles=legend, fontsize=8, ncol=min(4, len(legend)), loc="upper center",
-                bbox_to_anchor=(0.5, 1.02), frameon=False)
+    axis.legend(handles=legend, fontsize=15, ncol=1, loc="upper right",
+                bbox_to_anchor=(0.98, 0.98), frameon=False)
 
 
 def save_runtime(target, base_id, rows):
-    figure, axis = plt.subplots(figsize=(8.0, 4.5), constrained_layout=True)
+    figure, axis = plt.subplots(figsize=(7.5, 6.5), constrained_layout=True)
     grouped_bars(axis, rows, "wall", "",
                  "Elapsed Time [s]", log_scale=True, log_limits=(1, 10_000))
     figure.savefig(target / "runtime.png", dpi=180)
@@ -193,7 +204,7 @@ def save_runtime(target, base_id, rows):
 
 
 def save_cpu(target, base_id, rows):
-    figure, axis = plt.subplots(figsize=(8.0, 4.5), constrained_layout=True)
+    figure, axis = plt.subplots(figsize=(7.5, 6.5), constrained_layout=True)
     grouped_bars(axis, rows, "cpu", "CPU Consumption",
                  "CPU Time [s]", log_scale=True)
     figure.savefig(target / "cpu.png", dpi=180)
@@ -206,11 +217,7 @@ def save_io(target, base_id, rows):
     writes = [dict(row, io_gib=number(row["write_bytes"]) / 2**30) for row in rows]
     spills = [dict(row, io_gib=number(row["spill_bytes"]) / 2**30) for row in rows]
 
-    read_figure, read_axis = plt.subplots(figsize=(8.0, 4.5), constrained_layout=True)
-    grouped_bars(read_axis, reads, "io_gib", "", "Data Read [GiB]")
-    read_figure.savefig(target / "read.png", dpi=180)
-    read_figure.savefig(target / "read.pdf")
-    plt.close(read_figure)
+    save_read(target, rows)
 
     figure, axes = plt.subplots(3, 1, figsize=(8.0, 10.0), sharex=True, constrained_layout=True)
     grouped_bars(axes[0], reads, "io_gib", "Read Volume",
@@ -220,9 +227,19 @@ def save_io(target, base_id, rows):
     sources = "; ".join(sorted({row["io_source"] for row in rows}))
     figure.text(0.5, 0.005,
                 f"I/O source: {sources}. Exact OOC spill is available only after a completed -oocStats run.",
-                ha="center", fontsize=8)
+                ha="center", fontsize=12)
     figure.savefig(target / "io.png", dpi=180)
     figure.savefig(target / "io.pdf")
+    plt.close(figure)
+
+
+def save_read(target, rows):
+    """Write the standalone input-read-volume figure."""
+    reads = [dict(row, io_gib=number(row["read_bytes"]) / 2**30) for row in rows]
+    figure, axis = plt.subplots(figsize=(7.5, 6.5), constrained_layout=True)
+    grouped_bars(axis, reads, "io_gib", "", "Data Read [GiB]")
+    figure.savefig(target / "read.png", dpi=180)
+    figure.savefig(target / "read.pdf")
     plt.close(figure)
 
 
@@ -237,22 +254,62 @@ def invocation_path(path):
     return candidates[0]
 
 
+def replacement_ooc_rows(invocation):
+    """Load an OOC-only invocation and reject accidental mixed-run replacement."""
+    grouped = defaultdict(list)
+    for case in sorted(path for path in invocation.iterdir() if (path / "results.csv").is_file()):
+        for row in load_case(case):
+            if implementation_label(row["implementation"]) != "systemds-ooc":
+                raise ValueError(
+                    f"OOC replacement invocation contains non-OOC row: {case.name} "
+                    f"({row['implementation']})")
+            grouped[row["base_id"]].append(row)
+    if not grouped:
+        raise ValueError(f"No OOC result rows under {invocation}")
+    return grouped
+
+
+def replace_ooc_rows(rows, replacements, base_id):
+    """Keep every original series except SystemDS OOC, then substitute refreshed rows."""
+    if base_id not in replacements:
+        return rows
+    replacement_rows = replacements[base_id]
+    original_profiles = {row["memory_profile"] for row in rows
+                         if implementation_label(row["implementation"]) == "systemds-ooc"}
+    replacement_profiles = {row["memory_profile"] for row in replacement_rows}
+    if original_profiles != replacement_profiles:
+        raise ValueError(
+            f"OOC replacement profiles for {base_id} differ: "
+            f"original={sorted(original_profiles)}, replacement={sorted(replacement_profiles)}")
+    return [row for row in rows if implementation_label(row["implementation"]) != "systemds-ooc"] + replacement_rows
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("path", type=Path, nargs="?", default=Path("/media/jannik/data/OOCExperiments/bench-results"),
                         help="invocation directory, or its bench-results parent (default: latest invocation)")
+    parser.add_argument("--replace-ooc-from", type=Path, metavar="INVOCATION",
+                        help="replace SystemDS-OOC rows with those from this OOC-only invocation")
+    parser.add_argument("--figures", choices=("all", "runtime-read"), default="all",
+                        help="figure set to render (default: all)")
     args = parser.parse_args()
     invocation = invocation_path(args.path.resolve())
+    replacements = (replacement_ooc_rows(invocation_path(args.replace_ooc_from.resolve()))
+                    if args.replace_ooc_from else {})
     grouped = defaultdict(list)
     for case in sorted(path for path in invocation.iterdir() if (path / "results.csv").is_file()):
         for row in load_case(case):
             grouped[row["base_id"]].append(row)
     suite_root = Path(__file__).resolve().parent
     for base_id, rows in grouped.items():
+        rows = replace_ooc_rows(rows, replacements, base_id)
         target = workload_dir(suite_root, base_id, invocation)
         save_runtime(target, base_id, rows)
-        save_cpu(target, base_id, rows)
-        save_io(target, base_id, rows)
+        if args.figures == "runtime-read":
+            save_read(target, rows)
+        else:
+            save_cpu(target, base_id, rows)
+            save_io(target, base_id, rows)
     print(f"Generated grouped figures for {len(grouped)} workloads under {invocation}")
 
 

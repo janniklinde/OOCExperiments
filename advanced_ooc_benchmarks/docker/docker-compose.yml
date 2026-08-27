@@ -1,0 +1,36 @@
+name: advanced-ooc-benchmarks
+
+services:
+  bench:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        BENCH_UID: ${BENCH_UID:-1000}
+        BENCH_GID: ${BENCH_GID:-1000}
+        JAVA_VERSION: ${JAVA_VERSION:-21}
+        INSTALL_SPARK: ${INSTALL_SPARK:-false}
+        PYSPARK_VERSION: ${PYSPARK_VERSION:-3.5.3}
+    image: advanced-ooc-benchmarks:latest
+    container_name: advanced-ooc-benchmarks
+    hostname: ooc-bench
+    # systemd is PID 1 and the runner creates cgroup-v2 scopes with
+    # `systemd-run --user --scope`; that needs a writable cgroup hierarchy.
+    # Privileged also makes /proc/sys/vm/drop_caches writable, which is what
+    # gives the suite a genuinely cold page cache between runs.
+    privileged: true
+    stop_signal: SIGRTMIN+3
+    stop_grace_period: 30s
+    tmpfs:
+      - /run:exec,mode=755
+      - /run/lock
+    volumes:
+      # The OOCExperiments repository; the plan directory is /workspace/advanced_ooc_benchmarks.
+      - ${REPO_DIR:-../..}:/workspace:rw
+      # Datasets, prepared SystemDS representations, and results (plan.root).
+      - ${BENCH_DATA_DIR:-./data}:/bench/data:rw
+      # A prebuilt SystemDS.jar; the image deliberately does not build SystemDS.
+      - ${SYSTEMDS_JAR:-../../../systemds/target/SystemDS.jar}:/opt/systemds/SystemDS.jar:ro
+    shm_size: ${SHM_SIZE:-2gb}
+    # Do not set mem_limit: the profiles in the plan cap each run at 4/8/16 GB
+    # inside their own scope, and an outer container limit would distort them.

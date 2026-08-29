@@ -44,6 +44,8 @@ _RETENTION_METRICS = {
     "pca": ("score_norm_sq",),
     "lmcg": ("residual_norm",),
     "l2svm": ("model_norm",),
+    "random_features": ("model_norm", "residual_norm"),
+    "knn": ("accuracy", "vote_sum"),
 }
 
 
@@ -1190,14 +1192,18 @@ def execute_plan(plan_path, validate_only=False):
             if field in run:
                 run_context[f"run.{field}"] = str(run[field])
         flatten("run", run.get("parameters", {}), run_context)
-        if not run.get("_baseline_case"):
-            for variant_id, variant in datasets[dataset_id].get("variants", {}).items():
-                context_key = f"run.{variant_id}"
-                if context_key not in run_context:
-                    raise ValueError(f"Run {run_id} must define parameters.{variant_id} for dataset "
-                                     f"variant {dataset_id}.{variant_id}")
-                prepare_dataset_variant(dataset_id, variant_id, variant, prepared[dataset_id][0],
-                                        run_context, plan_dir, global_env)
+        for variant_id, variant in datasets[dataset_id].get("variants", {}).items():
+            # A blocksize variant belongs to the SystemDS cases; a Dask chunk variant
+            # belongs to the single -baseline case that holds the unblocked arms. Each
+            # is prepared only for the case type that reads it.
+            if bool(variant.get("baseline_only")) != bool(run.get("_baseline_case")):
+                continue
+            context_key = f"run.{variant_id}"
+            if context_key not in run_context:
+                raise ValueError(f"Run {run_id} must define parameters.{variant_id} for dataset "
+                                 f"variant {dataset_id}.{variant_id}")
+            prepare_dataset_variant(dataset_id, variant_id, variant, prepared[dataset_id][0],
+                                    run_context, plan_dir, global_env)
         resources = dict(plan.get("defaults", {}).get("resources", {}))
         resources.update(run.get("resources", {}))
         threads = resources.get("threads", "auto")

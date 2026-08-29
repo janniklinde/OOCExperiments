@@ -1,5 +1,9 @@
 dask[array,distributed]
 joblib
+matplotlib
 numpy
+pyyaml
 scikit-learn
 scipy
+sparse
+zarr

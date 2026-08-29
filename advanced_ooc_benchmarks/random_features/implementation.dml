@@ -1,0 +1,58 @@
+#-------------------------------------------------------------
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0.
+#-------------------------------------------------------------
+
+# Random Fourier feature ridge regression (Rahimi & Recht, NIPS 2007).
+#
+# The point of this workload is the shape of its intermediate rather than its
+# input. X is d columns wide and fits in memory at every profile; the feature
+# map Z = sqrt(2/D) * cos(X %*% Wp + b) is D columns wide with D >> d, so Z is
+# larger than X by D/d and larger than any memory budget here. Nothing in the
+# closed-form solution needs Z as a whole: both t(Z) %*% Z and t(Z) %*% y are
+# row-separable accumulations, so an engine that streams Z never has to hold
+# more than one block of it. An engine that materializes it must find 4 to 32 GB.
+#
+# Arithmetic intensity is the other half of the contrast. Forming the Gram costs
+# 2*n*D^2 flops against 8*n*D bytes of Z, i.e. D/4 flops per byte -- 128 at
+# D = 512 and 1024 at D = 4096. This is a compute-dense out-of-core workload, so
+# a streaming engine has room to hide its I/O completely, unlike knn/ which is
+# traffic-dominated over an intermediate of the same size.
+
+# The map is the paired [cos, sin] Fourier feature, so a projection of D/2
+# columns yields D output columns.
+#
+# This is the pairing rather than the single `cos(Xw + b)` with a uniform phase.
+# Both appear in Rahimi & Recht and both are unbiased, but the pairing has the
+# lower variance (Sutherland & Schneider, UAI 2015) and, relevant here, it needs
+# no phase vector at all -- and a 1-by-D phase is exactly the shape this backend
+# handles worst, since building one costs either a degenerate 1x1 outer product
+# or a row slice of a multi-block matrix, and OOC rejects the first and
+# miscounts the blocks of the second.
+m_random_fourier_ridge = function(Matrix[Double] X, Matrix[Double] y, Matrix[Double] W,
+                                  Double reg)
+  return (Matrix[Double] beta, Double model_norm, Double residual_norm)
+{
+  half = ncol(W);
+  if (nrow(W) != ncol(X)) {
+    stop("the projection must have one row per column of X");
+  }
+
+  # One projection feeds both halves, so the expensive product happens once and
+  # the two transcendentals are elementwise over its blocks.
+  P = X %*% W;
+  Z = cbind(cos(P), sin(P)) * sqrt(1.0 / half);
+
+  gram = t(Z) %*% Z;
+  rhs = t(Z) %*% y;
+  beta = solve(gram + diag(matrix(reg, rows=2 * half, cols=1)), rhs);
+
+  # ||Z beta - y||^2 from the Gram, so reporting the fit costs no further pass
+  # over Z. Guard the square root: cancellation can drive the identity slightly
+  # below zero once the residual is small relative to ||y||.
+  squared = as.scalar(t(beta) %*% gram %*% beta - 2 * t(beta) %*% rhs) + sum(y ^ 2);
+  residual_norm = sqrt(max(squared, 0));
+  model_norm = sqrt(sum(beta ^ 2));
+}

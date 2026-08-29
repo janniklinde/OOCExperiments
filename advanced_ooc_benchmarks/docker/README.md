@@ -47,7 +47,7 @@ are read straight out of that scope's `memory.*`, `cpu.stat`, `io.stat`, and
 | `SYSTEMDS_JAR` | `/opt/systemds/SystemDS.jar` | the SystemDS build under test |
 
 The image installs a JDK and the baseline Python stack
-(`requirements-baselines.txt` plus PyYAML in `/opt/bench-venv`) but deliberately
+(`requirements-baselines.txt` in `/opt/bench-venv`) but deliberately
 **does not build SystemDS**: the jar is the thing being measured and usually
 comes from a working checkout, so it is mounted read-only. Build it on the host
 with `mvn -q -DskipTests package` and point `SYSTEMDS_JAR` at

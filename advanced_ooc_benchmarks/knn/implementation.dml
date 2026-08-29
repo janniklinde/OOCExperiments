@@ -1,0 +1,51 @@
+#-------------------------------------------------------------
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0.
+#-------------------------------------------------------------
+
+# Brute-force k-nearest-neighbour classification.
+#
+# The companion to random_features/: both build an intermediate far larger than
+# their input, but this one is traffic-dominated rather than compute-dominated.
+# The query-by-reference distance matrix costs 2*nq*np*d flops to build and
+# 8*nq*np bytes to hold -- d/4 flops per byte, 128 at d = 512 -- and is then
+# swept k more times by the selection loop. Growing the reference set grows the
+# intermediate linearly while the inputs stay in the hundreds of megabytes,
+# which is the scaling wall that makes practitioners subsample instead.
+#
+# Two deliberate choices keep the loop from adding a second matrix of the same
+# size. `rowIndexMin` and `table` give a selection matrix with exactly one
+# nonzero per query, which SystemDS keeps sparse, so gathering the neighbour
+# labels and masking the chosen cell are both a single pass over `distances`
+# with no dense companion. And the query norms are omitted from the distance:
+# they are constant along a row, so they shift every candidate for a query
+# equally and cannot change which reference is nearest. The result is therefore
+# ordered like the true distance without being it, which is all selection needs.
+m_knn_classify = function(Matrix[Double] reference, Matrix[Double] labels,
+                          Matrix[Double] queries, Integer k)
+  return (Matrix[Double] predictions, Matrix[Double] votes)
+{
+  nq = nrow(queries);
+  np = nrow(reference);
+  if (k > np) {
+    stop("k cannot exceed the number of reference rows");
+  }
+
+  distances = -2 * (queries %*% t(reference)) + t(rowSums(reference ^ 2));
+  votes = matrix(0, rows=nq, cols=1);
+
+  # Large enough to push a chosen cell past every real candidate, small enough
+  # that k accumulations stay far from overflow.
+  masked = 1e300;
+
+  for (j in 1:k) {
+    nearest = rowIndexMin(distances);
+    hit = table(seq(1, nq), nearest, nq, np);
+    votes = votes + hit %*% labels;
+    distances = distances + hit * masked;
+  }
+
+  predictions = (votes * 2 >= k);
+}

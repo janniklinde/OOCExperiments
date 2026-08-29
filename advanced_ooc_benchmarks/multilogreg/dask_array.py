@@ -16,12 +16,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import dask
 import dask.array as da
 import numpy as np
-from dask_support import create_client, default_row_chunk, load_matrix
+from dask_support import create_client, load_zarr, resolve_zarr, read_vector
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("data", type=Path)
+    parser.add_argument("--zarr", type=Path,
+                        help="override the prepared Zarr store for X "
+                             "(default: <data>/zarr/X.zarr)")
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--inner-iterations", type=int, default=1)
     parser.add_argument("--tolerance", type=float, default=1e-8)
@@ -42,16 +45,20 @@ def main():
         metadata = json.loads((args.data / "metadata.json").read_text())
         n, d, classes = metadata["rows"], metadata["cols"], metadata["classes"]
         k = classes - 1
-        row_chunk = default_row_chunk(d)
-        matrix = load_matrix(args.data / "X.f64", (n, d), row_chunk=row_chunk)
+        matrix = load_zarr(resolve_zarr(args.data, args.zarr))
+        row_chunk = matrix.chunks[0][0]
         # nn_y holds {0,1}; the vendored SystemDS implementation turns the same file into a
         # {1,2} label column and then an indicator matrix whose first K columns are the
         # non-baseline categories. Class index 0 is therefore the positive label.
-        raw_labels = load_matrix(args.data / "nn_y.f64", (n, 1), row_chunk=row_chunk)
-        label_index = da.where(raw_labels > 0, 0.0, 1.0)
-        indicators = da.concatenate(
-            [(label_index == c).astype(np.float64) for c in range(classes)], axis=1)
-        indicators = indicators.persist()
+        raw_labels = read_vector(args.data / "nn_y.f64", n)
+        label_index = np.where(raw_labels > 0, 0.0, 1.0)
+        # Build the indicators in NumPy (n-by-classes is 64 MB at four million rows), then
+        # hand them back to Dask on X's exact row chunking. A bare NumPy operand would be
+        # captured whole by every task that touches it rather than sliced per block.
+        indicators = da.from_array(
+            np.concatenate([(label_index == c).astype(np.float64) for c in range(classes)],
+                           axis=1),
+            chunks=(matrix.chunks[0], classes))
 
         # The vendored SystemDS implementation performs this full-input robustness scan
         # before training. The benchmark dataset contract excludes missing values, but

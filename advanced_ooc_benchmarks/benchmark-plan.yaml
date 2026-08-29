@@ -46,6 +46,26 @@ resource_profiles:
 # unrestricted Cartesian product. These activation sizes are exact GiB for
 # 65,536 FP64 rows.
 parameter_cases:
+  # Output width of the random Fourier map. The map is n-by-D, so at a million
+  # rows these are 4.1 / 8.2 / 16.4 / 32.8 GB. Forming the Gram costs 2*n*D^2, so
+  # the widest case is roughly 33 TFLOP against 5 TFLOP for rf16 -- quadratic in
+  # the very parameter that makes the intermediate grow, which is why it is listed
+  # but left out of the default sweep.
+  rf_width:
+    - {id: rf4, features: 512}
+    - {id: rf8, features: 1024}
+    - {id: rf16, features: 2048}
+    # - {id: rf32, features: 4096}
+
+  # Reference rows for kNN, against a fixed 25,000-row query block: the distance
+  # matrix is 4.0 / 8.0 / 16.0 / 32.0 GB. Unlike the map above, the cost here grows
+  # linearly with the intermediate, so the largest case stays affordable.
+  knn_reference:
+    - {id: knn4, reference_rows: 20000}
+    - {id: knn8, reference_rows: 40000}
+    - {id: knn16, reference_rows: 80000}
+    - {id: knn32, reference_rows: 160000}
+
   mlp_activation:
     - {id: act4, hidden_size: 8192}
     - {id: act8, hidden_size: 16384}
@@ -66,7 +86,7 @@ templates:
       ${run.systemds_args}
   systemds-spark:
     comparable: true
-    enabled: false
+    enabled: true
     blocksize_sweep: spark
     required_tools: [spark_submit]
     # In local[N] there is no executor JVM: Spark's unified pool and SystemDS's own
@@ -112,7 +132,7 @@ templates:
       ${run.systemds_args}
   python:
     comparable: true
-    enabled: false
+    enabled: true
     required_python_modules: [numpy]
     environment:
       OMP_NUM_THREADS: ${resources.threads}
@@ -121,8 +141,8 @@ templates:
       MALLOC_ARENA_MAX: 2
   dask:
     comparable: true
-    enabled: false
-    required_python_modules: [numpy, dask.array, distributed]
+    enabled: true
+    required_python_modules: [numpy, dask.array, distributed, zarr]
     environment:
       OMP_NUM_THREADS: 1
       OPENBLAS_NUM_THREADS: 1
@@ -200,6 +220,28 @@ datasets:
             # block is 8MB against 2MB at 500. 3g survived the 16GB datasets and OOMed
             # assembling X-bs1000 for the 32GB ones. Prepare runs outside the run cgroups.
             SYSTEMDS_ROOT="$prep_root" JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=${plan.root}/tmp/java" "${tools.python}" "${plan.dir}/prepare_dense_systemds.py" "${dataset.dir}" --rows ${dataset.rows} --cols ${dataset.cols} --blocksize ${run.blocksize} --chunk-mib ${dataset.systemds_chunk_mib} --java "${tools.java}" --systemds-jar "${tools.systemds_jar}" --config "$prep_root/conf/SystemDS-config.xml" --java-heap 8g --java-tmp "${plan.root}/tmp/java" --replace-invalid --x-output "${dataset.dir}/systemds/X-bs${run.blocksize}" --binary-y-output "${dataset.dir}/systemds/binary_y-bs${run.blocksize}" --nn-y-output "${dataset.dir}/systemds/nn_y-bs${run.blocksize}"
+      # The Dask arm's counterpart to the native SystemDS blocksize: an uncompressed
+      # Zarr store of X, prepared outside the timed scope exactly like X-bs<blocksize>.
+      # It is baseline_only because Dask and NumPy run in the single -baseline case that
+      # carries no SystemDS blocksize. Only X is converted: the response vectors are one
+      # column wide and are read eagerly as NumPy, so chunking them would add thousands
+      # of kilobyte-sized tasks to every graph for a 32 MB operand.
+      dask_chunk:
+        baseline_only: true
+        artifacts:
+          X_zarr:
+            path: zarr/X.zarr
+            metadata:
+              path: zarr/X.zarr.json
+              expect:
+                {rows: "${dataset.rows}", cols: "${dataset.cols}",
+                 row_chunk: "${run.dask_chunk}", col_chunk: "${dataset.cols}",
+                 dtype: float64, compressor: none,
+                 generator: prepare_zarr.py, generator_version: 1}
+        prepare:
+          policy: auto
+          command: |
+            "${tools.python}" "${plan.dir}/prepare_zarr.py" "${dataset.dir}/X.f64" "${dataset.dir}/zarr/X.zarr" --rows ${dataset.rows} --cols ${dataset.cols} --row-chunk ${run.dask_chunk} --chunk-mib ${dataset.systemds_chunk_mib} --replace-invalid
 
   # This definition consumes no space until an enabled run references dense_2m.
   dense_2m:
@@ -462,6 +504,137 @@ datasets:
       command: >-
         ../experiments/real_world/prepare.sh twitter-2010 "${dataset.dir}"
 
+  # Intermediate-bound pair. Both datasets are small enough to sit in memory at
+  # every profile; what does not fit is what the algorithm builds from them, so
+  # these two say something the input-bound sweeps above cannot. They are also
+  # nearly free on disk -- together under 2 GB of raw plus their prepared copies,
+  # against 96 GB for one dense instance -- because the large object of each run
+  # is never stored at all.
+
+  # Random Fourier features: 1.02 GB of input, a feature map of 4.1 / 8.2 / 16.4 /
+  # 32.8 GB at the four widths in `rf_width`. 128 columns keeps the projection
+  # itself trivial while leaving the map's width free to scale.
+  rf_1m:
+    <<: *dense_dataset
+    directory: ${plan.root}/bench-data/rf-1m
+    parameters:
+      {rows: 1000000, cols: 128, classes: 2, sparsity: 1.0,
+       distribution: normal, seed: 41, generator_chunk_mib: 256,
+       accept_legacy: false, systemds_chunk_mib: 128}
+
+  # Brute-force kNN: 819 MB of input, a query-by-reference distance matrix of
+  # 4.0 / 8.0 / 16.0 / 32.0 GB at the four reference sizes in `knn_reference`.
+  # 200,000 rows leaves the 25,000-row query block clear of the largest reference
+  # block, and every boundary the run slices at -- 20,000 / 40,000 / 80,000 /
+  # 160,000 and the query start at 175,000 -- is a multiple of the 5,000-row Dask
+  # chunk, so no arm reads a partial chunk.
+  knn_200k:
+    <<: *dense_dataset
+    directory: ${plan.root}/bench-data/knn-200k
+    parameters:
+      {rows: 200000, cols: 512, classes: 2, sparsity: 1.0,
+       distribution: normal, seed: 43, generator_chunk_mib: 256,
+       accept_legacy: false, systemds_chunk_mib: 128}
+
+  # Sparse symmetric graph for connected components, stored as CSR over raw files exactly
+  # like `pagerank/`. Twelve bytes per stored edge -- a 4-byte column index and an 8-byte
+  # value -- which is also what a SystemDS SparseBlockCSR costs, so the arms read comparable
+  # volume instead of being separated by their representations. The all-ones value array
+  # carries no information but is written and read anyway: SystemDS has no unweighted matrix
+  # type and must read it, and dropping it would cut the Dask arm's input by two thirds.
+  #
+  # `band` sets degree, and so dataset size at a fixed vertex count; the power-of-two offset
+  # ladder above it sets diameter, and so the propagation-pass count. Unlike a dense
+  # adjacency the two are independent here, which is the main reason this workload is sparse.
+  #
+  # Density is 1.47%, which is set by the blocksize rather than chosen freely. SystemDS's OOC
+  # engine budgets every tile with `estimateSizeDenseInMemory(blen, blen)` -- dense, whatever
+  # the data's actual sparsity -- against a limit of min(heap/9, 1 GiB). That caps the
+  # blocksize at 5,181 outright and at 2,991 for the mem4 profile's 3g heap. A block therefore
+  # holds at most ~2,991^2 cells, and for it to carry a megabyte of stored edges the graph
+  # cannot be sparser than about 1%. At 1.47% and blocksize 2,500 each block holds 1.05 MiB.
+  # The four instances are 4.0 / 8.0 / 16.1 / 31.8 GB.
+  cc_d4: &cc_dataset
+    directory: ${plan.root}/bench-data/cc-d4
+    parameters:
+      {vertices: 150000, components: 4, band: 1107, minority_fraction: 0.015, seed: 7,
+       generator_chunk_mib: 256, systemds_chunk_mib: 128}
+    ready: [metadata.json]
+    artifacts:
+      row_ptr:
+        path: csr/row_ptr.i64
+        size_bytes_from_metadata: {path: metadata.json, key: vertices, multiplier: 8, add: 8}
+        metadata:
+          path: metadata.json
+          expect:
+            {vertices: "${dataset.vertices}", components: "${dataset.components}",
+             band: "${dataset.band}", minority_fraction: "${dataset.minority_fraction}",
+             seed: "${dataset.seed}",
+             generator: connected_components/prepare.py, generator_version: 1}
+      col_idx:
+        path: csr/col_idx.i32
+        size_bytes_from_metadata: {path: metadata.json, key: edge_slots, multiplier: 4}
+      values:
+        path: csr/values.f64
+        size_bytes_from_metadata: {path: metadata.json, key: edge_slots, multiplier: 8}
+    prepare:
+      policy: auto
+      command: |
+        "${tools.python}" "${plan.dir}/connected_components/prepare.py" --out "${dataset.dir}" --vertices ${dataset.vertices} --components ${dataset.components} --band ${dataset.band} --minority-fraction ${dataset.minority_fraction} --seed ${dataset.seed} --chunk-mib ${dataset.generator_chunk_mib}
+    variants:
+      # Only SystemDS needs a converted representation. Dask reads the canonical CSR
+      # directly: row bands are already its natural chunking of that layout, so its tuning
+      # knob is the runtime `band_rows` parameter rather than a prepared artifact. There is
+      # no Zarr variant here for the same reason -- Zarr stores dense arrays, and the whole
+      # point of this dataset is that the graph never exists densely.
+      blocksize:
+        artifacts:
+          G:
+            path: systemds/G-bs${run.blocksize}
+            metadata: {expect: {rows: "${dataset.vertices}", cols: "${dataset.vertices}", rows_in_block: "${run.blocksize}", cols_in_block: "${run.blocksize}"}}
+        prepare:
+          policy: auto
+          command: |
+            prep_root="${dataset.dir}/.sysds-root-bs${run.blocksize}"
+            mkdir -p "$prep_root/target" "$prep_root/conf" "${dataset.dir}/tmp/prepare-bs${run.blocksize}" "${dataset.dir}/scratch/prepare-bs${run.blocksize}" "${dataset.dir}/tmp/java"
+            ln -sfn "${tools.systemds_jar}" "$prep_root/target/SystemDS.jar"
+            if [ -d "$(dirname "${tools.systemds_jar}")/lib" ]; then
+              ln -sfn "$(dirname "${tools.systemds_jar}")/lib" "$prep_root/target/lib"
+            fi
+            cat > "$prep_root/conf/SystemDS-config.xml" <<EOF
+            <root>
+              <sysds.localtmpdir>${dataset.dir}/tmp/prepare-bs${run.blocksize}</sysds.localtmpdir>
+              <sysds.scratch>${dataset.dir}/scratch/prepare-bs${run.blocksize}</sysds.scratch>
+              <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>
+            </root>
+            EOF
+            # Sparse transfer, so prepare_sparse_systemds.py rather than the dense converter:
+            # a single row band of this graph would be terabytes if materialized densely.
+            # 8g for the same reason as the dense datasets -- the reblock is itself an OOC
+            # job, and preparation runs outside the run cgroups.
+            SYSTEMDS_ROOT="$prep_root" JAVA_TOOL_OPTIONS="-Djava.io.tmpdir=${plan.root}/tmp/java" "${tools.python}" "${plan.dir}/prepare_sparse_systemds.py" "${dataset.dir}" "${dataset.dir}/systemds/G-bs${run.blocksize}" --blocksize ${run.blocksize} --chunk-mib ${dataset.systemds_chunk_mib} --java "${tools.java}" --systemds-jar "${tools.systemds_jar}" --config "$prep_root/conf/SystemDS-config.xml" --java-heap 8g --java-tmp "${plan.root}/tmp/java" --replace-invalid
+
+  cc_d8:
+    <<: *cc_dataset
+    directory: ${plan.root}/bench-data/cc-d8
+    parameters:
+      {vertices: 212500, components: 4, band: 1570, minority_fraction: 0.015, seed: 17,
+       generator_chunk_mib: 256, systemds_chunk_mib: 128}
+
+  cc_d16:
+    <<: *cc_dataset
+    directory: ${plan.root}/bench-data/cc-d16
+    parameters:
+      {vertices: 302500, components: 4, band: 2237, minority_fraction: 0.015, seed: 27,
+       generator_chunk_mib: 256, systemds_chunk_mib: 128}
+
+  cc_d32:
+    <<: *cc_dataset
+    directory: ${plan.root}/bench-data/cc-d32
+    parameters:
+      {vertices: 425000, components: 4, band: 3145, minority_fraction: 0.015, seed: 37,
+       generator_chunk_mib: 256, systemds_chunk_mib: 128}
+
 dataset_groups:
   # 32 GB instances: at 16 GB the data barely exceeded the largest budget, and the
   # per-JVM warmup (~15s, measured) was 65-78% of an OOC run. Doubling the data makes
@@ -470,6 +643,10 @@ dataset_groups:
   dense_scaling: [dense_d32] #[dense_d4, dense_d8, dense_d16, dense_d32]
   gnmf_scaling: [gnmf_d32] #[gnmf_d4, gnmf_d8, gnmf_d16, gnmf_d32]
   dense_legacy_scaling: [dense_2m] #[dense_1m, dense_2m]
+  # 150,000 / 212,500 / 302,500 / 425,000 vertices at density 1.47% are 4.0 / 8.0 /
+  # 16.1 / 31.8 GB of CSR. Every one is an exact multiple of both the 2,500 SystemDS
+  # blocksize and the 500-row Dask band.
+  cc_scaling: [cc_d32] #[cc_d4, cc_d8, cc_d16, cc_d32]
 
 systemds_setup: &systemds_setup
   command: |
@@ -521,6 +698,11 @@ runs:
     entrypoint: ${plan.dir}/multilogreg/systemds.dml
     blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
+      # Row chunk for the prepared Zarr store: 95 MiB at 1000 columns, inside Dask's
+      # ~100 MiB guidance, and an exact divisor of every dense dataset so no trailing
+      # chunk is padded. Full-width rows, not square tiles: every kernel here is a
+      # row-local reduction, and splitting columns forces a combine none of them ask for.
+      dask_chunk: 12500
       # Raised from 1/1: one outer and one inner step is a single gradient step, not
       # multinomial logistic regression. TRON costs roughly outer*(2+2*inner) passes
       # over X, so 1/1 was 4 passes and 5/10 would be 110 -- 3/5 gives 36, a real fit
@@ -563,6 +745,11 @@ runs:
     entrypoint: ${plan.dir}/randomized_svd/systemds.dml
     blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
+      # Row chunk for the prepared Zarr store: 95 MiB at 1000 columns, inside Dask's
+      # ~100 MiB guidance, and an exact divisor of every dense dataset so no trailing
+      # chunk is padded. Full-width rows, not square tiles: every kernel here is a
+      # row-local reduction, and splitting columns forces a combine none of them ask for.
+      dask_chunk: 12500
       rank: 16
       seed: 31
       systemds_args: >-
@@ -594,6 +781,7 @@ runs:
     entrypoint: ${plan.dir}/mlp/systemds.dml
     blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
+      dask_chunk: 8192   # divides the 65,536-row activation input exactly; this run has no Dask arm today
       epochs: 1
       batch_size: 65536
       hidden_size: 9216
@@ -634,6 +822,11 @@ runs:
     entrypoint: ${plan.dir}/gnmf/systemds.dml
     blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
+      # Row chunk for the prepared Zarr store: 95 MiB at 1000 columns, inside Dask's
+      # ~100 MiB guidance, and an exact divisor of every dense dataset so no trailing
+      # chunk is padded. Full-width rows, not square tiles: every kernel here is a
+      # row-local reduction, and splitting columns forces a combine none of them ask for.
+      dask_chunk: 12500
       rank: 16
       # raised from 2: multiplicative updates conventionally run 50-200; 20 is a floor.
       iterations: 20
@@ -670,6 +863,7 @@ runs:
     entrypoint: ${plan.dir}/gmm/systemds.dml
     blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
+      dask_chunk: 12500   # divides dense_1m exactly; this run has no Dask arm today
       components: 4
       model: VVI
       iterations: 1
@@ -705,6 +899,11 @@ runs:
     entrypoint: ${plan.dir}/kmeans/systemds.dml
     blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
+      # Row chunk for the prepared Zarr store: 95 MiB at 1000 columns, inside Dask's
+      # ~100 MiB guidance, and an exact divisor of every dense dataset so no trailing
+      # chunk is padded. Full-width rows, not square tiles: every kernel here is a
+      # row-local reduction, and splitting columns forces a combine none of them ask for.
+      dask_chunk: 12500
       clusters: 16
       # raised from 2: Lloyd's algorithm runs to convergence; 2 steps is one refinement.
       iterations: 10
@@ -741,6 +940,11 @@ runs:
     entrypoint: ${plan.dir}/pca/systemds.dml
     blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
+      # Row chunk for the prepared Zarr store: 95 MiB at 1000 columns, inside Dask's
+      # ~100 MiB guidance, and an exact divisor of every dense dataset so no trailing
+      # chunk is padded. Full-width rows, not square tiles: every kernel here is a
+      # row-local reduction, and splitting columns forces a combine none of them ask for.
+      dask_chunk: 12500
       components: 16
       systemds_args: >-
         -args "${input.X}" ${run.components}
@@ -774,6 +978,11 @@ runs:
     entrypoint: ${plan.dir}/lmcg/systemds.dml
     blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
+      # Row chunk for the prepared Zarr store: 95 MiB at 1000 columns, inside Dask's
+      # ~100 MiB guidance, and an exact divisor of every dense dataset so no trailing
+      # chunk is padded. Full-width rows, not square tiles: every kernel here is a
+      # row-local reduction, and splitting columns forces a combine none of them ask for.
+      dask_chunk: 12500
       # raised from 2: conjugate gradient needs ~10-100 steps to be CG at all.
       iterations: 10
       reg: 1e-7
@@ -803,6 +1012,157 @@ runs:
           --memory-limit ${resources.dask_memory_limit} --temporary-directory "${run.results}/dask-spill"
           --output "${run.outputs}/dask-r${rep}.json"
 
+  - id: connected_components_scaling
+    enabled: false
+    dataset: {group: cc_scaling}
+    resource_profiles: [mem16, mem8, mem4]
+    entrypoint: ${plan.dir}/connected_components/systemds.dml
+    # 2,500, not the 500 the dense workloads use. SystemDS budgets an OOC tile as if it were
+    # dense, so a sparse graph at blocksize 500 would put 2.3 nonzeros in each of 1.2 billion
+    # blocks; 2,500 puts 1.05 MiB in each of 28,900. It is also the largest round value with
+    # headroom under the mem4 profile's ceiling of 2,991 (see the cc_d4 dataset comment).
+    blocksize_sweeps: {ooc: [2500], spark: [2500]}
+    parameters:
+      # Rows per Dask COO chunk. About 38 MB of stored edges at degree 6,300, and an exact
+      # divisor of all four cc datasets so no band is short. It also yields 850 chunks at
+      # cc_d32 -- well above the two-per-thread floor below which threads sit idle -- while
+      # keeping a chunk's live nonzeros an order of magnitude under the smallest budget.
+      band_rows: 500
+      # A cap, not a target. Max-label propagation converges in about the graph diameter,
+      # which the power-of-two offset ladder puts near log2(vertices/band); all three arms
+      # stop on the identical `diff == 0` test, so they perform the same number of passes.
+      # 60 leaves generous headroom over the ~18 expected at cc_d32.
+      iterations: 60
+      systemds_args: >-
+        -args "${input.G}" ${run.iterations}
+        "${run.outputs}/systemds-C-r${rep}"
+    inputs: {G: {artifact: G}}
+    resources: {timeout_seconds: 5400}
+    setup: *systemds_setup
+    cold_cache: ["${dataset.dir}"]
+    implementations:
+      - {id: systemds-ooc, template: systemds-ooc}
+      - {id: systemds-spark, template: systemds-spark}
+      # SciPy is present for the CSR layout but has no out-of-core execution: the gather
+      # this kernel needs is one float per stored edge, so this arm is expected to complete
+      # only on the smaller instances and to exhaust memory at cc_d32. That is the result,
+      # not a defect -- but read it as a statement about whole-array NumPy, not about CSR.
+      - id: numpy-label-propagation
+        template: python
+        required_python_modules: [numpy]
+        command: >-
+          "${tools.python}" "${plan.dir}/connected_components/numpy.py" "${dataset.dir}"
+          --iterations ${run.iterations}
+          --output "${run.outputs}/numpy-r${rep}.json"
+      - id: dask-label-propagation
+        template: dask
+        required_python_modules: [numpy, dask.array, distributed, sparse]
+        command: >-
+          "${tools.python}" "${plan.dir}/connected_components/dask_array.py" "${dataset.dir}"
+          --band-rows ${run.band_rows} --iterations ${run.iterations}
+          --threads ${resources.dask_threads}
+          --memory-limit ${resources.dask_memory_limit} --temporary-directory "${run.results}/dask-spill"
+          --output "${run.outputs}/dask-r${rep}.json"
+
+  # Intermediate-bound: the input fits in memory at every profile and the feature
+  # map does not. Nothing in the closed form needs the map as a whole, so an engine
+  # that streams it never holds more than a block; one that materializes it must
+  # find up to 33 GB. The Gram is D/4 flops per byte of map -- 128 at rf4, 512 at
+  # rf16 -- so this is the compute-dense half of the pair, where a streaming engine
+  # has the most room to hide its reads.
+  - id: random_features_scaling
+    enabled: false
+    dataset: rf_1m
+    resource_profiles: [mem16, mem8, mem4]
+    parameter_cases: rf_width
+    entrypoint: ${plan.dir}/random_features/systemds.dml
+    blocksize_sweeps: {ooc: [500], spark: [1000]}
+    parameters:
+      # 100,000 rows is 102 MB at 128 columns and an exact divisor of the dataset.
+      dask_chunk: 100000
+      gamma: 0.01
+      reg: 1.0
+      seed: 41
+      systemds_args: >-
+        -args "${input.X}" "${input.binary_y}"
+        "${run.results}/projection/W-f${run.features}.csv" ${run.reg}
+        "${run.outputs}/systemds-beta-r${rep}"
+    inputs: {X: {artifact: X}, binary_y: {artifact: binary_y}}
+    resources: {timeout_seconds: 2400}
+    # The projection is written once per case, outside the timed scope, and read by
+    # all four arms. Generating it inside each arm would compare three random number
+    # generators instead of one feature map; a prepared file makes them identical by
+    # construction. It is cheap enough (a few megabytes) to rebuild per case rather
+    # than to track as a dataset artifact.
+    setup:
+      - *systemds_setup
+      - command: |
+          "${tools.python}" "${plan.dir}/random_features/prepare_projection.py" --out "${run.results}/projection" --cols ${dataset.cols} --features ${run.features} --gamma ${run.gamma} --seed ${run.seed}
+    baseline_setup:
+      - command: |
+          "${tools.python}" "${plan.dir}/random_features/prepare_projection.py" --out "${run.results}/projection" --cols ${dataset.cols} --features ${run.features} --gamma ${run.gamma} --seed ${run.seed}
+    cold_cache: ["${dataset.dir}"]
+    implementations:
+      - {id: systemds-ooc, template: systemds-ooc}
+      - {id: systemds-spark, template: systemds-spark}
+      - id: numpy-ridge
+        template: python
+        command: >-
+          "${tools.python}" "${plan.dir}/random_features/numpy.py" "${dataset.dir}"
+          --projection "${run.results}/projection/W-f${run.features}" --reg ${run.reg}
+          --output "${run.outputs}/numpy-r${rep}.json"
+      - id: dask-ridge
+        template: dask
+        command: >-
+          "${tools.python}" "${plan.dir}/random_features/dask_array.py" "${dataset.dir}"
+          --projection "${run.results}/projection/W-f${run.features}" --reg ${run.reg}
+          --threads ${resources.dask_threads}
+          --memory-limit ${resources.dask_memory_limit} --temporary-directory "${run.results}/dask-spill"
+          --output "${run.outputs}/dask-r${rep}.json"
+
+  # Intermediate-bound, traffic-dominated: the distance matrix is the same size as
+  # the feature map above but costs only d/4 flops per byte to build, and the
+  # selection loop then sweeps it k more times. This is the quadratic wall that
+  # makes practitioners subsample a training set rather than use all of it.
+  - id: knn_scaling
+    enabled: false
+    dataset: knn_200k
+    resource_profiles: [mem16, mem8, mem4]
+    parameter_cases: knn_reference
+    entrypoint: ${plan.dir}/knn/systemds.dml
+    blocksize_sweeps: {ooc: [500], spark: [1000]}
+    parameters:
+      # 5,000 rows is 20 MB at 512 columns -- below the usual guidance, but it is the
+      # largest chunk that divides every boundary this run slices at, and 40 chunks
+      # is far too few for per-task overhead to matter.
+      dask_chunk: 5000
+      query_rows: 25000
+      neighbours: 5
+      systemds_args: >-
+        -args "${input.X}" "${input.nn_y}" ${run.reference_rows} ${run.query_rows}
+        ${run.neighbours} "${run.outputs}/systemds-predictions-r${rep}"
+    inputs: {X: {artifact: X}, nn_y: {artifact: nn_y}}
+    resources: {timeout_seconds: 3600}
+    setup: *systemds_setup
+    cold_cache: ["${dataset.dir}"]
+    implementations:
+      - {id: systemds-ooc, template: systemds-ooc}
+      - {id: systemds-spark, template: systemds-spark}
+      - id: numpy-brute-force
+        template: python
+        command: >-
+          "${tools.python}" "${plan.dir}/knn/numpy.py" "${dataset.dir}"
+          --reference-rows ${run.reference_rows} --query-rows ${run.query_rows}
+          --neighbours ${run.neighbours} --output "${run.outputs}/numpy-r${rep}.json"
+      - id: dask-brute-force
+        template: dask
+        command: >-
+          "${tools.python}" "${plan.dir}/knn/dask_array.py" "${dataset.dir}"
+          --reference-rows ${run.reference_rows} --query-rows ${run.query_rows}
+          --neighbours ${run.neighbours} --threads ${resources.dask_threads}
+          --memory-limit ${resources.dask_memory_limit} --temporary-directory "${run.results}/dask-spill"
+          --output "${run.outputs}/dask-r${rep}.json"
+
   - id: l2svm_scaling
     enabled: true
     dataset: {group: dense_scaling}
@@ -810,6 +1170,11 @@ runs:
     entrypoint: ${plan.dir}/l2svm/systemds.dml
     blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
+      # Row chunk for the prepared Zarr store: 95 MiB at 1000 columns, inside Dask's
+      # ~100 MiB guidance, and an exact divisor of every dense dataset so no trailing
+      # chunk is padded. Full-width rows, not square tiles: every kernel here is a
+      # row-local reduction, and splitting columns forces a combine none of them ask for.
+      dask_chunk: 12500
       # raised from 3: an SVM solved in 3 outer steps is not a converged fit, and at
       # 3 the ~15s JVM warmup dominated the measurement rather than the OOC path.
       iterations: 10

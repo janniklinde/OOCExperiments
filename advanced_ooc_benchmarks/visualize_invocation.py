@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Render grouped workload comparisons for one benchmark invocation.
 
-For each workload this writes ``runtime``, ``cpu``, and ``io`` figures below
+For each workload this writes ``runtime``, ``read``, ``write``, ``cpu``, and ``io`` figures below
 ``<workload>/results/<invocation-id>/``. Every plot groups bars by memory profile and,
 within each group, compares all executed implementations/backends. Cgroup I/O is preferred;
 when unavailable, GNU time's Linux rusage block counters are converted with 512-byte blocks.
@@ -218,6 +218,7 @@ def save_io(target, base_id, rows):
     spills = [dict(row, io_gib=number(row["spill_bytes"]) / 2**30) for row in rows]
 
     save_read(target, rows)
+    save_write(target, rows)
 
     figure, axes = plt.subplots(3, 1, figsize=(8.0, 10.0), sharex=True, constrained_layout=True)
     grouped_bars(axes[0], reads, "io_gib", "Read Volume",
@@ -240,6 +241,16 @@ def save_read(target, rows):
     grouped_bars(axis, reads, "io_gib", "", "Data Read [GiB]")
     figure.savefig(target / "read.png", dpi=180)
     figure.savefig(target / "read.pdf")
+    plt.close(figure)
+
+
+def save_write(target, rows):
+    """Write the standalone output-write-volume figure."""
+    writes = [dict(row, io_gib=number(row["write_bytes"]) / 2**30) for row in rows]
+    figure, axis = plt.subplots(figsize=(7.5, 6.5), constrained_layout=True)
+    grouped_bars(axis, writes, "io_gib", "", "Data Written [GiB]")
+    figure.savefig(target / "write.png", dpi=180)
+    figure.savefig(target / "write.pdf")
     plt.close(figure)
 
 
@@ -290,7 +301,7 @@ def main():
                         help="invocation directory, or its bench-results parent (default: latest invocation)")
     parser.add_argument("--replace-ooc-from", type=Path, metavar="INVOCATION",
                         help="replace SystemDS-OOC rows with those from this OOC-only invocation")
-    parser.add_argument("--figures", choices=("all", "runtime-read"), default="all",
+    parser.add_argument("--figures", choices=("all", "runtime-read", "runtime-read-write"), default="all",
                         help="figure set to render (default: all)")
     args = parser.parse_args()
     invocation = invocation_path(args.path.resolve())
@@ -305,8 +316,10 @@ def main():
         rows = replace_ooc_rows(rows, replacements, base_id)
         target = workload_dir(suite_root, base_id, invocation)
         save_runtime(target, base_id, rows)
-        if args.figures == "runtime-read":
+        if args.figures in ("runtime-read", "runtime-read-write"):
             save_read(target, rows)
+            if args.figures == "runtime-read-write":
+                save_write(target, rows)
         else:
             save_cpu(target, base_id, rows)
             save_io(target, base_id, rows)

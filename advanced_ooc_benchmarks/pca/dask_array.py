@@ -14,12 +14,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import dask.array as da
 import numpy as np
-from dask_support import create_client, load_matrix
+from dask_support import create_client, load_zarr, resolve_zarr, store_tall
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("data", type=Path)
+    parser.add_argument("--zarr", type=Path,
+                        help="override the prepared Zarr store for X "
+                             "(default: <data>/zarr/X.zarr)")
     parser.add_argument("--components", type=int, default=16)
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--memory-limit", default="3GiB")
@@ -36,7 +39,7 @@ def main():
     shape = (metadata["rows"], metadata["cols"])
     if not 1 <= args.components <= shape[1] or shape[0] < 2:
         raise ValueError("components must be in [1, cols] and at least two rows are required")
-    matrix = load_matrix(args.data / "X.f64", shape)
+    matrix = load_zarr(resolve_zarr(args.data, args.zarr))
     center, gram = da.compute(matrix.mean(axis=0), matrix.T @ matrix, **compute_options)
     covariance = gram / (shape[0] - 1)
     covariance -= (shape[0] / (shape[0] - 1)) * np.outer(center, center)
@@ -45,15 +48,12 @@ def main():
     eigenvalues = values[order]
     components = vectors[:, order]
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    score_path = args.output.with_name(args.output.stem + "-scores.npy")
-    scores = np.lib.format.open_memmap(
-        score_path, mode="w+", dtype=np.float64, shape=(shape[0], args.components))
+    score_path = args.output.with_name(args.output.stem + "-scores.zarr")
     score_array = matrix @ components - center @ components
     # Do not materialize the tall score matrix in the Python heap.  Returning
     # the stored chunks lets Dask share their computation with the checksum.
-    stored = da.store(score_array, scores, lock=False, compute=False, return_stored=True)
+    stored = store_tall(score_array, score_path)
     score_norm_sq = float((stored * stored).sum().compute(**compute_options))
-    scores.flush()
     np.save(args.output.with_name(args.output.stem + "-components.npy"), components)
     np.save(args.output.with_name(args.output.stem + "-eigenvalues.npy"), eigenvalues.reshape(-1, 1))
     report = {"implementation": "dask-pca", "seconds": time.perf_counter() - start,

@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import dask.array as da
 import numpy as np
-from dask_support import create_client, load_matrix, read_rows
+from dask_support import create_client, load_zarr, resolve_zarr, read_rows
 
 
 def normalized_labels(path, rows):
@@ -34,6 +34,9 @@ def normalized_labels(path, rows):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("data", type=Path)
+    parser.add_argument("--zarr", type=Path,
+                        help="override the prepared Zarr store for X "
+                             "(default: <data>/zarr/X.zarr)")
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument("--inner-iterations", type=int, default=20)
     parser.add_argument("--tolerance", type=float, default=0.0)
@@ -54,7 +57,7 @@ def main():
         metadata = json.loads((args.data / "metadata.json").read_text())
         rows, cols = metadata["rows"], metadata["cols"]
         labels = normalized_labels(args.data / "binary_y.f64", rows)
-        matrix = load_matrix(args.data / "X.f64", (rows, cols))
+        matrix = load_zarr(resolve_zarr(args.data, args.zarr))
         weights = np.zeros((cols, 1), dtype=np.float64)
         scores = np.zeros((rows, 1), dtype=np.float64)
         gradient = (matrix.T @ labels).compute()

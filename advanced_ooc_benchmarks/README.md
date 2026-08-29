@@ -8,10 +8,11 @@ from the raw memmaps without modifying the raw inputs.
 ## Layout
 
 - `benchmark-plan.yaml`: aligned 4/8/16 GB synthetic inputs crossed with 16/8/4 GB memory profiles
-  for MultiLogReg, randomized SVD, GNMF, KMeans, PCA, LMCG, and L2-SVM.
+  for MultiLogReg, randomized SVD, GNMF, KMeans, PCA, LMCG, L2-SVM, and connected components.
 - `benchmark-plan2.yaml`: the previous single-configuration plan preserved unchanged.
 - `run_cgroup_baselines.sh`, `benchmark_plan.py`, `drop_caches.py`: all runner support required
   by the plan.
+- `setup.sh`: one-shot host preparation for the interpreter the plan names as `tools.python`.
 - `docker/`: a systemd-based container that runs `run_cgroup_baselines.sh` with no host setup
   beyond a mounted dataset root and a prebuilt `SystemDS.jar`. See `docker/README.md`;
   `cd docker && cp .env.example .env && ./bench.sh build && ./bench.sh run`.
@@ -30,7 +31,10 @@ from the raw memmaps without modifying the raw inputs.
   contains `dask_array.py`; it is not named `dask.py` because that would shadow the installed
   Python `dask` package.
 - `kmeans/`, `pca/`, and `lmcg/` contain deterministic self-contained DML implementations plus
-  whole-memmap NumPy and automatically chunked Dask baselines.
+  whole-memmap NumPy and Zarr-backed Dask baselines.
+- `prepare_zarr.py`: converts a canonical raw FP64 matrix into the uncompressed Zarr store the
+  Dask arm reads, in bounded transfer bands. This is the Dask counterpart to the native SystemDS
+  blocksize conversion and, like it, runs outside the timed cgroup.
 - `gnmf/` implements the fixed-iteration Lee-Seung multiplicative updates over a non-negative FP64
   matrix. SystemDS, NumPy, and Dask share deterministic positive initialization and materialize both
   learned factors.
@@ -46,6 +50,24 @@ from the raw memmaps without modifying the raw inputs.
 - `pagerank/` reuses the prepared Twitter-2010 graph from `experiments/real_world`, including its
   deterministic vertex permutation, normalized CSR representation, dangling bitmap, and native
   400,000-by-400,000 SystemDS tiles used by the established Twitter experiments.
+- `connected_components/` computes connected components by max-label propagation over a sparse
+  symmetric graph. `prepare.py` generates it with a planted component structure and exact ground
+  truth, as CSR over raw files; SystemDS, SciPy, and Dask all read that one representation. The
+  kernel is a broadcast multiply and a row-max rather than a matmul, so it exercises `ooc_uarmax`
+  and `ooc_max` on sparse blocks, which no other workload here reaches.
+- `random_features/` fits ridge regression on a random Fourier feature map (Rahimi & Recht,
+  NIPS 2007) in the paired `[cos, sin]` form. The input is 1.02 GB and the map is 4 to 33 GB, so
+  what does not fit is the intermediate rather than the data. `prepare_projection.py` writes the
+  projection once per case, outside the timed scope, and all four arms read that one file.
+- `knn/` classifies a fixed query block against a growing reference block by brute force. The
+  query-by-reference distance matrix is the same 4 to 32 GB as the feature map above but costs
+  `d/4` flops per byte to build instead of `D/4`, so the pair brackets the compute-dense and
+  traffic-dominated ends of the same intermediate size.
+- `prepare_sparse_systemds.py`: the sparse counterpart to `prepare_dense_systemds.py`. It reuses
+  that module's staging manifest, validation, and native OOC `rbind` assembly, and differs only in
+  handing each row band to the Python binding as a `scipy.sparse.csr_matrix`. Note that it must
+  construct `SystemDSContext(data_transfer_mode=0)`: the default pipe transfer has no sparse
+  implementation and silently hands the JVM a null `MatrixBlock`.
 
 ## Comparability contract
 
@@ -111,6 +133,66 @@ its nonlinear conjugate-gradient direction and Newton line search. All arms use 
 tolerance, and materialize the complete coefficient vector. NumPy exposes the whole memmap and
 Dask chooses chunks automatically; neither baseline introduces a user-selected row-block loop.
 
+Connected components runs the vendored `m_components` label propagation in all three arms:
+`u = max(rowMaxs(G * t(c)), c)` until no label changes, preceded by the same `rowSums`/`colSums`
+symmetry guard. The label vector is one value per vertex, so every arm holds it densely in memory
+and only the graph is out of core. The iteration count is data-determined rather than fixed, and
+because all arms stop on the identical `diff == 0` test they perform the same number of passes.
+Each arm reports its component count and label sum, and both are checked against the exact ground
+truth the generator records, so a silently wrong arm fails instead of returning a plausible number.
+
+The graph is sparse and is stored once, as CSR over raw files (`row_ptr.i64`, `col_idx.i32`,
+`values.f64`), the representation `pagerank/` already uses. All three arms read that same
+representation; only SystemDS converts, into its own blocksize-qualified sparse blocks, because it
+has no reader for foreign CSR. There is deliberately no Zarr variant here: Zarr stores dense arrays,
+and the point of this dataset is that the graph never exists densely. Dask's row bands are already
+the natural chunking of CSR, so its tuning knob is the runtime `band_rows` parameter rather than a
+prepared artifact. The 12 bytes per stored edge match what a SystemDS `SparseBlockCSR` costs (a
+4-byte column index plus an 8-byte value), so the arms read comparable volume. The value array is
+all ones and carries no information; it is written and read anyway, because SystemDS has no
+unweighted matrix type and must read it, and synthesizing it in the baselines would cut their input
+by two thirds for free. This is the opposite call from the RandomForest arm above, and for the
+opposite reason: there, matching the byte volume would have meant discarding sklearn's compact
+representation; here, not matching it would hand the baselines an advantage that has nothing to do
+with scheduling.
+
+Two structural properties of the graph are chosen rather than incidental. Within a component the
+vertices sit on a ring and each is joined to `r ± o (mod m)` for a fixed offset set, which makes the
+edge relation symmetric by construction: generation never sorts, which at billions of edges would
+mean an external sort. The offset set is a short band of consecutive values plus a ladder of powers
+of two. A band alone gives diameter `m/(2*band)` -- hundreds of thousands of passes. The ladder
+alone gives diameter about `log2(m)`, since any offset is reachable through its binary
+representation. Together, `band` tunes degree (and so dataset size) while the ladder tunes depth
+(and so the pass count), and the two are independent -- which a dense adjacency cannot offer, since
+there density and diameter are the same knob. Component membership and within-component rank are
+both scattered by one seeded permutation; without it the ring would sit in a band around the
+diagonal and the nonzeros per row chunk would be wildly uneven.
+
+The graph's density, 1.47%, is set by SystemDS rather than chosen freely, and this is the one
+number to understand before changing anything here. The OOC engine budgets every tile with
+`OOCUtils.estimateOutputTileBytes`, which calls `MatrixBlock.estimateSizeDenseInMemory(blen, blen)`
+-- a *dense* estimate, whatever the data's actual sparsity -- and reserves five of them against a
+limit of `min(java_heap / 9, 1 GiB)`. Two consequences follow. The blocksize cannot exceed 5,181 at
+any heap, and cannot exceed 2,991 under the mem4 profile's 3g heap, which is the binding case since
+one blocksize serves all three profiles. And because a block spans at most about 2,991 by 2,991
+cells, a block can only carry a megabyte of stored edges if the graph is denser than roughly 1%.
+At blocksize 2,500 and density 1.47% each block holds 1.05 MiB, measured. The alternative -- a
+web-graph-like density of 1e-5 -- puts 2.3 nonzeros in each of 1.2 billion blocks at blocksize 500,
+where per-block overhead dominates completely: the same graph costs 16.13 bytes per stored edge at
+304 nonzeros per block and 12.11 at 92,555. So this workload is sparse in representation and in
+every arm's execution, but it is not sparse in the way a citation or web graph is, and a run whose
+`java_heap` drops below 3g will need the blocksize, and hence the dataset, resized again.
+
+The SciPy arm is present because SciPy supports the CSR layout, but it has no out-of-core execution.
+As in every other NumPy arm here the update is expressed over the whole input with no
+user-controlled row-block loop, which for this kernel means the gather `labels[columns]`
+materializes one float per stored edge before the segment max reduces it. Nothing in the algebra
+requires that temporary -- streaming it is precisely what the out-of-core arms do instead -- so the
+arm is expected to complete on the smaller instances and to exhaust memory at `cc_d32`. It
+deliberately does not build a `scipy.sparse.csr_matrix`: above two billion stored edges the row
+pointer needs `int64`, SciPy unifies both index arrays to a single dtype, and the `int32` column
+indices would be upcast, doubling the largest array in the dataset in RAM before any work starts.
+
 GNMF minimizes the Euclidean reconstruction error of `X ~= W %*% H` with the standard Lee-Seung
 multiplicative updates. Its dedicated 1,000,000-by-384 input is uniformly distributed on `[0,1)` and
 occupies 3.072 GB as raw FP64. Rank, iteration count, epsilon, seed, update order, initialization,
@@ -122,6 +204,108 @@ the declared shape, checks dimensions, seed, sparsity, distribution, and generat
 validates the corresponding SystemDS matrix metadata for each run's blocksize. Cache eviction is a
 hard precondition: a run aborts instead of silently comparing a cold implementation with a warm
 one.
+
+### Intermediate-bound workloads
+
+`random_features/` and `knn/` differ from every other workload here in what exceeds the memory
+budget. Their inputs are 1.02 GB and 819 MB, so the data fits at all three profiles; the feature
+map and the distance matrix do not. Neither object is ever stored on disk, which is why the pair
+adds under 3 GB to the dataset root while covering intermediates from 4 to 33 GB.
+
+Both are expressed so that nothing forces the large object to exist as a whole. `t(Z) %*% Z` and
+`t(Z) %*% y` are row-separable accumulations over the feature map, and the kNN selection loop
+touches the distance matrix through `rowIndexMin` and a `table` with one nonzero per query, so the
+gather and the mask are each a single pass with no dense companion matrix. What each engine then
+does with that freedom is the measurement: SystemDS streams, NumPy materializes, and Dask
+recomputes -- the distance matrix is too large to persist under any of these budgets, so the Dask
+arm rebuilds it once per neighbour and performs `k` products where the other arms perform one.
+That is Dask's real behaviour for an intermediate that exceeds memory, not a handicap the script
+imposes, and the arm says so in its docstring.
+
+The kNN distance omits the query norms in all three arms. They are constant along a row, so they
+shift every candidate for a query equally and cannot change which reference is nearest; the matrix
+is therefore ordered like the true distance without being it, which is all selection needs.
+
+The random Fourier projection is prepared as a file rather than generated per arm. It does not
+depend on the data, it is identical for every engine, and generating it three times would compare
+three random number generators instead of one feature map. `prepare_projection.py` writes it in two
+encodings of the same array -- `.f64` for the NumPy and Dask arms, and `.csv` with an `.mtd`
+sidecar for DML, which has no reader for raw row-major files -- at `%.17g`, so both hold the same
+doubles.
+
+#### OOC limitations these workloads ran into
+
+Writing the feature map first surfaced four OOC gaps, all reproduced against `-exec singlenode` with
+and without `-ooc` on the same inputs. They are recorded here because they constrain how any new
+DML in this suite may be written, and because two of them are silent.
+
+- Chained `+` or `*` over three or more operands compiles to an n-ary instruction that the OOC
+  backend cannot generate: *"Only n-ary cbind, rbind, nmin, and nmax are supported"*. Every
+  addition and product in a streamed dataflow has to stay binary. `cbind` and `rbind` are fine,
+  which is one reason the map is built as `cbind(cos(P), sin(P))`.
+- `matrix(seq(a, b), rows=r, cols=c)` where the sequence is longer than one block **silently
+  reshapes to zeros** under OOC. `sum` and `*` on the result stay correct while `+` and `/` behave
+  as if the matrix were empty, so the failure surfaces as a wrong number rather than an error.
+  Reproduced at blocksize 500 with 600 and 1024 elements; 100 and 400 are correct.
+- `outer(a, b, "+")` with a one-row left operand degenerates to a `1x1` against `1xD` binary op,
+  which OOC rejects with *"Invalid dimensions for matrix-matrix binary op"*.
+- Slicing a row out of a matrix that spans several blocks fails with *"OOCStream block count
+  mismatch: expected 2 but saw 1"*.
+
+The net effect is that small dense matrices generated inside a script are unreliable under OOC,
+which is the practical reason the projection is read from disk instead. With that one change both
+workloads agree across NumPy, Dask, SystemDS CP, and SystemDS OOC to the last few ulps.
+
+### Dask input preparation
+
+SystemDS reads a prepared native representation whose blocksize the plan sweeps; giving Dask only
+the raw file would tune one runtime's physical layout and not the other's. The Dask arm therefore
+reads its own prepared artifact, an uncompressed Zarr store built by `prepare_zarr.py` from the
+same canonical `X.f64`, declared as the `dask_chunk` dataset variant and sized per run with
+`parameters.dask_chunk`.
+
+The store always lives at `<dataset-dir>/zarr/X.zarr`, and the Dask baselines find it there with
+no argument. The chunking is recorded in the sidecar rather than in the filename, so changing
+`parameters.dask_chunk` makes the preflight see a mismatch and rebuild the store in place; the
+previous one is quarantined as `X.zarr.invalid-<timestamp>`. The trade-off against the
+`X-bs<blocksize>` naming is deliberate: two chunk sizes cannot coexist, so sweeping `dask_chunk`
+reconverts rather than reusing, which is acceptable for a value set once and outside the timed
+scope. Three properties of the store are load-bearing:
+
+- **Uncompressed.** The suite compares physical read volume, so the store must hold the same bytes
+  as the raw input. Blosc/zstd on normally distributed FP64 buys almost nothing and would distort
+  both `read.pdf` and the CPU chart.
+- **Full-width row chunks, not square tiles.** Every kernel here is a row-local reduction
+  (`t(X)%*%X`, `t(X)%*%(X%*%v)`, `t(P)%*%X`), so splitting columns forces a cross-chunk combine no
+  arm's algorithm asks for. A measured sweep over 250x250, 500x500, 1000x1000, and full-width
+  chunks found square tiles monotonically worse, by up to 13x at the smallest tile. Matching the
+  SystemDS square blocksize would be actively unfair rather than symmetric; at 1000 columns a
+  square tile also cannot exceed 8 MiB.
+- **Sized by chunks per thread, and an exact divisor of the row count.** The same sweep found
+  runtime tracks chunks-per-thread rather than chunk size: below roughly two chunks per thread the
+  tail wave dominates and runtime degrades sharply, while anything above about six is flat. Choose
+  a row chunk giving at least ~6 chunks per `resources.dask_threads`, and one that divides the row
+  count exactly - Zarr writes every chunk at full size, so a trailing partial chunk is padded on
+  disk and silently inflates the store (6.5% in one measured case). `prepare_zarr.py` warns and
+  suggests nearby exact divisors when the chunk does not divide the shape.
+
+The default `dask_chunk: 12500` gives 95 MiB chunks and divides 500,000 / 1,000,000 / 2,000,000 /
+4,000,000 exactly. It is chosen for the 32 GB member that `dense_scaling` currently selects: 320
+chunks, about 14 per thread on a 22-thread host. **If `dense_scaling` is widened back to
+`dense_d4`, revisit it** - 500,000 rows at 12500 is only 40 chunks, under two per thread on the
+same host, which the sweep puts in the degraded region.
+
+Only `X` is converted. The response vectors are one column wide and are read eagerly as NumPy by
+`dask_support.read_vector`: chunking them to match `X` would add one kilobyte-sized task per row
+block of the large matrix to every graph, for an operand that is 32 MB beside a 32 GB input.
+
+Because the Zarr array carries no alias layer, low-level fusion is safe and stays enabled. The
+older `load_matrix` reader built the array from `from_delayed` plus `concatenate`, which puts an
+alias at the top whose task specification is the *name* of another key; fusion renames that key
+differently depending on the downstream graph, so reusing one such array across the fixed-iteration
+submissions made the scheduler see two specifications for one stable key and warn about possible
+deadlocks. `load_matrix` remains for workloads that have not been converted; a plan that falls back
+to it must also set `optimization.fuse.active: False`.
 
 Dense blocksize is a backend-specific run setting, not part of the logical dataset. OOC and local
 Spark candidates are configured independently:
@@ -158,8 +342,10 @@ The dedicated Dask template uses one in-process threaded scheduler, limits it wi
 and fixes BLAS libraries to one thread per task, avoiding nested Dask-by-BLAS parallelism. The
 default 32 MiB target controls task granularity, while each memory profile scales Dask's managed
 memory limit to 12, 6, or 3 GiB; neither setting is a SystemDS blocksize. Tall Dask outputs such as
-PCA scores and GNMF `W` are stored directly into `.npy` memmaps rather than first being collected
-into the Python heap. NumPy continues to use `resources.threads`; its activation-sized MLP
+PCA scores and GNMF `W` are streamed into an uncompressed Zarr store rather than first being
+collected into the Python heap. They previously targeted an `np.lib.format.open_memmap`, which
+does not work under a distributed client: the memmap is serialized to the worker, which writes
+into its own copy, so the file stayed zero-filled while the returned checksum was still correct. NumPy continues to use `resources.threads`; its activation-sized MLP
 intermediates and tall PCA output are disk-backed memmaps. RandomForest separately caps concurrent
 sklearn tree builds with `resources.python_jobs`, because job-level parallelism duplicates
 tree-building state. Spark uses its independent `resources.spark_threads` setting.
@@ -260,8 +446,8 @@ KMeans, LMCG, and L2-SVM use 300-second caps; covariance PCA and GNMF use 600-se
 generation and native conversion remain on demand and outside the measured cgroups.
 
 The canonical dense interchange format is headerless little-endian row-major FP64 plus JSON
-metadata. NumPy, Dask, and dense SciPy operations can all consume it directly through `np.memmap`;
-Dask wraps that memmap with `dask.array.from_array`. Sparse SciPy workloads instead use canonical
+metadata. NumPy and dense SciPy operations consume it directly through `np.memmap`. Dask reads a
+prepared uncompressed Zarr store instead; see "Dask input preparation" below. Sparse SciPy workloads instead use canonical
 binary CSR arrays (`row_ptr`, `col_idx`, and `values`) because zeros in raw dense FP64 still occupy
 eight bytes each. HDF5 or `.npy` copies are optional and are not required by this suite.
 
@@ -290,14 +476,20 @@ Update `root` and `tools` in `benchmark-plan.yaml` for the target host. In parti
 cgroups are available:
 
 ```bash
-python3 -m pip install -r requirements-baselines.txt
-systemctl --user status
+./setup.sh
 systemd-run --user --scope -p MemoryMax=4G true
 ./run_cgroup_baselines.sh
 ```
 
-Install the requirements with the same interpreter configured as `tools.python`; the command above
-is illustrative when that interpreter is the active `python3`.
+`setup.sh` installs `requirements-baselines.txt` into the interpreter configured as `tools.python`
+rather than the active `python3`, creating that interpreter as a virtualenv when the path does not
+exist yet. It then installs the SystemDS Python bindings from the source tree next to
+`tools.systemds_jar` (dataset preparation needs `import systemds`; pass `--skip-systemds-python` to
+manage them yourself), imports every module any implementation declares — including the ones behind
+currently disabled runs, so enabling a run later does not send you back — and reports on `java`,
+`spark_submit`, `tools.systemds_jar`, user systemd, and the writability of `root`. External tools
+are warnings rather than failures: a missing `spark_submit` only matters once a Spark
+implementation is enabled. It ends by validating the plan, and re-running it is safe.
 
 ### Enable cgroup-v2 `io.stat` accounting
 

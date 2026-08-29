@@ -14,12 +14,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import dask.array as da
 import numpy as np
-from dask_support import create_client, default_row_chunk, load_matrix
+from dask_support import create_client, load_zarr, resolve_zarr, read_vector
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("data", type=Path)
+    parser.add_argument("--zarr", type=Path,
+                        help="override the prepared Zarr store for X "
+                             "(default: <data>/zarr/X.zarr)")
     parser.add_argument("--iterations", type=int, default=2)
     parser.add_argument("--reg", type=float, default=1e-7)
     parser.add_argument("--tolerance", type=float, default=0.0)
@@ -36,10 +39,8 @@ def main():
     start = time.perf_counter()
     metadata = json.loads((args.data / "metadata.json").read_text())
     shape = (metadata["rows"], metadata["cols"])
-    #both operands share one row-chunking so the elementwise/reduction steps stay aligned
-    row_chunk = default_row_chunk(shape[1])
-    matrix = load_matrix(args.data / "X.f64", shape, row_chunk=row_chunk)
-    response = load_matrix(args.data / "binary_y.f64", (shape[0], 1), row_chunk=row_chunk)
+    matrix = load_zarr(resolve_zarr(args.data, args.zarr))
+    response = read_vector(args.data / "binary_y.f64", shape[0])
     beta = np.zeros((shape[1], 1), dtype=np.float64)
     residual = -(matrix.T @ response).compute(**compute_options)
     direction = -residual

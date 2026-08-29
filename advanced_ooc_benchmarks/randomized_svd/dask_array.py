@@ -19,12 +19,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import dask.array as da
 import numpy as np
-from dask_support import create_client, load_matrix
+from dask_support import create_client, load_zarr, resolve_zarr
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("data", type=Path)
+    parser.add_argument("--zarr", type=Path,
+                        help="override the prepared Zarr store for X "
+                             "(default: <data>/zarr/X.zarr)")
     parser.add_argument("--rank", type=int, default=16)
     parser.add_argument("--seed", type=int, default=31)
     parser.add_argument("--threads", type=int, default=1)
@@ -39,7 +42,7 @@ def main():
     start = time.perf_counter()
     metadata = json.loads((args.data / "metadata.json").read_text())
     shape = (metadata["rows"], metadata["cols"])
-    matrix = load_matrix(args.data / "X.f64", shape)
+    matrix = load_zarr(resolve_zarr(args.data, args.zarr))
     omega = np.random.default_rng(args.seed).standard_normal((shape[1], args.rank))
 
     sketch = (matrix @ omega).persist(**compute_options)

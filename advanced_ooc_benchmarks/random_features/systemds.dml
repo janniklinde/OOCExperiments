@@ -1,0 +1,21 @@
+#-------------------------------------------------------------
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0.
+#-------------------------------------------------------------
+
+source("random_features/implementation.dml") as rf_impl;
+
+X = read($1);
+y = read($2);
+# The projection is prepared outside the run and read like any other input, so
+# every arm sketches with the same matrix rather than with its own generator.
+W = read($3, format="csv");
+[beta, model_norm, residual_norm] = rf_impl::m_random_fourier_ridge(
+  X=X, y=y, W=W, reg=as.double($4));
+
+write(beta, $5, format="binary");
+print("features=" + (2 * ncol(W)));
+print("model_norm=" + model_norm);
+print("residual_norm=" + residual_norm);

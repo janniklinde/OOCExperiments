@@ -1,0 +1,31 @@
+#-------------------------------------------------------------
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0.
+#-------------------------------------------------------------
+
+source("knn/implementation.dml") as knn_impl;
+
+X = read($1);
+y = read($2);
+reference_rows = as.integer($3);
+query_rows = as.integer($4);
+k = as.integer($5);
+
+# The reference set is the leading block and the query set the trailing one, so
+# a smaller reference case is a prefix of a larger one and no query is ever its
+# own neighbour.
+first_query = nrow(X) - query_rows + 1;
+reference = X[1:reference_rows, ];
+labels = y[1:reference_rows, ];
+queries = X[first_query:nrow(X), ];
+query_labels = y[first_query:nrow(X), ];
+
+[predictions, votes] = knn_impl::m_knn_classify(
+  reference=reference, labels=labels, queries=queries, k=k);
+
+write(predictions, $6, format="binary");
+print("reference_rows=" + reference_rows);
+print("vote_sum=" + sum(votes));
+print("accuracy=" + (sum(predictions == query_labels) / query_rows));

@@ -1,0 +1,20 @@
+#-------------------------------------------------------------
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0.
+#-------------------------------------------------------------
+
+source("connected_components/implementation.dml") as cc_impl;
+
+G = read($1);
+[C, iter] = cc_impl::m_components(G=G, maxi=as.integer($2), verbose=FALSE);
+
+write(C, $3, format="binary");
+
+# A vertex whose label equals its own id is the maximum of its component, so counting
+# them counts components without a second pass over G.
+components = sum(C == seq(1, nrow(G)));
+print("iterations=" + iter);
+print("components=" + components);
+print("label_sum=" + sum(C));

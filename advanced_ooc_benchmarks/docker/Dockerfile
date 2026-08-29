@@ -63,12 +63,12 @@ RUN if getent passwd ${BENCH_UID} >/dev/null; then \
     && mkdir -p /var/lib/systemd/linger \
     && touch /var/lib/systemd/linger/${BENCH_USER}
 
-# Baseline Python stack. pyyaml is required by benchmark_plan.py itself, which
-# runs under the plan's configured `tools.python`.
+# Baseline Python stack. The requirements file carries pyyaml because
+# benchmark_plan.py itself runs under the plan's configured `tools.python`.
 COPY requirements-baselines.txt /tmp/requirements-baselines.txt
 RUN python3 -m venv /opt/bench-venv \
     && /opt/bench-venv/bin/pip install --no-cache-dir --upgrade pip wheel \
-    && /opt/bench-venv/bin/pip install --no-cache-dir pyyaml -r /tmp/requirements-baselines.txt \
+    && /opt/bench-venv/bin/pip install --no-cache-dir -r /tmp/requirements-baselines.txt \
     && if [ "${INSTALL_SPARK}" = "true" ]; then \
          /opt/bench-venv/bin/pip install --no-cache-dir "pyspark==${PYSPARK_VERSION}"; \
        fi \

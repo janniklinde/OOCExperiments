@@ -31,6 +31,15 @@ services:
       - ${BENCH_DATA_DIR:-./data}:/bench/data:rw
       # A prebuilt SystemDS.jar; the image deliberately does not build SystemDS.
       - ${SYSTEMDS_JAR:-../../../systemds/target/SystemDS.jar}:/opt/systemds/SystemDS.jar:ro
+      # Its dependencies. The jar's manifest carries `Class-Path: lib/...`, resolved
+      # relative to the jar, so `java -jar` fails with NoClassDefFoundError without
+      # this. The plan's preparation commands also symlink this directory into the
+      # SYSTEMDS_ROOT they build for each blocksize.
+      - ${SYSTEMDS_LIB_DIR:-../../../systemds/target/lib}:/opt/systemds/lib:ro
+      # The SystemDS Python bindings, which every dataset preparation script needs
+      # (`from systemds.context import SystemDSContext`). Writable because pip drops
+      # build metadata beside the sources it installs from.
+      - ${SYSTEMDS_PYTHON_DIR:-../../../systemds/src/main/python}:/opt/systemds/python:rw
     shm_size: ${SHM_SIZE:-2gb}
     # Do not set mem_limit: the profiles in the plan cap each run at 4/8/16 GB
     # inside their own scope, and an outer container limit would distort them.

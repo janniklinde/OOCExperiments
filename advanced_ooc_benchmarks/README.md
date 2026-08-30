@@ -13,6 +13,14 @@ from the raw memmaps without modifying the raw inputs.
 - `run_cgroup_baselines.sh`, `benchmark_plan.py`, `drop_caches.py`: all runner support required
   by the plan.
 - `setup.sh`: one-shot host preparation for the interpreter the plan names as `tools.python`.
+- `sync_remote.sh`: pushes this directory, plus the jar and `lib/` named by the plan's
+  `tools.systemds_jar`, to a remote host that runs the suite through `docker/bench.sh`.
+- `download_results_remote.sh`: pulls a finished sweep back from that host -- the newest
+  invocation directory and its driver log by default, `--all` for every one of them.
+- `io_probe.sh`: measures what a candidate data root actually delivers, at 1/4/16 concurrent
+  streams, with `O_DIRECT` so it needs neither root nor `drop_caches`. Run it before adopting a
+  new mount: storage bandwidth sets which engine wins, so it belongs in the record beside the
+  results.
 - `docker/`: a systemd-based container that runs `run_cgroup_baselines.sh` with no host setup
   beyond a mounted dataset root and a prebuilt `SystemDS.jar`. See `docker/README.md`;
   `cd docker && cp .env.example .env && ./bench.sh build && ./bench.sh run`.
@@ -399,9 +407,13 @@ cases instead of duplicating run declarations. The default plan includes an alig
 
 ```yaml
 resource_profiles:
+  mem100: {memory_max: 100G, java_heap: 75g, dask_memory_limit: 75GiB}
   mem16: {memory_max: 16G, java_heap: 12g, dask_memory_limit: 12GiB}
   mem8: {memory_max: 8G, java_heap: 6g, dask_memory_limit: 6GiB}
   mem4: {memory_max: 4G, java_heap: 3g, dask_memory_limit: 3GiB}
+
+resource_groups:
+  scaling: [mem16, mem8, mem4]
 
 dataset_groups:
   dense_scaling: [dense_d4, dense_d8, dense_d16]
@@ -414,19 +426,25 @@ parameter_cases:
 runs:
   - id: lmcg
     dataset: {group: dense_scaling}
-    resource_profiles: [mem16, mem8, mem4]
+    resource_profiles: {group: scaling}
     blocksize_sweeps: {ooc: [500], spark: [1000]}
     # Remaining workload fields are unchanged.
 ```
+
+A run selects profiles either inline (`resource_profiles: [mem16, mem4]`) or by naming a group, in
+the same `{group: ...}` form the dataset selection uses. The group form is what makes a host-wide
+change one edit: adding `mem100` to `resource_groups.scaling` gives every run that names the group
+an in-memory reference point, without touching any run. Groups are validated -- non-empty, and
+every member a defined profile -- even when no enabled run selects them.
 
 Expansion order is dataset, resource profile, parameter case, backend/blocksize, and repetition.
 For example, a run that also selects `parameter_cases: mlp_activation` can produce
 `mlp-dense_d8-mem4-act8-ooc-bs500`. A selected resource profile overrides matching keys in the
 run's `resources` mapping; unrelated run-specific settings such as its timeout remain in effect.
 Parameter cases similarly override matching keys in `parameters`. Scalar datasets and runs without
-these selectors retain their previous names and behavior. Dataset groups, profiles, parameter case
-IDs, duplicates, and all referenced datasets are validated even when the corresponding run is
-disabled.
+these selectors retain their previous names and behavior. Dataset groups, resource groups,
+profiles, parameter case IDs, duplicates, and all referenced datasets are validated even when the
+corresponding run is disabled.
 
 The current plan enables MultiLogReg, randomized SVD, GNMF, KMeans, PCA, LMCG, and L2-SVM. With
 `dense_scaling` and `gnmf_scaling` currently narrowed to their 16 GB members, three resource

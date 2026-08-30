@@ -64,7 +64,11 @@ RUN if getent passwd ${BENCH_UID} >/dev/null; then \
     && touch /var/lib/systemd/linger/${BENCH_USER}
 
 # Baseline Python stack. The requirements file carries pyyaml because
-# benchmark_plan.py itself runs under the plan's configured `tools.python`.
+# benchmark_plan.py itself runs under the plan's configured `tools.python`, and
+# py4j/pandas/requests because the SystemDS Python bindings need them. The
+# bindings themselves cannot be installed here -- they live in the SystemDS
+# checkout, outside this build context -- so they are mounted and installed on
+# first use by run-in-container.sh, which is why the venv ends up user-owned.
 COPY requirements-baselines.txt /tmp/requirements-baselines.txt
 RUN python3 -m venv /opt/bench-venv \
     && /opt/bench-venv/bin/pip install --no-cache-dir --upgrade pip wheel \
@@ -72,7 +76,8 @@ RUN python3 -m venv /opt/bench-venv \
     && if [ "${INSTALL_SPARK}" = "true" ]; then \
          /opt/bench-venv/bin/pip install --no-cache-dir "pyspark==${PYSPARK_VERSION}"; \
        fi \
-    && rm /tmp/requirements-baselines.txt
+    && rm /tmp/requirements-baselines.txt \
+    && chown -R ${BENCH_UID}:${BENCH_GID} /opt/bench-venv
 
 # Mount points: the repository, the benchmark data/results root, and the jar.
 RUN mkdir -p /workspace /bench/data /opt/systemds \

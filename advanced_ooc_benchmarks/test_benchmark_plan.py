@@ -164,6 +164,42 @@ class RunExpansionTest(unittest.TestCase):
         self.assertEqual(cases[0]["parameter_case"], "act4")
         self.assertEqual(source[0]["dataset"], {"group": "dense"})
 
+    def test_resource_group_expands_like_an_inline_profile_list(self):
+        source = [{"id": "workload", "resource_profiles": {"group": "scaling"}}]
+        profiles = {"mem100": {"memory_max": "100G"}, "mem4": {"memory_max": "4G"}}
+
+        grouped = benchmark_plan.expand_run_cases(
+            source, resource_profiles=profiles,
+            resource_groups={"scaling": ["mem100", "mem4"]})
+        inline = benchmark_plan.expand_run_cases(
+            [{"id": "workload", "resource_profiles": ["mem100", "mem4"]}],
+            resource_profiles=profiles)
+
+        self.assertEqual([case["id"] for case in grouped],
+                         ["workload-mem100", "workload-mem4"])
+        self.assertEqual([case["resources"] for case in grouped],
+                         [case["resources"] for case in inline])
+        # A profile added to the group must not require touching the run.
+        self.assertEqual(source[0]["resource_profiles"], {"group": "scaling"})
+
+    def test_unknown_or_malformed_resource_groups_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unknown resource group missing"):
+            benchmark_plan.expand_run_cases(
+                [{"id": "workload", "resource_profiles": {"group": "missing"}}],
+                resource_profiles={"mem4": {"memory_max": "4G"}},
+                resource_groups={"scaling": ["mem4"]})
+        with self.assertRaisesRegex(ValueError, "must contain only group"):
+            benchmark_plan.expand_run_cases(
+                [{"id": "workload", "resource_profiles": {"group": "scaling", "extra": 1}}],
+                resource_profiles={"mem4": {"memory_max": "4G"}},
+                resource_groups={"scaling": ["mem4"]})
+        with self.assertRaisesRegex(ValueError, "Resource group scaling must be a non-empty list"):
+            benchmark_plan.validate_named_definitions(
+                {}, {}, {"mem4": {"memory_max": "4G"}}, {}, {"scaling": []})
+        with self.assertRaisesRegex(ValueError, "unknown resource_profiles mem8"):
+            benchmark_plan.validate_named_definitions(
+                {}, {}, {"mem4": {"memory_max": "4G"}}, {}, {"scaling": ["mem8"]})
+
     def test_unknown_named_dimensions_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "unknown dataset group missing"):
             benchmark_plan.expand_run_cases([

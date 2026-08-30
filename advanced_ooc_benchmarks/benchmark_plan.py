@@ -566,6 +566,28 @@ def expand_dataset_cases(runs, dataset_groups=None):
     return cases
 
 
+def resource_profile_selection(run, resource_groups=None):
+    """Resolve a scalar/list resource_profiles selection or a named resource group.
+
+    The same `{group: name}` form the dataset selection uses, for the same reason: a
+    profile added to a group reaches every run that names the group, instead of every
+    run repeating the list.
+    """
+    value = run.get("resource_profiles")
+    if not isinstance(value, dict):
+        return value
+    if set(value) != {"group"}:
+        raise ValueError(f"Run {run.get('id', '')} resource_profiles mapping must contain only "
+                         "group")
+    group_id = str(value["group"])
+    if not _VALID_ID.match(group_id):
+        raise ValueError(f"Run {run.get('id', '')} has invalid resource group id {group_id!r}")
+    resource_groups = resource_groups or {}
+    if group_id not in resource_groups:
+        raise ValueError(f"Run {run.get('id', '')} refers to unknown resource group {group_id}")
+    return resource_groups[group_id]
+
+
 def selected_names(run, field, definitions):
     """Validate a scalar/list selection from a named top-level definition mapping."""
     value = run.get(field)
@@ -588,7 +610,7 @@ def selected_names(run, field, definitions):
     return selected
 
 
-def expand_resource_profile_cases(runs, resource_profiles=None):
+def expand_resource_profile_cases(runs, resource_profiles=None, resource_groups=None):
     """Expand named, correlated resource configurations such as cgroup/heap pairs."""
     resource_profiles = resource_profiles or {}
     cases = []
@@ -596,6 +618,9 @@ def expand_resource_profile_cases(runs, resource_profiles=None):
         if "resource_profiles" not in configured_run:
             cases.append(configured_run)
             continue
+        configured_run = copy.deepcopy(configured_run)
+        configured_run["resource_profiles"] = resource_profile_selection(
+            configured_run, resource_groups)
         for profile_id in selected_names(configured_run, "resource_profiles", resource_profiles):
             profile = resource_profiles[profile_id]
             if not isinstance(profile, dict):
@@ -666,12 +691,12 @@ def expand_parameter_cases(runs, parameter_cases=None):
 
 
 def expand_run_cases(runs, templates=None, dataset_groups=None, resource_profiles=None,
-                     parameter_cases=None):
+                     parameter_cases=None, resource_groups=None):
     """Expand datasets, resources, parameters, and backend-specific block sizes."""
     templates = templates or {}
     cases = []
     expanded = expand_dataset_cases(runs, dataset_groups)
-    expanded = expand_resource_profile_cases(expanded, resource_profiles)
+    expanded = expand_resource_profile_cases(expanded, resource_profiles, resource_groups)
     expanded = expand_parameter_cases(expanded, parameter_cases)
     for configured_run in expanded:
         sweeps = configured_run.get("blocksize_sweeps")
@@ -954,7 +979,8 @@ def resolve_implementation(implementation, templates):
     return resolved
 
 
-def validate_named_definitions(datasets, dataset_groups, resource_profiles, parameter_cases):
+def validate_named_definitions(datasets, dataset_groups, resource_profiles, parameter_cases,
+                               resource_groups=None):
     """Validate reusable definitions even when no enabled run currently selects them."""
     for group_id, values in dataset_groups.items():
         if not isinstance(values, list) or not values:
@@ -966,6 +992,14 @@ def validate_named_definitions(datasets, dataset_groups, resource_profiles, para
     for profile_id, values in resource_profiles.items():
         if not isinstance(values, dict):
             raise ValueError(f"Resource profile {profile_id} must be a mapping")
+    for group_id, values in (resource_groups or {}).items():
+        if not isinstance(values, list) or not values:
+            raise ValueError(f"Resource group {group_id} must be a non-empty list")
+        fake_run = {"id": f"resource-group-{group_id}", "resource_profiles": values}
+        for profile_id in selected_names(fake_run, "resource_profiles", resource_profiles):
+            if profile_id not in resource_profiles:
+                raise ValueError(f"Resource group {group_id} refers to unknown resource profile "
+                                 f"{profile_id}")
     for group_id, values in parameter_cases.items():
         if not isinstance(values, list) or not values:
             raise ValueError(f"Parameter case group {group_id} must be a non-empty list")
@@ -987,6 +1021,7 @@ def expanded_plan_manifest(plan, runs, invocation_id):
     manifest = copy.deepcopy(plan)
     manifest.pop("dataset_groups", None)
     manifest.pop("resource_profiles", None)
+    manifest.pop("resource_groups", None)
     manifest.pop("parameter_cases", None)
     templates = manifest.get("templates", {})
     concrete = []
@@ -1088,7 +1123,9 @@ def execute_plan(plan_path, validate_only=False):
     dataset_groups = named_mapping(plan, "dataset_groups")
     resource_profiles = named_mapping(plan, "resource_profiles")
     parameter_cases = named_mapping(plan, "parameter_cases")
-    validate_named_definitions(datasets, dataset_groups, resource_profiles, parameter_cases)
+    resource_groups = named_mapping(plan, "resource_groups")
+    validate_named_definitions(datasets, dataset_groups, resource_profiles, parameter_cases,
+                               resource_groups)
     configured_runs = plan.get("runs", [])
     for run in configured_runs:
         run_id = str(run.get("id", ""))
@@ -1097,12 +1134,16 @@ def execute_plan(plan_path, validate_only=False):
         for dataset_id in run_dataset_ids(run, dataset_groups):
             if dataset_id not in datasets:
                 raise ValueError(f"Run {run_id} refers to unknown dataset {dataset_id}")
+        if "resource_profiles" in run:
+            selected_names({"id": run_id,
+                            "resource_profiles": resource_profile_selection(run, resource_groups)},
+                           "resource_profiles", resource_profiles)
         if not run.get("implementations"):
             raise ValueError(f"Run {run_id} has no implementations")
         for implementation in run["implementations"]:
             resolve_implementation(implementation, templates)
     expanded_runs = expand_run_cases(configured_runs, templates, dataset_groups,
-                                     resource_profiles, parameter_cases)
+                                     resource_profiles, parameter_cases, resource_groups)
     enabled_runs = [run for run in expanded_runs if run.get("enabled", True) and any(
         resolve_implementation(implementation, templates).get("enabled", True)
         for implementation in run.get("implementations", []))]

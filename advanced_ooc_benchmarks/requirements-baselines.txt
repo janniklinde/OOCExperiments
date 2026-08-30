@@ -2,7 +2,10 @@ dask[array,distributed]
 joblib
 matplotlib
 numpy
+pandas
+py4j
 pyyaml
+requests
 scikit-learn
 scipy
 sparse

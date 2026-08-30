@@ -36,28 +36,11 @@ telemetry:
   interval_seconds: 3
 
 # Named profiles keep correlated cgroup and JVM settings together. A run may
-# select one or a list with `resource_profiles: {group: scaling}`.
+# select one or a list with `resource_profiles: [mem16, mem8, mem4]`.
 resource_profiles:
-  # java_heap is three quarters of the cgroup limit and the Dask limit matches it, so
-  # the two runtimes are given the same share of the budget rather than each taking
-  # its own default. Note that java_heap also caps the OOC tile budget through
-  # min(heap/9, 1 GiB), which is what bounds the usable blocksize; above a 9g heap
-  # that term saturates and blocksize stops depending on the profile.
-  mem100: {memory_max: 100G, java_heap: 75g, dask_memory_limit: 75GiB}
   mem16: {memory_max: 16G, java_heap: 12g, dask_memory_limit: 12GiB}
   mem8: {memory_max: 8G, java_heap: 6g, dask_memory_limit: 6GiB}
   mem4: {memory_max: 4G, java_heap: 3g, dask_memory_limit: 3GiB}
-
-# Named sets of profiles, selected by a run as `resource_profiles: {group: <name>}` --
-# the same form `dataset: {group: ...}` uses. Adding a profile here reaches every run
-# that names the group, instead of every run repeating the list.
-resource_groups:
-  # The shipped sweep: data:memory of 2x, 4x and 8x on the 32 GB datasets.
-  scaling: [mem16, mem8, mem4]
-  # Add the in-memory reference point on a host that has the RAM for it. At 100 GB
-  # every dataset here fits, so these cases measure what the out-of-core machinery
-  # costs when nothing needs to spill.
-  # scaling: [mem100, mem16, mem8, mem4]
 
 # Correlated algorithm parameters expand as named cases rather than as an
 # unrestricted Cartesian product. These activation sizes are exact GiB for
@@ -684,7 +667,7 @@ runs:
   - id: pagerank_3g
     enabled: false
     dataset: twitter_400k
-    resource_profiles: {group: scaling}
+    resource_profiles: [mem16, mem8, mem4]
     entrypoint: ${plan.dir}/pagerank/systemds.dml
     blocksize_sweeps: {ooc: [400000], spark: [400000]}
     parameters:
@@ -711,9 +694,9 @@ runs:
   - id: multilogreg_scaling
     enabled: true
     dataset: {group: dense_scaling}
-    resource_profiles: {group: scaling}
+    resource_profiles: [mem16, mem8, mem4]
     entrypoint: ${plan.dir}/multilogreg/systemds.dml
-    blocksize_sweeps: {ooc: [500, 1000], spark: [1000]}
+    blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
       # Row chunk for the prepared Zarr store: 95 MiB at 1000 columns, inside Dask's
       # ~100 MiB guidance, and an exact divisor of every dense dataset so no trailing
@@ -758,9 +741,9 @@ runs:
   - id: randomized_svd_scaling
     enabled: true
     dataset: {group: dense_scaling}
-    resource_profiles: {group: scaling}
+    resource_profiles: [mem16, mem8, mem4]
     entrypoint: ${plan.dir}/randomized_svd/systemds.dml
-    blocksize_sweeps: {ooc: [500, 1000], spark: [1000]}
+    blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
       # Row chunk for the prepared Zarr store: 95 MiB at 1000 columns, inside Dask's
       # ~100 MiB guidance, and an exact divisor of every dense dataset so no trailing
@@ -833,11 +816,11 @@ runs:
           --output "${run.outputs}/dask-r${rep}.json"
 
   - id: gnmf_scaling
-    enabled: false
+    enabled: true
     dataset: {group: gnmf_scaling}
-    resource_profiles: {group: scaling}
+    resource_profiles: [mem16, mem8, mem4]
     entrypoint: ${plan.dir}/gnmf/systemds.dml
-    blocksize_sweeps: {ooc: [500, 1000], spark: [1000]}
+    blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
       # Row chunk for the prepared Zarr store: 95 MiB at 1000 columns, inside Dask's
       # ~100 MiB guidance, and an exact divisor of every dense dataset so no trailing
@@ -912,9 +895,9 @@ runs:
   - id: kmeans_scaling
     enabled: true
     dataset: {group: dense_scaling}
-    resource_profiles: {group: scaling}
+    resource_profiles: [mem16, mem8, mem4]
     entrypoint: ${plan.dir}/kmeans/systemds.dml
-    blocksize_sweeps: {ooc: [500, 1000], spark: [1000]}
+    blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
       # Row chunk for the prepared Zarr store: 95 MiB at 1000 columns, inside Dask's
       # ~100 MiB guidance, and an exact divisor of every dense dataset so no trailing
@@ -953,9 +936,9 @@ runs:
   - id: pca_scaling
     enabled: true
     dataset: {group: dense_scaling}
-    resource_profiles: {group: scaling}
+    resource_profiles: [mem16, mem8, mem4]
     entrypoint: ${plan.dir}/pca/systemds.dml
-    blocksize_sweeps: {ooc: [500, 1000], spark: [1000]}
+    blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
       # Row chunk for the prepared Zarr store: 95 MiB at 1000 columns, inside Dask's
       # ~100 MiB guidance, and an exact divisor of every dense dataset so no trailing
@@ -991,9 +974,9 @@ runs:
   - id: lmcg_scaling
     enabled: true
     dataset: {group: dense_scaling}
-    resource_profiles: {group: scaling}
+    resource_profiles: [mem16, mem8, mem4]
     entrypoint: ${plan.dir}/lmcg/systemds.dml
-    blocksize_sweeps: {ooc: [500, 1000], spark: [1000]}
+    blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
       # Row chunk for the prepared Zarr store: 95 MiB at 1000 columns, inside Dask's
       # ~100 MiB guidance, and an exact divisor of every dense dataset so no trailing
@@ -1032,7 +1015,7 @@ runs:
   - id: connected_components_scaling
     enabled: false
     dataset: {group: cc_scaling}
-    resource_profiles: {group: scaling}
+    resource_profiles: [mem16, mem8, mem4]
     entrypoint: ${plan.dir}/connected_components/systemds.dml
     # 2,500, not the 500 the dense workloads use. SystemDS budgets an OOC tile as if it were
     # dense, so a sparse graph at blocksize 500 would put 2.3 nonzeros in each of 1.2 billion
@@ -1090,7 +1073,7 @@ runs:
   - id: random_features_scaling
     enabled: false
     dataset: rf_1m
-    resource_profiles: {group: scaling}
+    resource_profiles: [mem16, mem8, mem4]
     parameter_cases: rf_width
     entrypoint: ${plan.dir}/random_features/systemds.dml
     blocksize_sweeps: {ooc: [500], spark: [1000]}
@@ -1144,7 +1127,7 @@ runs:
   - id: knn_scaling
     enabled: false
     dataset: knn_200k
-    resource_profiles: {group: scaling}
+    resource_profiles: [mem16, mem8, mem4]
     parameter_cases: knn_reference
     entrypoint: ${plan.dir}/knn/systemds.dml
     blocksize_sweeps: {ooc: [500], spark: [1000]}
@@ -1183,9 +1166,9 @@ runs:
   - id: l2svm_scaling
     enabled: true
     dataset: {group: dense_scaling}
-    resource_profiles: {group: scaling}
+    resource_profiles: [mem16, mem8, mem4]
     entrypoint: ${plan.dir}/l2svm/systemds.dml
-    blocksize_sweeps: {ooc: [500, 1000], spark: [1000]}
+    blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
       # Row chunk for the prepared Zarr store: 95 MiB at 1000 columns, inside Dask's
       # ~100 MiB guidance, and an exact divisor of every dense dataset so no trailing
@@ -1261,7 +1244,7 @@ runs:
   - id: als_3g
     enabled: false
     dataset: als_1m
-    resource_profiles: {group: scaling}
+    resource_profiles: [mem16, mem8, mem4]
     entrypoint: ${plan.dir}/als/systemds.dml
     blocksize_sweeps: {ooc: [8000], spark: [8000]}
     parameters:

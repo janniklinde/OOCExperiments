@@ -31,6 +31,20 @@ if ! grep -qw io "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).se
   echo "warning: the io controller is not delegated to the user manager; I/O byte metrics will be missing" >&2
 fi
 
+# Dataset preparation imports `systemds`, which the image cannot install because the
+# bindings live in the SystemDS checkout rather than the build context. Installing
+# from the mounted sources keeps the binding and the jar from drifting apart.
+# --no-deps because py4j/pandas/requests are already in the image, so this needs no
+# network and cannot resolve a different numpy underneath the baselines.
+if ! "$python" -c "import systemds" >/dev/null 2>&1; then
+  bindings="${BENCH_CONTAINER_BINDINGS:-/opt/systemds/python}"
+  [[ -f "$bindings/setup.py" ]] || fail \
+    "no SystemDS Python bindings at $bindings; mount the checkout's src/main/python there"
+  echo "installing the SystemDS Python bindings from $bindings" >&2
+  "$python" -m pip install --no-cache-dir --no-deps --quiet "$bindings" ||
+    fail "could not install the SystemDS Python bindings from $bindings"
+fi
+
 "$python" "$plan_dir/docker/make_container_plan.py" "$source_plan" -o "$container_plan"
 
 # Largest profile in the plan versus what the container may actually use.

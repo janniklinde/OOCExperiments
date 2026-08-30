@@ -13,3 +13,9 @@ experiments/**/DiskWriteEventLog.csv
 experiments/**/RunSettings.csv
 experiments/**/tmp/
 experiments/message_passing/
+bench-results/
+bench-data/
+# Container-rewritten benchmark plans and local docker settings
+advanced_ooc_benchmarks/*.container.yaml
+advanced_ooc_benchmarks/docker/.env
+results-remote/

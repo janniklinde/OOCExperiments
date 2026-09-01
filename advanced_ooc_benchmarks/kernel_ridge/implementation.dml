@@ -1,0 +1,63 @@
+#-------------------------------------------------------------
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0.
+#-------------------------------------------------------------
+
+# Exact kernel ridge regression with an RBF kernel, solved by conjugate gradient.
+#
+# The exact counterpart to random_features/. Random Fourier features exist
+# precisely to avoid the object this workload materialises: the n-by-n Gram
+# matrix. At n = 50,000 that is 20 GB built from a 51 MB input -- the widest
+# input-to-intermediate ratio in this suite, and the reason every textbook
+# treatment of kernel methods opens with the O(n^2) memory wall.
+#
+# What distinguishes this from knn/ is not the shape of the intermediate but the
+# access pattern. knn builds `distances` once and rewrites it k times. Here `K`
+# is loop-invariant and every conjugate-gradient iteration re-reads it in full,
+# so a `cg_iterations`-iteration solve streams cg_iterations * 8 * n^2 bytes
+# through whatever memory the engine has. That is the pattern that separates an
+# engine which keeps a disk-resident operand and re-streams it from one which
+# recomputes the operand on demand: the first pays n^2 bytes of reads per
+# iteration, the second pays 2*n^2*d flops per iteration to rebuild it.
+#
+# The kernel is built from the squared-distance identity rather than a pairwise
+# loop so the whole construction is one matrix product plus two rank-one
+# broadcasts, which every arm here can express and stream.
+
+m_krr_fit = function(Matrix[double] X, Matrix[double] y, Double gamma,
+    Double reg, Integer cg_iterations)
+  return (Matrix[double] alpha, Double residual_norm)
+{
+  n = nrow(X);
+  sq = rowSums(X ^ 2);
+
+  # Squared euclidean distances, then the RBF kernel. Unlike knn/ the query
+  # norms cannot be dropped: exp() is not monotone-invariant the way argmin is,
+  # so both broadcasts are required for the kernel to be correct.
+  sqdist = -2 * (X %*% t(X)) + sq + t(sq);
+  K = exp(-gamma * sqdist);
+
+  # Conjugate gradient on (K + reg*I) alpha = y. K is never modified, so the
+  # regulariser is applied to the vector inside the product rather than being
+  # added to the matrix -- adding it would rewrite all n^2 cells for n useful
+  # updates and would force a second full-size operand to exist.
+  alpha = matrix(0, rows = n, cols = 1);
+  r = y;
+  p = r;
+  rs = sum(r ^ 2);
+
+  for (i in 1:cg_iterations) {
+    Kp = K %*% p + reg * p;
+    denominator = sum(p * Kp);
+    step = rs / denominator;
+    alpha = alpha + step * p;
+    r = r - step * Kp;
+    rs_next = sum(r ^ 2);
+    p = r + (rs_next / rs) * p;
+    rs = rs_next;
+  }
+
+  residual_norm = sqrt(rs);
+}

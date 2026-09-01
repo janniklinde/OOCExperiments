@@ -1,0 +1,28 @@
+#-------------------------------------------------------------
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0.
+#-------------------------------------------------------------
+
+source("kernel_ridge/implementation.dml") as krr_impl;
+
+start = time();
+X_all = read($1);
+y_all = read($2);
+train_rows = $3;
+gamma = $4;
+reg = $5;
+cg_iterations = $6;
+
+X = X_all[1:train_rows, ];
+y = y_all[1:train_rows, ];
+
+[alpha, residual_norm] = krr_impl::m_krr_fit(
+  X = X, y = y, gamma = gamma, reg = reg, cg_iterations = cg_iterations);
+
+write(alpha, $7, format="binary");
+print("train_rows=" + train_rows);
+print("alpha_sum=" + sum(alpha));
+print("residual_norm=" + residual_norm);
+print("Total execution time: " + ((time()-start)/1000000));

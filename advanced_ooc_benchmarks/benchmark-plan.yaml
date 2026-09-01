@@ -83,11 +83,23 @@ parameter_cases:
     - {id: knn16, reference_rows: 80000}
     - {id: knn32, reference_rows: 160000}
 
-  mlp_activation:
-    - {id: act4, hidden_size: 8192}
-    - {id: act8, hidden_size: 16384}
-    - {id: act16, hidden_size: 32768}
-    - {id: act32, hidden_size: 65536}
+  # Hidden width sets the model, which at 16,384 features is 1.3 / 2.6 / 5.2 /
+  # 10.5 GB of first-layer weights -- 0.4x to 3.5x the mem4 profile's 3g heap.
+  # Nesterov SGD needs three of them live (weights, gradient, velocity), so the
+  # resident requirement is three times those figures. Capped at 80k: 160k would
+  # be 21 GB per copy and the scratch alone would exceed the suite's disk budget.
+  mlp_hidden:
+    - {id: h10, hidden_size: 10240}
+    - {id: h20, hidden_size: 20480}
+    - {id: h40, hidden_size: 40960}
+    - {id: h80, hidden_size: 81920}
+
+  # Training rows for the exact kernel solve. The Gram matrix is n^2 cells:
+  # 1.25 / 5.0 / 20.0 GB, built from at most 51 MB of input.
+  krr_size:
+    - {id: krr4, train_rows: 12500}
+    - {id: krr8, train_rows: 25000}
+    - {id: krr16, train_rows: 50000}
 
 templates:
   systemds-ooc:
@@ -345,13 +357,43 @@ datasets:
        distribution: uniform_nonnegative, seed: 204, generator_chunk_mib: 256,
        accept_legacy: false, systemds_chunk_mib: 128}
 
-  mlp_activation_64k:
+  # Wide-hidden-layer MLP. 2.15 GB of input against a first-layer model of up to
+  # 10.5 GB -- the one workload here where the object that does not fit is the
+  # *model*, not the data or an activation. That distinction is what makes it
+  # worth running: activation checkpointing, the technique the deep-learning
+  # stack standardised on for memory pressure, has nothing to recompute when the
+  # parameters are the problem, and sharding it across devices is unavailable on
+  # a single node. Jankov et al. (VLDB 2019) report TensorFlow crashing above
+  # 40,000 hidden units on a 60,000-feature input; the geometry here is scaled to
+  # a single-node disk budget but keeps the same ratio of model to memory.
+  #
+  # 16,384 columns rather than 60,000 because the model is D*H and three copies
+  # of it must be live: at D = 60,000 and H = 80,000 the scratch requirement
+  # alone would be 115 GB before any engine overhead.
+  mlp_wide:
     <<: *dense_dataset
-    directory: ${plan.root}/bench-data/mlp-activation-64k
+    directory: ${plan.root}/bench-data/mlp-wide
     parameters:
-      {rows: 65536, cols: 8, classes: 2, sparsity: 1.0,
-       distribution: normal, seed: 29, generator_chunk_mib: 64,
-       accept_legacy: false, systemds_chunk_mib: 64}
+      {rows: 16384, cols: 16384, classes: 2, sparsity: 1.0,
+       distribution: normal, seed: 29, generator_chunk_mib: 128,
+       accept_legacy: false, systemds_chunk_mib: 128}
+
+  # Exact kernel ridge regression. 51 MB of input, a Gram matrix of 1.25 / 5.0 /
+  # 20.0 GB at the three sizes in `krr_size` -- by far the widest input-to-
+  # intermediate ratio in the suite, and the reason random Fourier features
+  # (random_features/) exist at all. Running both makes the approximation and the
+  # exact method a matched pair rather than two unrelated workloads.
+  #
+  # 128 columns matches rf_1m so the two share a feature dimension, and keeps the
+  # kernel build traffic-dominated: 2*n^2*d flops against 8*n^2 bytes is 32 flops
+  # per byte, a quarter of knn's ratio at 512 columns.
+  krr_50k:
+    <<: *dense_dataset
+    directory: ${plan.root}/bench-data/krr-50k
+    parameters:
+      {rows: 50000, cols: 128, classes: 2, sparsity: 1.0,
+       distribution: normal, seed: 47, generator_chunk_mib: 128,
+       accept_legacy: false, systemds_chunk_mib: 128}
 
   randomforest_1m:
     directory: ${plan.root}/bench-data/randomforest
@@ -792,16 +834,35 @@ runs:
           --memory-limit ${resources.dask_memory_limit} --temporary-directory "${run.results}/dask-spill"
           --output "${run.outputs}/dask-r${rep}.json"
 
-  - id: mlp_3g
+  # Wide-hidden-layer MLP: the model is what does not fit.
+  #
+  # Both baselines were rewritten for this geometry. Holding W1 as an ordinary
+  # in-RAM array would have them fail on the first allocation, which measures
+  # nothing, so numpy/ keeps the weights, gradient and velocity in np.memmap and
+  # dask_array/ double-buffers them through Zarr stores. Those are the strongest
+  # single-node formulations available without a training framework, which is
+  # what makes the comparison one of I/O efficiency rather than of allocation
+  # strategy.
+  #
+  # One epoch of 16 batches. The claim is about model scale, not convergence;
+  # raise `rows` for a longer run at 1.0 GB of raw input per 8,192 rows.
+  - id: mlp_wide_scaling
     enabled: false
-    dataset: mlp_activation_64k
+    dataset: mlp_wide
+    resource_profiles: {group: scaling}
+    parameter_cases: mlp_hidden
     entrypoint: ${plan.dir}/mlp/systemds.dml
     blocksize_sweeps: {ooc: [500], spark: [1000]}
     parameters:
-      dask_chunk: 8192   # divides the 65,536-row activation input exactly; this run has no Dask arm today
+      # 512 rows is 67 MB at 16,384 columns and divides the dataset exactly,
+      # giving 32 chunks. Sized on the input rather than the activation because
+      # at these hidden widths the activation is chunked on its own axis.
+      dask_chunk: 512
+      # Column chunk for the (D, H) parameter stores: 2,048 columns is 268 MB at
+      # 16,384 rows and divides every width in `mlp_hidden`.
+      hidden_chunk: 2048
       epochs: 1
-      batch_size: 65536
-      hidden_size: 9216
+      batch_size: 1024
       learning_rate: 0.003
       seed: 7
       systemds_args: >-
@@ -809,7 +870,7 @@ runs:
         ${run.learning_rate} ${run.seed} ${run.hidden_size}
         "${run.outputs}/systemds-W1-r${rep}" "${run.outputs}/systemds-W2-r${rep}"
     inputs: {X: {artifact: X}, y: {artifact: nn_y}}
-    resources: {memory_max: 4G, java_heap: 3g, timeout_seconds: 600}
+    resources: {timeout_seconds: 3600}
     setup: *systemds_setup
     cold_cache: ["${dataset.dir}"]
     implementations:
@@ -827,7 +888,60 @@ runs:
         command: >-
           "${tools.python}" "${plan.dir}/mlp/dask_array.py" "${dataset.dir}"
           --epochs ${run.epochs} --batch-size ${run.batch_size}
-          --hidden-size ${run.hidden_size} --learning-rate ${run.learning_rate} --seed ${run.seed}
+          --hidden-size ${run.hidden_size} --hidden-chunk ${run.hidden_chunk}
+          --learning-rate ${run.learning_rate} --seed ${run.seed}
+          --threads ${resources.dask_threads}
+          --memory-limit ${resources.dask_memory_limit} --temporary-directory "${run.results}/dask-spill"
+          --output "${run.outputs}/dask-r${rep}.json"
+
+  # Exact kernel ridge regression: the intermediate is revisited, not consumed.
+  #
+  # knn/ builds its distance matrix once and rewrites it k times. Here the Gram
+  # matrix is loop-invariant and every one of the 20 CG iterations re-reads it in
+  # full -- 400 GB of traffic at krr16 against a 51 MB input. That is the pattern
+  # that separates an engine which keeps a disk-resident operand from one which
+  # recomputes it on demand, and both baselines expose the choice explicitly so
+  # the gap is measured rather than assumed.
+  - id: kernel_ridge_scaling
+    enabled: false
+    dataset: krr_50k
+    resource_profiles: {group: scaling}
+    parameter_cases: krr_size
+    entrypoint: ${plan.dir}/kernel_ridge/systemds.dml
+    blocksize_sweeps: {ooc: [500], spark: [1000]}
+    parameters:
+      # 2,500 rows is 2.6 MB of input but 50 MB of Gram matrix once squared onto
+      # the columns, and divides all three sizes in `krr_size` exactly.
+      dask_chunk: 2500
+      gamma: 0.01
+      reg: 1.0
+      cg_iterations: 20
+      systemds_args: >-
+        -args "${input.X}" "${input.nn_y}" ${run.train_rows} ${run.gamma}
+        ${run.reg} ${run.cg_iterations} "${run.outputs}/systemds-alpha-r${rep}"
+    inputs: {X: {artifact: X}, nn_y: {artifact: nn_y}}
+    resources: {timeout_seconds: 3600}
+    setup: *systemds_setup
+    cold_cache: ["${dataset.dir}"]
+    implementations:
+      - {id: systemds-ooc, template: systemds-ooc}
+      - {id: systemds-spark, template: systemds-spark}
+      # In-RAM Gram matrix, which is what sklearn.kernel_ridge builds and what
+      # knn/numpy.py does. Expected to be OOM-killed above the profile's limit;
+      # add --kernel-memmap for the disk-backed formulation and report the
+      # stronger of the two.
+      - id: numpy-kernel-ridge
+        template: python
+        command: >-
+          "${tools.python}" "${plan.dir}/kernel_ridge/numpy.py" "${dataset.dir}"
+          --train-rows ${run.train_rows} --gamma ${run.gamma} --reg ${run.reg}
+          --cg-iterations ${run.cg_iterations} --output "${run.outputs}/numpy-r${rep}.json"
+      - id: dask-kernel-ridge
+        template: dask
+        command: >-
+          "${tools.python}" "${plan.dir}/kernel_ridge/dask_array.py" "${dataset.dir}"
+          --train-rows ${run.train_rows} --gamma ${run.gamma} --reg ${run.reg}
+          --cg-iterations ${run.cg_iterations} --chunk-rows ${run.dask_chunk}
           --threads ${resources.dask_threads}
           --memory-limit ${resources.dask_memory_limit} --temporary-directory "${run.results}/dask-spill"
           --output "${run.outputs}/dask-r${rep}.json"

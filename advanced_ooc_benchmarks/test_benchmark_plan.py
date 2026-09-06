@@ -4,9 +4,14 @@
 # this work for additional information regarding copyright ownership.
 # The ASF licenses this file to You under the Apache License, Version 2.0.
 
+import contextlib
+import io
 import json
+import os
+import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -454,3 +459,218 @@ class ScopeRunnerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PreparationTimeoutTest(unittest.TestCase):
+    def test_timeout_kills_the_whole_process_group(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            pid_file = directory / "child.pid"
+            command = f"sleep 60 & echo $! > '{pid_file}'; sleep 60"
+
+            with self.assertRaises(subprocess.TimeoutExpired):
+                benchmark_plan.command_run(command, directory, dict(os.environ),
+                                           directory / "run.log", timeout=1)
+
+            # bash -lc dies on its own, so the grandchild is the thing worth asserting.
+            child = int(pid_file.read_text().strip())
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                try:
+                    os.kill(child, 0)
+                except ProcessLookupError:
+                    return
+                time.sleep(0.1)
+            self.fail(f"process {child} survived the timeout")
+
+    def test_dataset_preparation_reports_the_timeout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            dataset = {
+                "ready": ["metadata.json"],
+                "prepare": {"policy": "auto", "command": "sleep 60", "timeout_seconds": 1},
+            }
+            context = {"plan.root": str(directory)}
+
+            with self.assertRaisesRegex(RuntimeError, "exceeded 1s and was killed"):
+                benchmark_plan.prepare_dataset("dense", dataset, context, directory, {})
+
+
+class ImplementationSelectionTest(unittest.TestCase):
+    """--implementation narrows the arms so a smoke test need not run the comparison."""
+
+    def _plan(self, directory):
+        plan = {
+            "version": 1, "root": str(directory),
+            "datasets": {"dense": {"ready": ["metadata.json"]}},
+            "templates": {"python": {"command": "true"}},
+            "runs": [
+                {"id": "lmcg", "dataset": "dense", "entrypoint": "x.dml",
+                 "implementations": [{"id": "systemds-ooc", "template": "python"},
+                                     {"id": "systemds-cp", "template": "python"},
+                                     {"id": "numpy-cg", "template": "python"}]},
+                {"id": "kmeans", "dataset": "dense", "entrypoint": "x.dml",
+                 "implementations": [{"id": "numpy-lloyd", "template": "python"}]},
+            ],
+        }
+        path = directory / "plan.yaml"
+        path.write_text(json.dumps(plan))
+        return path
+
+    def _select(self, plan, patterns):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            benchmark_plan.execute_plan(plan, validate_only=True, implementations=patterns)
+        return output.getvalue()
+
+    def test_a_single_arm_drops_the_cases_without_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            plan = self._plan(Path(temporary))
+            output = self._select(plan, ["systemds-ooc"])
+            # kmeans has no systemds-ooc arm, so only lmcg survives.
+            self.assertIn("1 enabled run case", output)
+
+    def test_a_glob_keeps_every_matching_arm(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            plan = self._plan(Path(temporary))
+            output = self._select(plan, ["numpy-*"])
+            self.assertIn("2 enabled run case", output)
+
+    def test_an_unmatched_arm_is_an_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            plan = self._plan(Path(temporary))
+            with self.assertRaises(ValueError) as raised:
+                benchmark_plan.execute_plan(plan, validate_only=True,
+                                            implementations=["dask-cg"])
+            self.assertIn("No enabled implementation matches", str(raised.exception))
+
+    def test_it_composes_with_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            plan = self._plan(Path(temporary))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                benchmark_plan.execute_plan(plan, validate_only=True, only=["lmcg"],
+                                            implementations=["systemds-*"])
+            self.assertIn("1 enabled run case", output.getvalue())
+
+
+class RunSelectionTest(unittest.TestCase):
+    def _plan(self, directory):
+        plan = {
+            "version": 1, "root": str(directory),
+            "datasets": {"dense": {"ready": ["metadata.json"]}},
+            "templates": {"python": {"command": "true"}},
+            "runs": [
+                {"id": "lmcg_scaling", "dataset": "dense", "entrypoint": "x.dml",
+                 "implementations": [{"id": "numpy", "template": "python"}]},
+                {"id": "kmeans_scaling", "dataset": "dense", "entrypoint": "x.dml",
+                 "implementations": [{"id": "numpy", "template": "python"}]},
+            ],
+        }
+        path = directory / "plan.yaml"
+        path.write_text(json.dumps(plan))
+        return path
+
+    def test_only_selects_a_subset(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            plan = self._plan(Path(temporary))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                benchmark_plan.execute_plan(plan, validate_only=True, only=["lmcg_scaling"])
+            self.assertIn("1 enabled run case", output.getvalue())
+
+    def test_only_accepts_a_glob(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            plan = self._plan(Path(temporary))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                benchmark_plan.execute_plan(plan, validate_only=True, only=["*_scaling"])
+            self.assertIn("2 enabled run cases", output.getvalue())
+
+    def test_unmatched_selection_is_an_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            plan = self._plan(Path(temporary))
+            with self.assertRaisesRegex(ValueError, "No enabled run case matches"):
+                benchmark_plan.execute_plan(plan, validate_only=True, only=["pca_scaling"])
+
+
+class SkipVariantsTest(unittest.TestCase):
+    def test_base_dataset_is_staged_without_its_variants(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            plan = {
+                "version": 1, "root": str(directory), "results": str(directory / "out"),
+                "datasets": {"dense": {
+                    "directory": str(directory / "dense"),
+                    "ready": ["metadata.json"],
+                    "artifacts": {"X_raw": {"path": "X.f64"}},
+                    "prepare": {"policy": "auto", "command":
+                                "mkdir -p '${dataset.dir}'; touch '${dataset.dir}/X.f64'; "
+                                "printf '{}' > '${dataset.dir}/metadata.json'"},
+                    "variants": {"blocksize": {
+                        "artifacts": {"X": {"path": "X-bs${run.blocksize}"}},
+                        "prepare": {"policy": "auto",
+                                    "command": "touch '${dataset.dir}/X-bs${run.blocksize}'"},
+                    }},
+                }},
+                "templates": {"python": {"command": "true"}},
+                "runs": [{"id": "lmcg", "dataset": "dense", "entrypoint": "x.dml",
+                          "parameters": {"blocksize": 1000},
+                          "implementations": [{"id": "numpy", "template": "python"}]}],
+            }
+            path = directory / "plan.yaml"
+            path.write_text(json.dumps(plan))
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                benchmark_plan.execute_plan(path, prepare_only=True, skip_variants=True)
+            self.assertTrue((directory / "dense" / "X.f64").exists())
+            self.assertFalse((directory / "dense" / "X-bs1000").exists())
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                benchmark_plan.execute_plan(path, prepare_only=True)
+            self.assertTrue((directory / "dense" / "X-bs1000").exists())
+
+
+class PrepareKeepGoingTest(unittest.TestCase):
+    def _plan(self, directory):
+        def dataset(name, command):
+            return {"directory": str(directory / name), "ready": ["metadata.json"],
+                    "prepare": {"policy": "auto", "command": command}}
+        plan = {
+            "version": 1, "root": str(directory), "results": str(directory / "out"),
+            "datasets": {
+                "broken": dataset("broken", "definitely-not-a-command"),
+                "fine": dataset("fine",
+                                "mkdir -p '${dataset.dir}'; printf '{}' > '${dataset.dir}/metadata.json'"),
+            },
+            "templates": {"python": {"command": "true"}},
+            "runs": [{"id": name, "dataset": name, "entrypoint": "x.dml",
+                      "implementations": [{"id": "numpy", "template": "python"}]}
+                     for name in ("broken", "fine")],
+        }
+        path = directory / "plan.yaml"
+        path.write_text(json.dumps(plan))
+        return path
+
+    def test_a_failing_dataset_does_not_block_the_others(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                rc = benchmark_plan.execute_plan(self._plan(directory), prepare_only=True)
+
+            self.assertEqual(rc, 1)  # non-zero, so a wrapper still sees the failure
+            self.assertTrue((directory / "fine" / "metadata.json").exists())
+            self.assertIn("FAILED broken", output.getvalue())
+            self.assertIn("Prepared 1 of 2 datasets", output.getvalue())
+
+    @unittest.skipUnless(
+        shutil.which("systemd-run") and subprocess.run(
+            ["systemctl", "--user", "status"], stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL).returncode == 0,
+        "a real run needs a user systemd manager before it reaches preparation")
+    def test_a_real_run_still_fails_fast(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            with self.assertRaisesRegex(RuntimeError, "Generator for broken failed"):
+                benchmark_plan.execute_plan(self._plan(directory))

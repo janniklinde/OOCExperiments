@@ -96,8 +96,12 @@ manager. Containers are not under `user@.service` at all, so also recreate the c
 (`./bench.sh down && ./bench.sh up`) and, if the root hierarchy gained the controller,
 restart the docker daemon. Re-run `./bench.sh preflight` to confirm rather than assuming.
 
-Note that `drop_caches` cannot be fixed by privilege: `drop_caches.py` gates on write access from
-the unprivileged runner, so making the file root-writable changes nothing. `io.pressure` is
+The `drop_caches` warning is fixed by the image, not by the host: the container is privileged, so
+`/proc/sys/vm` is writable by root, but the runner is an unprivileged uid and the file is mode 0200.
+The image therefore installs `/usr/local/bin/bench-drop-caches` with a NOPASSWD sudoers rule for the
+benchmark user, and both `drop_caches.py` and this preflight prefer it over the fallback. An image
+built before that was added still warns; `./bench.sh down && ./bench.sh build && ./bench.sh up`
+clears it. Remember the drop is **host-wide**. `io.pressure` is
 unaffected by any of this -- PSI files exist in every v2 cgroup regardless of controller
 delegation -- so the "fraction of wall time stalled on I/O" metric survives even the worst case.
 

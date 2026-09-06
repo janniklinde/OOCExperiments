@@ -3,11 +3,20 @@
 # the preconditions the runner cannot recover from, then hand over to
 # run_cgroup_baselines.sh. Runs as the unprivileged benchmark user.
 #
-# Usage: run-in-container.sh [SOURCE_PLAN]
+# Usage: run-in-container.sh [SOURCE_PLAN] [BENCHMARK_PLAN_ARGS...]
+#
+# Arguments after the plan reach benchmark_plan.py unchanged, so the container can
+# stage data (--prepare-only, --skip-variants) or run a subset (--only for run cases,
+# --implementation for single arms) rather than only ever executing the whole sweep.
 set -euo pipefail
 
 plan_dir="${BENCH_PLAN_DIR:-/workspace/advanced_ooc_benchmarks}"
-source_plan="${1:-${BENCHMARK_SOURCE_PLAN:-$plan_dir/benchmark-plan.yaml}}"
+# A leading option is not a plan path: keep the default plan and forward it instead.
+if [[ $# -gt 0 && "$1" != -* ]]; then
+  source_plan="$1"; shift
+else
+  source_plan="${BENCHMARK_SOURCE_PLAN:-$plan_dir/benchmark-plan.yaml}"
+fi
 container_plan="${BENCHMARK_PLAN:-$plan_dir/benchmark-plan.container.yaml}"
 python="${BENCH_CONTAINER_PYTHON:-/opt/bench-venv/bin/python}"
 jar="${BENCH_CONTAINER_JAR:-/opt/systemds/SystemDS.jar}"
@@ -55,4 +64,4 @@ fi
 
 export BENCHMARK_PLAN="$container_plan"
 export BENCHMARK_PLAN_PYTHON="$python"
-exec "$plan_dir/run_cgroup_baselines.sh"
+exec "$plan_dir/run_cgroup_baselines.sh" "$@"

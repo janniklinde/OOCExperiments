@@ -11,18 +11,26 @@
 #   ./bench.sh shell            interactive shell as the benchmark user
 #   ./bench.sh logs             follow container logs
 #   ./bench.sh down             stop and remove the container
+#
+# BENCH_DOCKER overrides the docker CLI for every call (e.g. "sudo docker" where the
+# benchmark user is not in the docker group); BENCH_COMPOSE overrides only compose.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 service=bench
 container="${BENCH_CONTAINER_NAME:-advanced-ooc-benchmarks}"
 
+# The docker CLI itself. Set BENCH_DOCKER to route every invocation - compose and
+# exec alike - through something else, e.g. "sudo docker" on a host where the
+# benchmark user is not in the docker group.
+read -r -a docker_cmd <<< "${BENCH_DOCKER:-docker}"
+
 # Compose V2 as a docker plugin, or the standalone V1 binary. Set BENCH_COMPOSE to
 # override (e.g. "sudo docker compose").
 if [[ -n "${BENCH_COMPOSE:-}" ]]; then
   read -r -a compose <<< "$BENCH_COMPOSE"
-elif docker compose version >/dev/null 2>&1; then
-  compose=(docker compose)
+elif "${docker_cmd[@]}" compose version >/dev/null 2>&1; then
+  compose=("${docker_cmd[@]}" compose)
 elif command -v docker-compose >/dev/null 2>&1; then
   compose=(docker-compose)
 else
@@ -53,16 +61,16 @@ start() {
   # systemd needs a moment to reach the user manager; linger starts it at boot,
   # and starting it explicitly is idempotent if logind has not yet done so.
   for _ in $(seq 60); do
-    if docker exec "$container" systemctl is-system-running --wait >/dev/null 2>&1 ||
-       docker exec "$container" systemctl is-system-running 2>/dev/null |
+    if "${docker_cmd[@]}" exec "$container" systemctl is-system-running --wait >/dev/null 2>&1 ||
+       "${docker_cmd[@]}" exec "$container" systemctl is-system-running 2>/dev/null |
          grep -qE 'running|degraded'; then
       break
     fi
     sleep 1
   done
-  docker exec -u root "$container" systemctl start "user@${uid}.service"
+  "${docker_cmd[@]}" exec -u root "$container" systemctl start "user@${uid}.service"
   for _ in $(seq 30); do
-    if docker exec -u "$uid" "${user_env[@]}" "$container" systemctl --user status >/dev/null 2>&1; then
+    if "${docker_cmd[@]}" exec -u "$uid" "${user_env[@]}" "$container" systemctl --user status >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
@@ -77,7 +85,7 @@ case "${1:-}" in
   run)
     shift
     start
-    docker exec "${tty_flags[@]}" -u "$uid" "${user_env[@]}" "$container" "$entry" "$@"
+    "${docker_cmd[@]}" exec "${tty_flags[@]}" -u "$uid" "${user_env[@]}" "$container" "$entry" "$@"
     ;;
   run-detached)
     # The exec is owned by the docker daemon, so the sweep survives the ssh session
@@ -90,31 +98,31 @@ case "${1:-}" in
     log="$log_dir/run-$stamp.log"
     quoted="$entry"
     for argument in "$@"; do quoted+=" $(printf '%q' "$argument")"; done
-    docker exec -d -u "$uid" "${user_env[@]}" "$container" \
+    "${docker_cmd[@]}" exec -d -u "$uid" "${user_env[@]}" "$container" \
       bash -c "mkdir -p $log_dir && exec $quoted >> $log 2>&1"
     echo "started in the background; log: \$BENCH_DATA_DIR/bench-results/run-$stamp.log"
     echo "follow it with: $0 tail"
     ;;
   tail)
     shift
-    docker exec "${tty_flags[@]}" -u "$uid" "$container" \
+    "${docker_cmd[@]}" exec "${tty_flags[@]}" -u "$uid" "$container" \
       bash -c "tail -n \${1:-40} -f \$(ls -t $log_dir/run-*.log | head -1)" "$@"
     ;;
   preflight)
     start
-    docker exec "${tty_flags[@]}" -u "$uid" "${user_env[@]}" "$container" \
+    "${docker_cmd[@]}" exec "${tty_flags[@]}" -u "$uid" "${user_env[@]}" "$container" \
       /workspace/advanced_ooc_benchmarks/docker/preflight.sh
     ;;
   status)
-    if docker exec -u "$uid" "$container" pgrep -af benchmark_plan.py >/dev/null 2>&1; then
-      docker exec -u "$uid" "$container" pgrep -af benchmark_plan.py
+    if "${docker_cmd[@]}" exec -u "$uid" "$container" pgrep -af benchmark_plan.py >/dev/null 2>&1; then
+      "${docker_cmd[@]}" exec -u "$uid" "$container" pgrep -af benchmark_plan.py
     else
       echo "no benchmark run in progress"
     fi
     ;;
   shell)
     start
-    docker exec -it -u "$uid" "${user_env[@]}" -w /workspace/advanced_ooc_benchmarks \
+    "${docker_cmd[@]}" exec -it -u "$uid" "${user_env[@]}" -w /workspace/advanced_ooc_benchmarks \
       "$container" bash -l
     ;;
   logs) shift; run_compose logs -f "$@" ;;

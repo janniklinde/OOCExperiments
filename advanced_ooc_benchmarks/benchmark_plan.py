@@ -10,12 +10,14 @@ import argparse
 import copy
 import csv
 from datetime import datetime
+import fnmatch
 import hashlib
 import json
 import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -284,11 +286,32 @@ def expand_map(values, context):
     return {str(key): expand(str(value), context) for key, value in (values or {}).items()}
 
 
-def command_run(command, cwd, env, log=None):
+def command_run(command, cwd, env, log=None, timeout=None):
+    """Run a trusted plan command, optionally bounded by a timeout.
+
+    A timeout raises subprocess.TimeoutExpired. Commands run in their own session so
+    that expiry can signal the whole process group: `bash -lc` would otherwise die and
+    leave the generator it spawned running against the dataset directory.
+    """
     output = None if log is None else open(log, "w", encoding="utf-8")
     try:
-        return subprocess.run(["bash", "-lc", command], cwd=cwd, env=env,
-                              stdout=output, stderr=subprocess.STDOUT).returncode
+        process = subprocess.Popen(["bash", "-lc", command], cwd=cwd, env=env,
+                                   stdout=output, stderr=subprocess.STDOUT,
+                                   start_new_session=True)
+        try:
+            return process.wait(timeout=timeout or None)
+        except subprocess.TimeoutExpired:
+            for number in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(process.pid, number)
+                except ProcessLookupError:
+                    break
+                try:
+                    process.wait(timeout=30)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            raise
     finally:
         if output:
             output.close()
@@ -395,7 +418,7 @@ def remove_preparation_outputs(dataset, directory, context):
             path.unlink()
 
 
-def prepare_dataset(dataset_id, dataset, base_context, plan_dir, global_env):
+def prepare_dataset(dataset_id, dataset, base_context, plan_dir, global_env, timeout=None):
     if not _VALID_ID.match(dataset_id):
         raise ValueError(f"Invalid dataset id {dataset_id!r}")
     parameters = dataset.get("parameters", {})
@@ -439,8 +462,13 @@ def prepare_dataset(dataset_id, dataset, base_context, plan_dir, global_env):
     env = dict(global_env)
     env.update(expand_map(preparation.get("env"), context))
     prep_log = directory / "prepare.log"
+    timeout = preparation.get("timeout_seconds", timeout)
     print(f"Preparing {dataset_id} in {directory}; follow {prep_log} for progress.", file=sys.stderr)
-    rc = command_run(command, plan_dir, env, prep_log)
+    try:
+        rc = command_run(command, plan_dir, env, prep_log, timeout)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"Generator for {dataset_id} exceeded {timeout}s and was killed; "
+                           f"see {prep_log}") from error
     if rc:
         raise RuntimeError(f"Generator for {dataset_id} failed ({rc}); see {prep_log}")
     problems = dataset_status(dataset, directory, context)
@@ -450,7 +478,7 @@ def prepare_dataset(dataset_id, dataset, base_context, plan_dir, global_env):
 
 
 def prepare_dataset_variant(dataset_id, variant_id, variant, directory, context,
-                            plan_dir, global_env):
+                            plan_dir, global_env, timeout=None):
     """Ensure run-specific dataset artifacts, such as a native blocksize, exist."""
     problems = dataset_status(variant, directory, context)
     if not problems:
@@ -486,9 +514,14 @@ def prepare_dataset_variant(dataset_id, variant_id, variant, directory, context,
     env.update(expand_map(preparation.get("env"), context))
     value = context[f"run.{variant_id}"]
     prep_log = directory / f"prepare-{variant_id}-{value}.log"
+    timeout = preparation.get("timeout_seconds", timeout)
     print(f"Preparing dataset variant {description} in {directory}; follow {prep_log} for progress.",
           file=sys.stderr)
-    rc = command_run(command, plan_dir, env, prep_log)
+    try:
+        rc = command_run(command, plan_dir, env, prep_log, timeout)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"Generator for dataset variant {description} exceeded {timeout}s and "
+                           f"was killed; see {prep_log}") from error
     if rc:
         raise RuntimeError(f"Generator for dataset variant {description} failed ({rc}); "
                            f"see {prep_log}")
@@ -862,6 +895,24 @@ cgroup_values() {
   ' "${files[@]}" 2>/dev/null
 }
 
+proc_io_values() {
+  # rchar counts bytes returned by read() syscalls, read_bytes counts bytes actually fetched
+  # from the block device. Their ratio is the read amplification the page cache introduces;
+  # cgroup io.stat only reports the device side, so it cannot show the gap on its own.
+  local pid key value rchar_total=0 read_total=0
+  #the appended newline guarantees the last pid is read even if the file lacks one
+  while read -r pid; do
+    [[ -n "$pid" && -r "/proc/$pid/io" ]] || continue
+    while read -r key value; do
+      case "$key" in
+        rchar:) rchar_total=$(( rchar_total + value )) ;;
+        read_bytes:) read_total=$(( read_total + value )) ;;
+      esac
+    done <"/proc/$pid/io"
+  done < <(cat "$root/cgroup.procs" 2>/dev/null; echo)
+  printf '%d,%d' "$rchar_total" "$read_total"
+}
+
 sample_cgroup() {
   local now_ns elapsed_ms memory_current memory_peak memory_swap pids values
   now_ns=$(date +%s%N)
@@ -871,8 +922,8 @@ sample_cgroup() {
   read -r memory_swap <"$root/memory.swap.current" 2>/dev/null || memory_swap=0
   read -r pids <"$root/pids.current" 2>/dev/null || pids=0
   values=$(cgroup_values "$pids")
-  printf '%s,%s,%s,%s,%s\n' "$elapsed_ms" "$memory_current" "$memory_peak" \
-    "$memory_swap" "$values" >>"$telemetry"
+  printf '%s,%s,%s,%s,%s,%s\n' "$elapsed_ms" "$memory_current" "$memory_peak" \
+    "$memory_swap" "$values" "$(proc_io_values)" >>"$telemetry"
 }
 
 monitor_cgroup() {
@@ -883,7 +934,7 @@ monitor_cgroup() {
   done
 }
 
-printf '%s\n' 'elapsed_ms,memory_current_bytes,memory_peak_bytes,memory_swap_current_bytes,anon_bytes,file_bytes,shmem_bytes,file_dirty_bytes,file_writeback_bytes,pgfault,pgmajfault,workingset_refault_anon,workingset_refault_file,workingset_activate_file,cpu_usage_usec,cpu_user_usec,cpu_system_usec,cpu_nr_periods,cpu_nr_throttled,cpu_throttled_usec,pids_current,io_read_bytes,io_write_bytes,io_read_ops,io_write_ops,io_discard_bytes,io_discard_ops,cpu_pressure_some_usec,cpu_pressure_full_usec,memory_pressure_some_usec,memory_pressure_full_usec,io_pressure_some_usec,io_pressure_full_usec' >"$telemetry"
+printf '%s\n' 'elapsed_ms,memory_current_bytes,memory_peak_bytes,memory_swap_current_bytes,anon_bytes,file_bytes,shmem_bytes,file_dirty_bytes,file_writeback_bytes,pgfault,pgmajfault,workingset_refault_anon,workingset_refault_file,workingset_activate_file,cpu_usage_usec,cpu_user_usec,cpu_system_usec,cpu_nr_periods,cpu_nr_throttled,cpu_throttled_usec,pids_current,io_read_bytes,io_write_bytes,io_read_ops,io_write_ops,io_discard_bytes,io_discard_ops,cpu_pressure_some_usec,cpu_pressure_full_usec,memory_pressure_some_usec,memory_pressure_full_usec,io_pressure_some_usec,io_pressure_full_usec,proc_rchar_bytes,proc_read_bytes' >"$telemetry"
 telemetry_start_ns=$(date +%s%N)
 # Give the benchmark payload a higher OOM score than this small accounting
 # wrapper. If MemoryMax is exhausted, the kernel can kill the payload while
@@ -921,6 +972,8 @@ IFS=, read -r io_read_bytes io_write_bytes io_read_ops io_write_ops io_discard_b
   echo "cpu_system_usec=$(stat_value "$root/cpu.stat" system_usec)"
   echo "cpu_nr_throttled=$(stat_value "$root/cpu.stat" nr_throttled)"
   echo "cpu_throttled_usec=$(stat_value "$root/cpu.stat" throttled_usec)"
+  echo "proc_rchar_bytes=$(awk -F, 'NR>1 && $34>m {m=$34} END {printf "%d", m+0}' "$telemetry")"
+  echo "proc_read_bytes=$(awk -F, 'NR>1 && $35>m {m=$35} END {printf "%d", m+0}' "$telemetry")"
   echo "io_read_bytes=$io_read_bytes"
   echo "io_write_bytes=$io_write_bytes"
   echo "io_read_ops=$io_read_ops"
@@ -1105,7 +1158,8 @@ def cleanup_temporary_paths(paths):
     return removed, errors
 
 
-def execute_plan(plan_path, validate_only=False):
+def execute_plan(plan_path, validate_only=False, prepare_only=False, only=(),
+                 skip_variants=False, implementations=()):
     plan = yaml.safe_load(plan_path.read_text())
     if not isinstance(plan, dict) or plan.get("version") != 1:
         raise ValueError("Benchmark plan must be a mapping with version: 1")
@@ -1147,6 +1201,32 @@ def execute_plan(plan_path, validate_only=False):
     enabled_runs = [run for run in expanded_runs if run.get("enabled", True) and any(
         resolve_implementation(implementation, templates).get("enabled", True)
         for implementation in run.get("implementations", []))]
+    if only:
+        selected = [run for run in enabled_runs
+                    if any(pattern in (str(run["id"]), str(run.get("base_id", run["id"])))
+                           or fnmatch.fnmatch(str(run["id"]), pattern) for pattern in only)]
+        if not selected:
+            raise ValueError(f"No enabled run case matches {', '.join(only)}")
+        enabled_runs = selected
+    if implementations:
+        # Narrow each case to the named arms and drop the cases left with none. A smoke
+        # test wants one engine, not the whole comparison: at a spilling profile the
+        # in-memory arms are expected to run to their timeout, which is a measurement
+        # worth having and a validation step worth twenty minutes less.
+        selected = []
+        for run in enabled_runs:
+            kept = [implementation for implementation in run.get("implementations", [])
+                    if any(pattern == str(implementation.get("id", ""))
+                           or fnmatch.fnmatch(str(implementation.get("id", "")), pattern)
+                           for pattern in implementations)]
+            if kept:
+                run = dict(run)
+                run["implementations"] = kept
+                selected.append(run)
+        if not selected:
+            raise ValueError(f"No enabled implementation matches "
+                             f"{', '.join(implementations)}")
+        enabled_runs = selected
     run_ids = set()
     for run in expanded_runs:
         run_id = str(run.get("id", ""))
@@ -1194,24 +1274,30 @@ def execute_plan(plan_path, validate_only=False):
         if result.returncode:
             raise RuntimeError(f"Configured Python is missing required modules: "
                                f"{result.stdout.strip()}")
-    if not shutil.which("systemd-run") or subprocess.run(
+    if not prepare_only and (not shutil.which("systemd-run") or subprocess.run(
             ["systemctl", "--user", "status"], stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL).returncode:
+            stderr=subprocess.DEVNULL).returncode):
         raise RuntimeError("A working user systemd instance and systemd-run are required")
 
     root.mkdir(parents=True, exist_ok=True)
     prepared = {}
+    prepare_timeout = plan.get("defaults", {}).get("prepare_timeout_seconds", 0)
+    # Staging is a batch job: one unbuildable dataset should cost its own runs, not the
+    # nine others queued behind it. A real run still fails fast, where a missing input
+    # means the measurement cannot happen at all.
+    prepare_failures = {}
     results_root = Path(expand(str(plan.get("results", "${plan.root}/results")), context)).resolve()
     results_root.mkdir(parents=True, exist_ok=True)
     invocation_id = execution_timestamp()
     invocation_dir = results_root / invocation_id
-    invocation_dir.mkdir()
-    shutil.copy2(plan_path, invocation_dir / "benchmark-plan.yaml")
-    write_invocation_metadata(
-        invocation_dir / "invocation-metadata.json", plan_dir, root, context)
-    manifest = expanded_plan_manifest(plan, enabled_runs, invocation_id)
-    (invocation_dir / "expanded-plan.yaml").write_text(
-        yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8")
+    if not prepare_only:
+        invocation_dir.mkdir()
+        shutil.copy2(plan_path, invocation_dir / "benchmark-plan.yaml")
+        write_invocation_metadata(
+            invocation_dir / "invocation-metadata.json", plan_dir, root, context)
+        manifest = expanded_plan_manifest(plan, enabled_runs, invocation_id)
+        (invocation_dir / "expanded-plan.yaml").write_text(
+            yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8")
     execution_records = []
 
     for run in enabled_runs:
@@ -1221,9 +1307,18 @@ def execute_plan(plan_path, validate_only=False):
         dataset_id = str(run["dataset"])
         if dataset_id not in datasets:
             raise ValueError(f"Run {run_id} refers to unknown dataset {dataset_id}")
-        if dataset_id not in prepared:
-            prepared[dataset_id] = prepare_dataset(dataset_id, datasets[dataset_id], context,
-                                                    plan_dir, global_env)
+        if dataset_id in prepare_failures:
+            continue
+        try:
+            if dataset_id not in prepared:
+                prepared[dataset_id] = prepare_dataset(dataset_id, datasets[dataset_id], context,
+                                                        plan_dir, global_env, prepare_timeout)
+        except (RuntimeError, ValueError, OSError) as error:
+            if not prepare_only:
+                raise
+            prepare_failures[dataset_id] = str(error)
+            print(f"warning: skipping {dataset_id}: {error}", file=sys.stderr)
+            continue
         _, dataset_context = prepared[dataset_id]
         run_context = dict(dataset_context)
         run_context["run.id"] = run_id
@@ -1233,7 +1328,10 @@ def execute_plan(plan_path, validate_only=False):
             if field in run:
                 run_context[f"run.{field}"] = str(run[field])
         flatten("run", run.get("parameters", {}), run_context)
-        for variant_id, variant in datasets[dataset_id].get("variants", {}).items():
+        # Base datasets are blocksize- and chunk-independent, so they can be staged before
+        # a calibration sweep has chosen either; the variants derived from them cannot.
+        for variant_id, variant in ({} if skip_variants
+                                    else datasets[dataset_id].get("variants", {})).items():
             # A blocksize variant belongs to the SystemDS cases; a Dask chunk variant
             # belongs to the single -baseline case that holds the unblocked arms. Each
             # is prepared only for the case type that reads it.
@@ -1243,8 +1341,17 @@ def execute_plan(plan_path, validate_only=False):
             if context_key not in run_context:
                 raise ValueError(f"Run {run_id} must define parameters.{variant_id} for dataset "
                                  f"variant {dataset_id}.{variant_id}")
-            prepare_dataset_variant(dataset_id, variant_id, variant, prepared[dataset_id][0],
-                                    run_context, plan_dir, global_env)
+            try:
+                prepare_dataset_variant(dataset_id, variant_id, variant, prepared[dataset_id][0],
+                                        run_context, plan_dir, global_env, prepare_timeout)
+            except (RuntimeError, ValueError, OSError) as error:
+                if not prepare_only:
+                    raise
+                prepare_failures[dataset_id] = str(error)
+                print(f"warning: skipping {dataset_id}: {error}", file=sys.stderr)
+                break
+        if prepare_only:
+            continue
         resources = dict(plan.get("defaults", {}).get("resources", {}))
         resources.update(run.get("resources", {}))
         threads = resources.get("threads", "auto")
@@ -1374,6 +1481,7 @@ def execute_plan(plan_path, validate_only=False):
                              "file_system_inputs", "cpu_usage_usec", "cpu_user_usec",
                              "cpu_system_usec", "cpu_nr_throttled", "cpu_throttled_usec",
                              "io_read_bytes", "io_write_bytes", "io_read_ops", "io_write_ops",
+                             "proc_rchar_bytes", "proc_read_bytes",
                              "memory_max_events", "oom_kill_events", "log", "metrics",
                              "telemetry"])
             timeout_seconds = int(resources.get("timeout_seconds", 0))
@@ -1471,6 +1579,8 @@ def execute_plan(plan_path, validate_only=False):
                     io_write_bytes = metric(metrics, r"^io_write_bytes=([0-9]+)$")
                     io_read_ops = metric(metrics, r"^io_read_ops=([0-9]+)$")
                     io_write_ops = metric(metrics, r"^io_write_ops=([0-9]+)$")
+                    proc_rchar = metric(metrics, r"^proc_rchar_bytes=([0-9]+)$")
+                    proc_read_bytes = metric(metrics, r"^proc_read_bytes=([0-9]+)$")
                     memory_max_events = metric(
                         metrics, r"^memory_events=.*(?:^|;)max ([0-9]+)(?:;|$)")
                     oom_kill_events = metric(
@@ -1479,7 +1589,8 @@ def execute_plan(plan_path, validate_only=False):
                                      wall_seconds, algorithm_seconds, peak, faults, inputs,
                                      cpu_usage, cpu_user, cpu_system, cpu_nr_throttled,
                                      cpu_throttled, io_read_bytes, io_write_bytes, io_read_ops,
-                                     io_write_ops, memory_max_events, oom_kill_events, log,
+                                     io_write_ops, proc_rchar, proc_read_bytes,
+                                     memory_max_events, oom_kill_events, log,
                                      metrics, telemetry_path])
                     csv_file.flush()
                     if implementation.get("comparable", True):
@@ -1491,6 +1602,13 @@ def execute_plan(plan_path, validate_only=False):
                             "outputs": outputs, "run_dir": run_dir,
                         })
                     print(f"{tag}: {status} (wall={wall_seconds}s, peak={peak})")
+    if prepare_only:
+        attempted = set(prepared) | set(prepare_failures)
+        print(f"Prepared {len(attempted) - len(prepare_failures)} of {len(attempted)} datasets "
+              f"for {len(enabled_runs)} run cases")
+        for dataset_id, error in sorted(prepare_failures.items()):
+            print(f"  FAILED {dataset_id}: {error}")
+        return 1 if prepare_failures else 0
     apply_output_retention(execution_records, invocation_dir)
     return 0
 
@@ -1499,9 +1617,23 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("plan", type=Path)
     parser.add_argument("--validate", action="store_true", help="validate structure without preparing or running")
+    parser.add_argument("--prepare-only", action="store_true",
+                        help="prepare and verify every dataset the selected runs read, then exit")
+    parser.add_argument("--only", action="append", default=[], metavar="RUN",
+                        help="limit to run cases matching an expanded id, a base id, or a glob; "
+                             "repeatable")
+    parser.add_argument("--implementation", action="append", default=[], metavar="ID",
+                        help="limit to implementations matching an id or a glob, dropping run "
+                             "cases left with none; repeatable")
+    parser.add_argument("--skip-variants", action="store_true",
+                        help="with --prepare-only, stage base datasets but not the blocksize and "
+                             "chunk variants derived from them")
     args = parser.parse_args()
+    if args.skip_variants and not args.prepare_only:
+        parser.error("--skip-variants only applies to --prepare-only")
     try:
-        return execute_plan(args.plan.resolve(), args.validate)
+        return execute_plan(args.plan.resolve(), args.validate, args.prepare_only, args.only,
+                            args.skip_variants, args.implementation)
     except (KeyError, ValueError, RuntimeError, OSError) as error:
         print(f"benchmark plan error: {error}", file=sys.stderr)
         return 2

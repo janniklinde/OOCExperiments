@@ -67,11 +67,20 @@ fi
 
 echo
 echo "== page cache"
+# Same resolution order as drop_caches.py: a direct write first, then the NOPASSWD
+# helper the image installs for the unprivileged benchmark user. `sudo -l` asks
+# whether the rule exists rather than exercising it -- actually running the helper
+# would drop the host's page cache as a side effect of a preflight that is supposed
+# to change nothing.
+drop_helper="/usr/local/bin/bench-drop-caches"
 if [[ -w /proc/sys/vm/drop_caches ]]; then
   note ok "/proc/sys/vm/drop_caches is writable (cold caches between runs)"
+elif [[ -x "$drop_helper" ]] && sudo -n -l "$drop_helper" >/dev/null 2>&1; then
+  note ok "drop_caches via $drop_helper (cold caches between runs)"
 else
-  note WARN "/proc/sys/vm/drop_caches is not writable; drop_caches.py falls back to
-       per-file POSIX_FADV_DONTNEED, which is less thorough"
+  note WARN "/proc/sys/vm/drop_caches is not writable and no usable $drop_helper;
+       drop_caches.py falls back to per-file POSIX_FADV_DONTNEED, which is less
+       thorough. Rebuild the image to install the helper."
 fi
 
 echo

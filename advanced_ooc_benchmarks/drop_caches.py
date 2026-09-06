@@ -14,6 +14,8 @@ Usage: drop_caches.py PATH [PATH ...]
 """
 import ctypes
 import os
+import shutil
+import subprocess
 import sys
 
 POSIX_FADV_DONTNEED = 4
@@ -84,6 +86,16 @@ def main(argv):
             fh.write("3\n")
         print("dropped all caches via /proc/sys/vm/drop_caches")
         return 0
+    # The benchmark container is privileged but the runner is an unprivileged uid,
+    # so the write above fails there. A NOPASSWD helper, when one is installed, keeps
+    # the global drop rather than falling back to per-file DONTNEED.
+    helper = shutil.which("bench-drop-caches") or "/usr/local/bin/bench-drop-caches"
+    if os.path.exists(helper) and shutil.which("sudo"):
+        dropped = subprocess.run(["sudo", "-n", helper], input=b"3\n",
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if dropped.returncode == 0:
+            print("dropped all caches via %s" % helper)
+            return 0
     pagesize = os.sysconf("SC_PAGE_SIZE")
     residual = 0
     for path in walk(argv[1:]):

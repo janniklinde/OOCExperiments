@@ -12,9 +12,11 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 host="${BENCH_REMOTE_HOST:-so014}"
 data="${BENCH_REMOTE_DATA_DIR:-/home/lindemann/bench/data}"
 dest="${BENCH_RESULTS_DIR:-$here/results-remote}"
+results_dir="${BENCH_REMOTE_RESULTS_DIR:-}"
 invocation=""
 fetch_all=0
 with_telemetry=1
+with_outputs=1
 list_only=0
 dry=()
 
@@ -27,9 +29,15 @@ Usage: ./download_results_remote.sh [options]
                       or $BENCH_REMOTE_DATA_DIR)
   --dest PATH         local destination (default: ./results-remote,
                       or $BENCH_RESULTS_DIR)
+  --results-dir PATH  remote results root, absolute or relative to the data dir
+                      (default: bench-results, or $BENCH_REMOTE_RESULTS_DIR).
+                      Calibration sweeps write to calibration-results instead.
   --invocation ID     fetch this invocation instead of the newest one
   --all               mirror every invocation and driver log
-  --no-telemetry      skip the per-case *.telemetry.csv traces (the bulk of it)
+  --no-telemetry      skip the per-case *.telemetry.csv traces
+  --no-outputs        skip the per-case outputs/ trees (retained matrices; the bulk
+                      of a sweep with failures, since retention only discards them
+                      once every comparable execution in a group succeeded)
   --list              show what is on the remote and exit
   --dry-run           show what rsync would transfer, change nothing
   -h, --help          this message
@@ -44,9 +52,11 @@ while [[ $# -gt 0 ]]; do
     --host) host="$2"; shift 2 ;;
     --data-dir) data="$2"; shift 2 ;;
     --dest) dest="$2"; shift 2 ;;
+    --results-dir) results_dir="$2"; shift 2 ;;
     --invocation) invocation="$2"; shift 2 ;;
     --all) fetch_all=1; shift ;;
     --no-telemetry) with_telemetry=0; shift ;;
+    --no-outputs) with_outputs=0; shift ;;
     --list) list_only=1; shift ;;
     --dry-run) dry=(--dry-run); shift ;;
     -h|--help) usage; exit 0 ;;
@@ -56,7 +66,10 @@ done
 
 command -v rsync >/dev/null || { echo "rsync is required" >&2; exit 2; }
 data="${data%/}"
-results="$data/bench-results"
+case "${results_dir:-bench-results}" in
+  /*) results="$results_dir" ;;
+  *) results="$data/${results_dir:-bench-results}" ;;
+esac
 
 # One ssh round trip for the listing: an invocation directory is a plain
 # timestamp directory, while the driver logs are files named run-<stamp>.log.
@@ -85,7 +98,8 @@ if [[ "$list_only" == 1 ]]; then
 fi
 
 exclude=()
-[[ "$with_telemetry" == 0 ]] && exclude=(--exclude='*.telemetry.csv')
+[[ "$with_telemetry" == 0 ]] && exclude+=(--exclude='*.telemetry.csv')
+[[ "$with_outputs" == 0 ]] && exclude+=(--exclude='outputs/')
 
 mkdir -p "$dest"
 

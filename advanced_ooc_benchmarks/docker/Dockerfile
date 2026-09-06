@@ -30,7 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         systemd systemd-sysv dbus dbus-user-session \
         openjdk-${JAVA_VERSION}-jdk-headless \
         python3 python3-venv \
-        bash gawk coreutils time procps util-linux \
+        bash gawk coreutils time procps util-linux sudo \
         ca-certificates curl git tzdata less \
     && rm -rf /var/lib/apt/lists/*
 
@@ -51,6 +51,64 @@ RUN mkdir -p /etc/systemd/system/user@.service.d \
     && printf '[Service]\nDelegate=cpu cpuset io memory pids\n' \
         > /etc/systemd/system/user@.service.d/delegate.conf
 
+# cgroup v2 refuses to enable a controller in a cgroup that holds processes, and a
+# container's namespaced cgroup root is not the real root, so it gets no exemption.
+# `docker exec` places every process it starts in exactly that root, so by the time
+# anyone execs in, the enable is already impossible -- which leaves subtree_control
+# empty all the way down and makes `systemd-run --user --scope -p MemoryMax=` a no-op
+# that is accepted and never enforced. Doing it at boot, before anything execs in, is
+# the only reliable moment.
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    '# Enable the cgroup v2 controllers the benchmark scopes need. Idempotent.' \
+    'root=/sys/fs/cgroup' \
+    '[ -w "$root/cgroup.subtree_control" ] || exit 0' \
+    'mkdir -p "$root/exec-holding"' \
+    'for p in $(cat "$root/cgroup.procs" 2>/dev/null); do' \
+    '  [ "$p" = 1 ] || echo "$p" > "$root/exec-holding/cgroup.procs" 2>/dev/null || true' \
+    'done' \
+    'for dir in "$root" "$root/user.slice"; do' \
+    '  [ -d "$dir" ] || continue' \
+    '  for c in memory io pids cpu; do' \
+    '    echo "+$c" > "$dir/cgroup.subtree_control" 2>/dev/null || true' \
+    '  done' \
+    'done' \
+    'exit 0' \
+        > /usr/local/bin/bench-enable-controllers \
+    && chmod 0755 /usr/local/bin/bench-enable-controllers \
+    && printf '%s\n' \
+    '[Unit]' \
+    'Description=Enable cgroup v2 controllers in the container cgroup root' \
+    'ConditionVirtualization=container' \
+    'Before=user.slice' \
+    '' \
+    '[Service]' \
+    'Type=oneshot' \
+    'RemainAfterExit=yes' \
+    'ExecStart=/usr/local/bin/bench-enable-controllers' \
+    '' \
+    '[Install]' \
+    'WantedBy=multi-user.target' \
+        > /etc/systemd/system/bench-cgroup-controllers.service \
+    && systemctl enable bench-cgroup-controllers.service
+
+# Delegation alone is not enough: systemd enables a controller in a slice's
+# cgroup.subtree_control only when something below it asks for that controller.
+# Without these defaults user.slice and user-<uid>.slice can leave memory and io
+# disabled, and then `systemd-run --user --scope -p MemoryMax=` is accepted and
+# silently unenforced -- a run that looks fine and measures nothing.
+RUN mkdir -p /etc/systemd/system.conf.d \
+    && printf '[Manager]\nDefaultCPUAccounting=yes\nDefaultIOAccounting=yes\nDefaultMemoryAccounting=yes\nDefaultTasksAccounting=yes\n' \
+        > /etc/systemd/system.conf.d/accounting.conf
+
+# /proc/sys/vm/drop_caches is root-owned 0644, so the benchmark user cannot write
+# it even here -- `privileged: true` grants the container capabilities, not this
+# unprivileged uid. One NOPASSWD helper restores the global cache drop; inside a
+# privileged, disposable container it concedes nothing that is not already root.
+RUN printf '#!/bin/sh\nsync\nexec tee /proc/sys/vm/drop_caches\n' \
+        > /usr/local/bin/bench-drop-caches \
+    && chmod 0755 /usr/local/bin/bench-drop-caches
+
 # Ubuntu 24.04 ships a stock uid 1000 user; drop it so the benchmark user can
 # take the host uid and keep bind-mounted results writable from the host.
 RUN if getent passwd ${BENCH_UID} >/dev/null; then \
@@ -61,7 +119,10 @@ RUN if getent passwd ${BENCH_UID} >/dev/null; then \
     else groupadd -g ${BENCH_GID} ${BENCH_USER}; fi \
     && useradd -m -u ${BENCH_UID} -g ${BENCH_GID} -s /bin/bash ${BENCH_USER} \
     && mkdir -p /var/lib/systemd/linger \
-    && touch /var/lib/systemd/linger/${BENCH_USER}
+    && touch /var/lib/systemd/linger/${BENCH_USER} \
+    && printf '%s ALL=(root) NOPASSWD: /usr/local/bin/bench-drop-caches\n' ${BENCH_USER} \
+        > /etc/sudoers.d/bench-drop-caches \
+    && chmod 0440 /etc/sudoers.d/bench-drop-caches
 
 # Baseline Python stack. The requirements file carries pyyaml because
 # benchmark_plan.py itself runs under the plan's configured `tools.python`, and

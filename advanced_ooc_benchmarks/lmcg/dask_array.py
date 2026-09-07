@@ -28,12 +28,16 @@ def main():
     parser.add_argument("--tolerance", type=float, default=0.0)
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--memory-limit", default="3GiB")
+    parser.add_argument("--memory-target", type=float, default=0.60)
     parser.add_argument("--temporary-directory", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.iterations < 1 or args.reg < 0 or args.tolerance < 0 or args.threads < 1:
         raise ValueError("iterations/threads must be positive and reg/tolerance non-negative")
-    client = create_client(args.threads, args.memory_limit, args.temporary_directory)
+    if not 0 < args.memory_target < 0.70:
+        raise ValueError("memory-target must be between zero and the 0.70 spill threshold")
+    client = create_client(args.threads, args.memory_limit, args.temporary_directory,
+                           memory_target=args.memory_target)
     compute_options = {}
 
     start = time.perf_counter()

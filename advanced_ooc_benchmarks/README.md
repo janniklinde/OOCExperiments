@@ -661,3 +661,17 @@ For this LMCG input, 1500-by-1000 dense arrays occupy 12 MB and cease to be G1
 humongous objects with 32 MiB regions; full 1500-by-1500 arrays remain humongous.
 For RAID throughput, use `proc_read_bytes / wall_seconds`; summing cgroup `io.stat`
 across both the RAID device and its members counts the same traffic twice.
+
+The follow-up `python3 make_lmcg_diagnostic_plan.py --higher` generates
+`benchmark-plan-lmcg-higher.yaml`, writing to `lmcg-higher-results`.
+G1 regions stay at 32 MiB. Nine cases cross 4/5/6 GiB worker brokers with
+2/2.5/3 GiB prefetch brokers. The respective replay/bulk budgets are
+768/1024/1280 MiB and replay block limits are 64/96/128.
+All nine use a 1/1.5 GiB soft/hard cache so the largest combination fits the
+12 GiB heap with the unchanged 1.2 GiB configured headroom. The previous winner
+(4 GiB worker, 2 GiB prefetch, 4/4.5 GiB cache) brackets the sweep:
+eleven executions in total. Compare its controls to the 4 GiB/2 GiB case to
+measure the smaller cache's cost separately. Larger budgets are experimental;
+the previous winner already showed evacuation failures and Full GCs.
+Run the generated plan using the same container command, and retrieve using
+`--results-dir lmcg-higher-results`. No JAR or image rebuild is required.

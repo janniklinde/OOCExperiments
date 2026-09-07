@@ -187,7 +187,7 @@ def load_matrix(path, shape, dtype=np.float64, row_chunk=None, row_range=None):
     return da.concatenate(blocks, axis=0)
 
 
-def create_client(threads, memory_limit, temporary_directory):
+def create_client(threads, memory_limit, temporary_directory, memory_target=0.60):
     """Create one spill-capable in-process worker with bounded concurrency."""
     temporary_directory = Path(temporary_directory)
     temporary_directory.mkdir(parents=True, exist_ok=True)
@@ -196,7 +196,7 @@ def create_client(threads, memory_limit, temporary_directory):
         # `load_matrix`'s from_delayed/concatenate construction; `load_zarr` has no alias,
         # so repeated fixed-iteration submissions no longer redefine a stable key. Keep
         # `optimization.fuse.active: False` if a workload falls back to `load_matrix`.
-        "distributed.worker.memory.target": 0.60,
+        "distributed.worker.memory.target": memory_target,
         "distributed.worker.memory.spill": 0.70,
         "distributed.worker.memory.pause": 0.82,
         "distributed.worker.memory.terminate": 0.95,

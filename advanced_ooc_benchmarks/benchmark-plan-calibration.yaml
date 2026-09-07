@@ -24,12 +24,19 @@ defaults:
   # otherwise hold an unattended invocation open indefinitely.
   prepare_timeout_seconds: 7200
   resources:
-    threads: auto
-    dask_threads: auto
-    dask_chunk_size: 32MiB
+    # Frozen here rather than in resource_profiles because a profile's values override a
+    # run's own, which would silently defeat the dask_threads sweeps below. Every
+    # calibration run uses mem16, so its per-profile values are the ones inlined here.
+    threads: 64
+    dask_threads: 64
+    # Not the Zarr store's chunking: every arm loads through from_zarr, which inherits the
+    # stored chunks, so nothing reads this today. It bounds any intermediate Dask decides
+    # to auto-chunk, and is held at the same 100 MiB the stores target so a fallback
+    # cannot quietly introduce a differently sized tile.
+    dask_chunk_size: 100MiB
     dask_memory_limit: 3GiB
     python_jobs: 4
-    spark_threads: auto
+    spark_threads: 48
     swap_max: 0
     timeout_seconds: 60
     timeout_grace_seconds: 30
@@ -460,7 +467,7 @@ runs:
     dataset: dense_d32
     resource_profiles: [mem16]
     entrypoint: ${plan.dir}/lmcg/systemds.dml
-    blocksize_sweeps: {ooc: [500, 1000], spark: [500, 1000]}
+    blocksize_sweeps: {ooc: [500, 1000, 1350, 1400], spark: [500, 1000]}
     parameters:
       iterations: 10
       reg: 1e-7
@@ -617,3 +624,110 @@ runs:
           --memory-limit ${resources.dask_memory_limit}
           --temporary-directory "${run.results}/dask-spill"
           --output "${run.outputs}/dask-r${rep}.json"
+
+  # SystemDS targets one Spark partition per 128 MB of matrix (SparkUtils.getNumPreferredPartitions
+  # over the Hadoop dfs.blocksize default), so concurrent partitions are threads * 128 MB
+  # regardless of blen. At mem16 that is 16.4 GB for 128 threads against a 12g heap and
+  # 6.1 GB for 48, which is the proposed explanation for the OOMs the main suite recorded
+  # in most of its Spark arms. These runs test it directly: the boundary should fall
+  # between 48 and 128.
+
+  - id: calibration_spark_t16
+    enabled: true
+    dataset: dense_d32
+    resource_profiles: [mem16]
+    entrypoint: ${plan.dir}/lmcg/systemds.dml
+    blocksize_sweeps: {spark: [1000]}
+    parameters:
+      iterations: 10
+      reg: 1e-7
+      tolerance: 0.0
+      systemds_args: >-
+        -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance}
+        "${run.outputs}/systemds-beta-r${rep}"
+    inputs: {X: {artifact: X}, y: {artifact: binary_y}}
+    resources: {timeout_seconds: 1800, spark_threads: 16}
+    setup: *systemds_setup
+    cold_cache: ["${dataset.dir}"]
+    implementations:
+      - {id: systemds-spark, template: systemds-spark}
+
+  - id: calibration_spark_t32
+    enabled: true
+    dataset: dense_d32
+    resource_profiles: [mem16]
+    entrypoint: ${plan.dir}/lmcg/systemds.dml
+    blocksize_sweeps: {spark: [1000]}
+    parameters:
+      iterations: 10
+      reg: 1e-7
+      tolerance: 0.0
+      systemds_args: >-
+        -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance}
+        "${run.outputs}/systemds-beta-r${rep}"
+    inputs: {X: {artifact: X}, y: {artifact: binary_y}}
+    resources: {timeout_seconds: 1800, spark_threads: 32}
+    setup: *systemds_setup
+    cold_cache: ["${dataset.dir}"]
+    implementations:
+      - {id: systemds-spark, template: systemds-spark}
+
+  - id: calibration_spark_t48
+    enabled: true
+    dataset: dense_d32
+    resource_profiles: [mem16]
+    entrypoint: ${plan.dir}/lmcg/systemds.dml
+    blocksize_sweeps: {spark: [1000]}
+    parameters:
+      iterations: 10
+      reg: 1e-7
+      tolerance: 0.0
+      systemds_args: >-
+        -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance}
+        "${run.outputs}/systemds-beta-r${rep}"
+    inputs: {X: {artifact: X}, y: {artifact: binary_y}}
+    resources: {timeout_seconds: 1800, spark_threads: 48}
+    setup: *systemds_setup
+    cold_cache: ["${dataset.dir}"]
+    implementations:
+      - {id: systemds-spark, template: systemds-spark}
+
+  - id: calibration_spark_t64
+    enabled: true
+    dataset: dense_d32
+    resource_profiles: [mem16]
+    entrypoint: ${plan.dir}/lmcg/systemds.dml
+    blocksize_sweeps: {spark: [1000]}
+    parameters:
+      iterations: 10
+      reg: 1e-7
+      tolerance: 0.0
+      systemds_args: >-
+        -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance}
+        "${run.outputs}/systemds-beta-r${rep}"
+    inputs: {X: {artifact: X}, y: {artifact: binary_y}}
+    resources: {timeout_seconds: 1800, spark_threads: 64}
+    setup: *systemds_setup
+    cold_cache: ["${dataset.dir}"]
+    implementations:
+      - {id: systemds-spark, template: systemds-spark}
+
+  - id: calibration_spark_t128
+    enabled: true
+    dataset: dense_d32
+    resource_profiles: [mem16]
+    entrypoint: ${plan.dir}/lmcg/systemds.dml
+    blocksize_sweeps: {spark: [1000]}
+    parameters:
+      iterations: 10
+      reg: 1e-7
+      tolerance: 0.0
+      systemds_args: >-
+        -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance}
+        "${run.outputs}/systemds-beta-r${rep}"
+    inputs: {X: {artifact: X}, y: {artifact: binary_y}}
+    resources: {timeout_seconds: 1800, spark_threads: 128}
+    setup: *systemds_setup
+    cold_cache: ["${dataset.dir}"]
+    implementations:
+      - {id: systemds-spark, template: systemds-spark}

@@ -3,7 +3,13 @@
 This directory is the self-contained cgroup-v2 benchmark suite for the advanced dense OOC
 workloads. It reuses the canonical raw dataset at `${plan.root}/bench-data/dense`. When a requested
 SystemDS blocksize-qualified native representation is absent, it can prepare that representation
-from the raw memmaps without modifying the raw inputs.
+by reblocking an existing native variant of the same matrix with an OOC read/write job.
+If no compatible native variant exists, it imports the raw memmaps. Source variants are preserved.
+The main plan uses 1500×1500 dense OOC blocks, direct I/O, 18 MiB reader buffers,
+and 16 I/O workers (also at most 16 pooled readers).
+`systemds-cp-spoof` enables CPU codegen through a separate config. It is selected
+only by `lmcg_spoof`, `kmeans_spoof`, and `multilogreg_spoof` at `mem128`
+(32 GB inputs, 96 GiB heap); it does not enable OOC execution.
 
 ## Layout
 
@@ -623,3 +629,35 @@ scikit-learn, joblib, or Dask dependencies. The timed payload raises its Linux O
 the accounting wrapper, so a cgroup OOM normally leaves exit status 137, GNU-time data, and cgroup
 memory events instead of an empty log and `nan` metrics. NumPy MLP activation memmaps use the
 runner-owned `python-tmp` root and are therefore removed after failed or successful executions.
+
+### LMCG GC and broker diagnostic
+
+`python3 make_lmcg_diagnostic_plan.py` derives `benchmark-plan-lmcg-diagnostic.yaml`
+from the main plan, preserving dataset definitions and native blocksize-1500 inputs.
+Run it as one invocation with the usual container runner. Results go into
+`lmcg-diagnostic-results` under the data root.
+
+The ten executions are two current-configuration controls bracketing eight combinations:
+
+| Factor | Low | High |
+| --- | --- | --- |
+| G1 region | 8 MiB | 32 MiB |
+| Worker broker | 3 GiB | 4 GiB |
+| Source/prefetch broker | 1000 MiB | 2 GiB |
+| Replay memory / bulk scan budget (prefetch factor) | 300 MiB | 768 MiB |
+| Replay block limit (prefetch factor) | 32 | 64 |
+
+The eight factorial cases fix cache soft/hard limits at 4/4.5 GiB. Otherwise larger
+brokers automatically shrink the cache, confounding the comparison. The two controls
+retain the main plan's default cache settings. All cases use a 12 GiB heap, 16 GiB
+cgroup, 64 compute threads, 16 I/O readers, direct I/O, and ten CG iterations.
+Each case captures `gc.log` and a profile JFR capped at 128 MiB, included by the normal
+results downloader even with `--no-outputs`. Profiling is enabled equally for controls.
+Compare cases differing in one factor; the prefetch factor deliberately changes its
+three cooperating limits together. This is a screening run, not repeated statistical
+validation. At 169 seconds per case, allow roughly half an hour.
+
+For this LMCG input, 1500-by-1000 dense arrays occupy 12 MB and cease to be G1
+humongous objects with 32 MiB regions; full 1500-by-1500 arrays remain humongous.
+For RAID throughput, use `proc_read_bytes / wall_seconds`; summing cgroup `io.stat`
+across both the RAID device and its members counts the same traffic twice.

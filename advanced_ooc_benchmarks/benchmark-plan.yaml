@@ -24,9 +24,13 @@ defaults:
   # otherwise hold an unattended invocation open indefinitely.
   prepare_timeout_seconds: 7200
   resources:
-    threads: auto
+    threads: 64
     dask_threads: auto
-    dask_chunk_size: 32MiB
+    # Not the Zarr store's chunking: every arm loads through from_zarr, which inherits the
+    # stored chunks, so nothing reads this today. It bounds any intermediate Dask decides
+    # to auto-chunk, and is held at the same 100 MiB the stores target so a fallback
+    # cannot quietly introduce a differently sized tile.
+    dask_chunk_size: 100MiB
     dask_memory_limit: 3GiB
     python_jobs: 4
     spark_threads: auto
@@ -41,12 +45,20 @@ telemetry:
 
 # Named profiles keep correlated cgroup and JVM settings together. A run may
 # select one or a list with `resource_profiles: {group: scaling}`.
+# Concurrency is the only tuned resource. Partition sizes stay at each backend's own
+# recommended value -- Dask 100 MB chunks, SystemDS 128 MB Spark partitions through the
+# explicit Hadoop fs.local.block.size setting -- and each backend instead gets the largest thread count
+# whose concurrent partitions fit half its memory budget, capped at the 64 physical cores
+# of the benchmark host. Dask: 0.5 * dask_memory_limit / 100 MB. Spark: 0.5 * java_heap /
+# 128 MB. OOC bounds its own cache independently of the budget, so it keeps all 64.
 resource_profiles:
-  mem128: {memory_max: 128G, java_heap: 96g, dask_memory_limit: 96GiB}
-  mem32: {memory_max: 32G, java_heap: 24g, dask_memory_limit: 24GiB}
-  mem16: {memory_max: 16G, java_heap: 12g, dask_memory_limit: 12GiB}
-  mem8: {memory_max: 8G, java_heap: 6g, dask_memory_limit: 6GiB}
-  mem4: {memory_max: 4G, java_heap: 3g, dask_memory_limit: 3GiB}
+  mem128: {memory_max: 128G, java_heap: 96g, dask_memory_limit: 96GiB, dask_threads: 64, spark_threads: 64}
+  mem32: {memory_max: 32G, java_heap: 24g, dask_memory_limit: 24GiB, dask_threads: 64, spark_threads: 64}
+  mem16: {memory_max: 16G, java_heap: 12g, dask_memory_limit: 12GiB, dask_threads: 64, spark_threads: 48}
+  # MLP uses 256 MiB weight chunks: 24 concurrent chunks occupy half of 12 GiB.
+  mem16_mlp: {memory_max: 16G, java_heap: 12g, dask_memory_limit: 12GiB, dask_threads: 24, spark_threads: 48}
+  mem8: {memory_max: 8G, java_heap: 6g, dask_memory_limit: 6GiB, dask_threads: 32, spark_threads: 24}
+  mem4: {memory_max: 4G, java_heap: 3g, dask_memory_limit: 3GiB, dask_threads: 16, spark_threads: 12}
 
 # Named sets of profiles, selected by a run as `resource_profiles: {group: <name>}` --
 # the same form `dataset: {group: ...}` uses. Adding a profile here reaches every run
@@ -114,6 +126,18 @@ templates:
       -jar "${tools.systemds_jar}" -f "${run.entrypoint}" -exec singlenode
       -config "${run.results}/SystemDS-config.xml" -stats
       ${run.systemds_args}
+  systemds-cp-spoof:
+    comparable: true
+    enabled: true
+    blocksize_sweep: ooc
+    command: >-
+      "${tools.java}" -Xms${resources.java_heap} -Xmx${resources.java_heap}
+      -XX:+UseG1GC -XX:G1HeapRegionSize=8m
+      -XX:ActiveProcessorCount=${resources.threads}
+      --add-modules=jdk.incubator.vector -Djava.io.tmpdir="${run.results}/java-tmp"
+      -jar "${tools.systemds_jar}" -f "${run.entrypoint}" -exec singlenode
+      -config "${run.results}/SystemDS-config-spoof.xml" -stats
+      ${run.systemds_args}
   systemds-spark:
     comparable: true
     enabled: true
@@ -156,6 +180,7 @@ templates:
       --conf "spark.sql.shuffle.partitions=${resources.spark_threads}"
       --conf "spark.dynamicAllocation.enabled=false"
       --conf "spark.memory.fraction=0.25"
+      --conf "spark.hadoop.fs.local.block.size=134217728"
       "${tools.systemds_jar}"
       -f "${run.entrypoint}" -exec spark
       -config "${run.results}/SystemDS-config.xml" -stats
@@ -244,6 +269,10 @@ datasets:
               <sysds.localtmpdir>${dataset.dir}/tmp/prepare-bs${run.blocksize}</sysds.localtmpdir>
               <sysds.scratch>${dataset.dir}/scratch/prepare-bs${run.blocksize}</sysds.scratch>
               <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>
+              <sysds.ooc.io.direct>true</sysds.ooc.io.direct>
+              <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>
+              <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>
+              <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>
             </root>
             EOF
             # 8g, raised from 3g: the reblock is itself an OOC job, and at blocksize 1000 each
@@ -299,7 +328,7 @@ datasets:
 
   # Two 4e9-cell reshapes of dense_d32. Holding the cell count fixed makes geometry the
   # only variable: at blocksize 1000 the base instance is a 4000x1 block grid, the wide
-  # one is 40x100, and the tall one -- read at blocksize 8000, since a 100-column matrix
+  # one is 40x100, and the tall one -- whose Spark arm uses blocksize 8000, since a 100-column matrix
   # at 1000 would give 0.8 MB blocks against the others' 8 MB -- is 5000x1. The wide
   # instance is the only genuinely column-blocked input in the suite.
   dense_d32_tall:
@@ -445,29 +474,43 @@ systemds_setup: &systemds_setup
       <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>
       <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>
       <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>
+      <sysds.ooc.io.direct>true</sysds.ooc.io.direct>
+      <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>
+      <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>
+      <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>
       <!--<sysds.native.blas>openblas</sysds.native.blas>-->
     </root>
     EOF
+    sed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|' \
+      "${run.results}/SystemDS-config.xml" > "${run.results}/SystemDS-config-spoof.xml"
+
 runs:
   # Execution order is plan order, and each dataset is staged immediately before the
   # first run that needs it, so the phases below are also the staging order.
   #
   # `blocksize_sweeps` names one blocksize per backend, and the two are independent:
-  # OOC (and CP, which shares its sweep) runs at 500, the best value measured on the
-  # development laptop, while Spark keeps 1000. Both artifacts therefore have to exist
-  # per dataset -- X-bs500 and X-bs1000 -- which is why today's bs1000 staging is not
-  # wasted. benchmark-plan-calibration.yaml still measures 500/1000/2000 on this host
-  # if you want the value confirmed rather than assumed. The tall runs and pagerank
-  # keep their own values, which follow the data geometry rather than this default. OOC and Spark candidates are independent,
+  # OOC (and CP, which shares its sweep) uses 1500; Spark keeps its own sizes.
+  # Dense OOC blocks hold up to 18 MB. The 18 MiB reader buffer fits a full record;
+  # 16 I/O workers issue concurrent reads and the pool retains at most 16 readers.
+  # Existing native variants are reblocked during preparation instead of reimported.
+  # Disabled PageRank retains its sparse-specific 400000 blocksize. OOC and Spark
+  # candidates are independent,
   # so each sweep creates backend-specific cases and the ungrouped Python/Dask
   # implementations run once in a shared <run-id>-baseline case.
   #
-  # `dask_chunk` is the row height of the prepared Zarr store, sized to ~95 MiB --
-  # inside Dask's ~100 MiB guidance and an exact divisor of the dataset, so no
-  # trailing chunk is padded. Full-width bands rather than square tiles: every kernel
-  # here is a row-local reduction, and splitting columns forces a combine none of them
-  # ask for. Whether square tiles would serve Dask better on the column-blocked wide
-  # shape is an open question neither plan answers.
+  # `dask_chunk` is the row height of the prepared Zarr store, chosen as the largest
+  # exact divisor of the dataset -- so no trailing chunk is padded -- that keeps the run's
+  # largest materialized tile inside Dask's ~100 MiB guidance. Which tile that is depends
+  # on the kernel. Matvec and Gram reductions contract to something tiny, so the input
+  # band dominates and ~95 MiB bands are the answer. knn and kernel_ridge instead form a
+  # chunk x chunk distance or kernel matrix, so the row height squares into the output
+  # tile and has to come down; see the note on each.
+  #
+  # Full-width bands rather than square tiles: every reduction here is row-local, and
+  # splitting columns forces a combine none of them ask for. Square tiles are also not
+  # reachable on a tall-skinny shape without falling far below the size guidance -- at
+  # 1,000 columns a square tile is 8 MB -- because a Dask chunk is also its unit of
+  # scheduling, where SystemDS groups several blocks into one partition.
 
   # ---------------------------------------------------------------------------
   # Phase 1 -- coverage cut-through
@@ -486,7 +529,7 @@ runs:
     dataset: dense_d32
     resource_profiles: [mem16]
     entrypoint: ${plan.dir}/lmcg/systemds.dml
-    blocksize_sweeps: {ooc: [500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1500], spark: [1000]}
     parameters:
       dask_chunk: 12500
       # raised from 2: conjugate gradient needs ~10-100 steps to be CG at all.
@@ -524,7 +567,7 @@ runs:
     dataset: dense_d32
     resource_profiles: [mem16]
     entrypoint: ${plan.dir}/kmeans/systemds.dml
-    blocksize_sweeps: {ooc: [500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1500], spark: [1000]}
     parameters:
       dask_chunk: 12500
       clusters: 32
@@ -562,7 +605,7 @@ runs:
     dataset: dense_d32
     resource_profiles: [mem16]
     entrypoint: ${plan.dir}/l2svm/systemds.dml
-    blocksize_sweeps: {ooc: [500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1500], spark: [1000]}
     parameters:
       dask_chunk: 12500
       # raised from 3: an SVM solved in 3 outer steps is not a converged fit, and at
@@ -605,7 +648,7 @@ runs:
     dataset: dense_d32
     resource_profiles: [mem16]
     entrypoint: ${plan.dir}/multilogreg/systemds.dml
-    blocksize_sweeps: {ooc: [500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1500], spark: [1000]}
     parameters:
       dask_chunk: 12500
       # Raised from 1/1: one outer and one inner step is a single gradient step, not
@@ -649,7 +692,7 @@ runs:
     dataset: gnmf_d32
     resource_profiles: [mem16]
     entrypoint: ${plan.dir}/gnmf/systemds.dml
-    blocksize_sweeps: {ooc: [500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1500], spark: [1000]}
     parameters:
       dask_chunk: 12500
       rank: 16
@@ -689,12 +732,14 @@ runs:
     resource_profiles: [mem16]
     parameter_cases: knn_anchor
     entrypoint: ${plan.dir}/knn/systemds.dml
-    blocksize_sweeps: {ooc: [500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1500], spark: [1000]}
     parameters:
-      # 5,000 rows is 20 MB at 512 columns -- below the usual guidance, but it is the
-      # largest chunk that divides every boundary this run slices at, and 40 chunks
-      # is far too few for per-task overhead to matter.
-      dask_chunk: 5000
+      # The distance matrix is chunk x chunk, so this row count sets the output tile
+      # rather than the 512-column input band: 2,500 rows is a 50 MiB tile, where the
+      # 5,000 that slice alignment also permits would be 200 MiB and spill at 64 threads.
+      # Chunks must divide every boundary this run slices at, whose gcd with the row
+      # count is 5,000, leaving 2,500 as the largest tile inside the 100 MiB target.
+      dask_chunk: 2500
       query_rows: 25000
       neighbours: 5
       systemds_args: >-
@@ -728,10 +773,10 @@ runs:
   # comparison is one of I/O efficiency rather than of allocation strategy.
   - id: mlp_wide
     dataset: mlp_wide
-    resource_profiles: [mem16]
+    resource_profiles: [mem16_mlp]
     parameter_cases: mlp_hidden
     entrypoint: ${plan.dir}/mlp/systemds.dml
-    blocksize_sweeps: {ooc: [500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1500], spark: [1000]}
     parameters:
       # 512 rows is 67 MB at 16,384 columns and divides the dataset exactly,
       # giving 32 chunks. Sized on the input rather than the activation because
@@ -784,11 +829,12 @@ runs:
   # data:memory is the point of the cell.
   # ---------------------------------------------------------------------------
   # Budget 128 -> 8 -> 4 GB at 32 GB of data.
-  - id: lmcg_memory
+  - &lmcg_memory_run
+    id: lmcg_memory
     dataset: dense_d32
     resource_profiles: {group: memory_rest}
     entrypoint: ${plan.dir}/lmcg/systemds.dml
-    blocksize_sweeps: {ooc: [500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1500], spark: [1000]}
     parameters:
       dask_chunk: 12500
       # raised from 2: conjugate gradient needs ~10-100 steps to be CG at all.
@@ -822,11 +868,12 @@ runs:
           --output "${run.outputs}/dask-r${rep}.json"
 
   # Budget 128 -> 8 -> 4 GB at 32 GB of data.
-  - id: kmeans_memory
+  - &kmeans_memory_run
+    id: kmeans_memory
     dataset: dense_d32
     resource_profiles: {group: memory_rest}
     entrypoint: ${plan.dir}/kmeans/systemds.dml
-    blocksize_sweeps: {ooc: [500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1500], spark: [1000]}
     parameters:
       dask_chunk: 12500
       clusters: 32
@@ -860,11 +907,12 @@ runs:
           --output "${run.outputs}/dask-r${rep}.json"
 
   # Budget 128 -> 8 -> 4 GB at 32 GB of data.
-  - id: multilogreg_memory
+  - &multilogreg_memory_run
+    id: multilogreg_memory
     dataset: dense_d32
     resource_profiles: {group: memory_rest}
     entrypoint: ${plan.dir}/multilogreg/systemds.dml
-    blocksize_sweeps: {ooc: [500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1500], spark: [1000]}
     parameters:
       dask_chunk: 12500
       # Raised from 1/1: one outer and one inner step is a single gradient step, not
@@ -914,7 +962,7 @@ runs:
     dataset: {group: dense_ladder}
     resource_profiles: [mem32]
     entrypoint: ${plan.dir}/lmcg/systemds.dml
-    blocksize_sweeps: {ooc: [500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1500], spark: [1000]}
     parameters:
       dask_chunk: 12500
       iterations: 10
@@ -951,7 +999,7 @@ runs:
     dataset: {group: dense_ladder}
     resource_profiles: [mem32]
     entrypoint: ${plan.dir}/kmeans/systemds.dml
-    blocksize_sweeps: {ooc: [500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1500], spark: [1000]}
     parameters:
       dask_chunk: 12500
       clusters: 32
@@ -1002,7 +1050,7 @@ runs:
     dataset: dense_d32_tall
     resource_profiles: [mem16]
     entrypoint: ${plan.dir}/lmcg/systemds.dml
-    blocksize_sweeps: {ooc: [8000], spark: [8000]}
+    blocksize_sweeps: {ooc: [1500], spark: [8000]}
     parameters:
       dask_chunk: 125000
       iterations: 10
@@ -1045,7 +1093,7 @@ runs:
     dataset: dense_d32_tall
     resource_profiles: [mem16]
     entrypoint: ${plan.dir}/kmeans/systemds.dml
-    blocksize_sweeps: {ooc: [8000], spark: [8000]}
+    blocksize_sweeps: {ooc: [1500], spark: [8000]}
     parameters:
       dask_chunk: 125000
       clusters: 32
@@ -1089,12 +1137,14 @@ runs:
     resource_profiles: [mem16]
     parameter_cases: knn_rest
     entrypoint: ${plan.dir}/knn/systemds.dml
-    blocksize_sweeps: {ooc: [500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1500], spark: [1000]}
     parameters:
-      # 5,000 rows is 20 MB at 512 columns -- below the usual guidance, but it is the
-      # largest chunk that divides every boundary this run slices at, and 40 chunks
-      # is far too few for per-task overhead to matter.
-      dask_chunk: 5000
+      # The distance matrix is chunk x chunk, so this row count sets the output tile
+      # rather than the 512-column input band: 2,500 rows is a 50 MiB tile, where the
+      # 5,000 that slice alignment also permits would be 200 MiB and spill at 64 threads.
+      # Chunks must divide every boundary this run slices at, whose gcd with the row
+      # count is 5,000, leaving 2,500 as the largest tile inside the 100 MiB target.
+      dask_chunk: 2500
       query_rows: 25000
       neighbours: 5
       systemds_args: >-
@@ -1144,7 +1194,7 @@ runs:
     resource_profiles: [mem16]
     parameter_cases: krr_anchor
     entrypoint: ${plan.dir}/kernel_ridge/systemds.dml
-    blocksize_sweeps: {ooc: [500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1500], spark: [1000]}
     parameters:
       # 2,500 rows is 2.6 MB of input but 50 MB of Gram matrix once squared onto
       # the columns, and divides all three sizes in `krr_size` exactly.
@@ -1189,7 +1239,7 @@ runs:
     resource_profiles: [mem16]
     parameter_cases: krr_rest
     entrypoint: ${plan.dir}/kernel_ridge/systemds.dml
-    blocksize_sweeps: {ooc: [500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1500], spark: [1000]}
     parameters:
       # 2,500 rows is 2.6 MB of input but 50 MB of Gram matrix once squared onto
       # the columns, and divides all three sizes in `krr_size` exactly.
@@ -1274,7 +1324,7 @@ runs:
     dataset: dense_d32_wide
     resource_profiles: [mem16]
     entrypoint: ${plan.dir}/lmcg/systemds.dml
-    blocksize_sweeps: {ooc: [500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1500], spark: [1000]}
     parameters:
       dask_chunk: 125
       iterations: 10
@@ -1311,7 +1361,7 @@ runs:
     dataset: dense_d32_wide
     resource_profiles: [mem16]
     entrypoint: ${plan.dir}/kmeans/systemds.dml
-    blocksize_sweeps: {ooc: [500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1500], spark: [1000]}
     parameters:
       dask_chunk: 125
       clusters: 32
@@ -1342,3 +1392,20 @@ runs:
           --threads ${resources.dask_threads}
           --memory-limit ${resources.dask_memory_limit} --temporary-directory "${run.results}/dask-spill"
           --output "${run.outputs}/dask-r${rep}.json"
+
+  # CP codegen references only where the 32 GB input fits the 96 GiB heap.
+  - <<: *lmcg_memory_run
+    id: lmcg_spoof
+    resource_profiles: [mem128]
+    implementations:
+      - {id: systemds-cp-spoof, template: systemds-cp-spoof}
+  - <<: *kmeans_memory_run
+    id: kmeans_spoof
+    resource_profiles: [mem128]
+    implementations:
+      - {id: systemds-cp-spoof, template: systemds-cp-spoof}
+  - <<: *multilogreg_memory_run
+    id: multilogreg_spoof
+    resource_profiles: [mem128]
+    implementations:
+      - {id: systemds-cp-spoof, template: systemds-cp-spoof}

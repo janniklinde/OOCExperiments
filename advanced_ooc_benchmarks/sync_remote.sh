@@ -18,6 +18,7 @@ data_dir="${BENCH_REMOTE_DATA_DIR:-}"
 write_env=1
 force_env=0
 send_jar=1
+jar_override=""
 dry=()
 
 usage() {
@@ -29,6 +30,7 @@ Usage: ./sync_remote.sh [HOST] [REMOTE_DIR] [options]
 
   --data-dir PATH   remote dataset/results root written into docker/.env
                     (default: <remote home>/<REMOTE_DIR>/data)
+  --jar PATH        override tools.systemds_jar (bindings come from the same checkout)
   --no-jar          skip the SystemDS jar and lib/ (~350 MB); the Python
                     bindings are sent regardless, being small and required
   --no-env          do not write docker/.env on the remote
@@ -42,6 +44,7 @@ positional=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --data-dir) data_dir="$2"; shift 2 ;;
+    --jar) jar_override="$2"; shift 2 ;;
     --no-jar) send_jar=0; shift ;;
     --no-env) write_env=0; shift ;;
     --force-env) force_env=1; shift ;;
@@ -76,7 +79,7 @@ plan_value() {
   ' "$plan"
 }
 
-jar="$(plan_value tools.systemds_jar)"
+jar="${jar_override:-$(plan_value tools.systemds_jar)}"
 jar="${jar/#\~/$HOME}"
 lib="$(dirname "$jar")/lib"
 # The Python bindings ship with the jar rather than separately: dataset preparation
@@ -105,14 +108,16 @@ else
   exit 2
 fi
 
-ssh "$host" "mkdir -p ~/$remote/advanced_ooc_benchmarks ~/$remote/systemds"
+if [[ ${#dry[@]} == 0 ]]; then
+  ssh "$host" "mkdir -p ~/$remote/advanced_ooc_benchmarks ~/$remote/systemds"
+fi
 
 echo
 echo "== benchmark directory"
 # --delete keeps the remote a mirror; results/ and caches stay local because a
 # remote run regenerates its own under the plan's root.
 rsync -az --delete "${dry[@]}" --info=stats1 \
-  --exclude='*/results' --exclude='__pycache__' --exclude='.pytest_cache' \
+  --exclude='/results' --exclude='/results-*' --exclude='*/results' --exclude='__pycache__' --exclude='.pytest_cache' \
   --exclude='scratch_space' --exclude='.env' --exclude='*.container.yaml' \
   --exclude='docker/data' \
   "$here/" "$host:$remote/advanced_ooc_benchmarks/"
@@ -188,6 +193,9 @@ cat <<NEXT
 Synced. On $host:
 
   cd ~/$remote/advanced_ooc_benchmarks/docker
-  ./bench.sh build
-  ./bench.sh run
+  # Recreate an idle container to refresh the single-file jar mount.
+  # The existing image can be reused; build only if image dependencies changed.
+  ./bench.sh down
+  ./bench.sh up
+  ./bench.sh run --only lmcg-mem16-ooc-bs1500 --implementation systemds-ooc
 NEXT

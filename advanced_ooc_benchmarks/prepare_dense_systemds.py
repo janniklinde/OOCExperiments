@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Convert canonical row-major FP64 files to SystemDS binary blocks in bounded chunks.
 
-Each raw input is transferred through the Python binding as a sequence of small,
+Existing native variants are reblocked with one OOC read/write job. Otherwise,
+each raw input is transferred through the Python binding as a sequence of small,
 row-aligned temporary matrices. A native SystemDS OOC program then rbinds those
 matrices and writes one matrix with the requested final block size.
 """
@@ -10,6 +11,7 @@ import argparse
 import gc
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -41,6 +43,21 @@ def native_state(path, rows, cols, blocksize=None):
     except (TypeError, ValueError):
         matches = False
     return "valid" if matches else "incompatible"
+
+
+def find_native_variant(output, name, rows, cols):
+    candidates = [output.parent / name]
+    candidates.extend(sorted(output.parent.glob(f"{name}-bs*")))
+    for candidate in candidates:
+        if candidate == output or (candidate.name != name and
+                                   not re.fullmatch(re.escape(name) + r"-bs\d+", candidate.name)):
+            continue
+        if native_state(candidate, rows, cols) != "valid":
+            continue
+        metadata = read_json(Path(str(candidate) + ".mtd"))
+        if metadata.get("format") == "binary":
+            return candidate
+    return None
 
 
 def raw_identity(path, rows, cols, dtype):
@@ -182,7 +199,7 @@ def stage_chunks(raw_path, rows, cols, blocksize, chunk_bytes, staging, dtype=np
     return chunks
 
 
-def assemble(chunks, output, rows, cols, blocksize, java, jar, config, heap, java_tmp):
+def assemble(chunks, output, rows, cols, blocksize, java, jar, config, heap, java_tmp, work_dir=None):
     assembly = output.with_name(output.name + ".assembling")
     completion = Path(str(assembly) + ".complete.json")
     completion_record = {
@@ -203,7 +220,7 @@ def assemble(chunks, output, rows, cols, blocksize, java, jar, config, heap, jav
             f"write(X, {dml_string(assembly)}, format=\"binary\", "
             f"rows_in_block={blocksize}, cols_in_block={blocksize});\n"
         )
-        dml_path = chunks[0].parent / "assemble.dml"
+        dml_path = (work_dir or chunks[0].parent) / "assemble.dml"
         dml_path.write_text(program, encoding="utf-8")
         command = [java, f"-Xmx{heap}", "-XX:+UseG1GC", "--add-modules=jdk.incubator.vector"]
         if java_tmp:
@@ -230,7 +247,7 @@ def assemble(chunks, output, rows, cols, blocksize, java, jar, config, heap, jav
 
 def convert_fp64(raw, output, rows, cols, blocksize, chunk_mib, java, jar, config,
                   java_heap="3g", java_tmp=None, replace_invalid=False, keep_staging=False,
-                  staging=None, dtype=np.float64):
+                  staging=None, dtype=np.float64, native_source=None):
     """Convert one raw row-major numeric matrix to one native SystemDS matrix."""
     raw = Path(raw)
     output = Path(output)
@@ -252,8 +269,13 @@ def convert_fp64(raw, output, rows, cols, blocksize, chunk_mib, java, jar, confi
     if staging is None:
         staging = output.parent / "systemds-staging" / f"{output.name}-bs{blocksize}"
     staging = Path(staging)
-    chunks = stage_chunks(raw, rows, cols, blocksize, chunk_mib << 20, staging, dtype)
-    assemble(chunks, output, rows, cols, blocksize, java, jar, config, java_heap, java_tmp)
+    if native_source is not None:
+        print(f"Reblocking existing native matrix {native_source} to blocksize {blocksize}.", flush=True)
+        staging.mkdir(parents=True, exist_ok=True)
+        chunks = [native_source]
+    else:
+        chunks = stage_chunks(raw, rows, cols, blocksize, chunk_mib << 20, staging, dtype)
+    assemble(chunks, output, rows, cols, blocksize, java, jar, config, java_heap, java_tmp, staging)
     if not keep_staging:
         shutil.rmtree(staging)
 
@@ -299,7 +321,8 @@ def main():
         staging = args.data / "systemds-staging" / f"{name}-bs{args.blocksize}"
         convert_fp64(raw, output, rows, cols, args.blocksize, args.chunk_mib, args.java,
                      args.systemds_jar, args.config, args.java_heap, args.java_tmp,
-                     args.replace_invalid, args.keep_staging, staging)
+                     args.replace_invalid, args.keep_staging, staging,
+                     native_source=find_native_variant(output, name, rows, cols))
         print(f"Prepared {name} at blocksize {args.blocksize}: {output}", flush=True)
 
 

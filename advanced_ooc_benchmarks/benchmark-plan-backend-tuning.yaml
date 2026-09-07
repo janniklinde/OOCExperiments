@@ -15,7 +15,7 @@ environment:
   SPARK_HOME: /home/jannik/.venvs/spark35/lib/python3.13/site-packages/pyspark
 defaults:
   repetitions: 1
-  prepare_timeout_seconds: 1000
+  prepare_timeout_seconds: 7200
   resources:
     threads: 64
     dask_threads: auto

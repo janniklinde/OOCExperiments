@@ -28,9 +28,9 @@ defaults:
     dask_threads: auto
     # Not the Zarr store's chunking: every arm loads through from_zarr, which inherits the
     # stored chunks, so nothing reads this today. It bounds any intermediate Dask decides
-    # to auto-chunk, and is held at the same 100 MiB the stores target so a fallback
+    # to auto-chunk, and is held at the same 100 MB the dense stores target so a fallback
     # cannot quietly introduce a differently sized tile.
-    dask_chunk_size: 100MiB
+    dask_chunk_size: 100MB
     dask_memory_limit: 3GiB
     python_jobs: 4
     spark_threads: auto
@@ -45,20 +45,16 @@ telemetry:
 
 # Named profiles keep correlated cgroup and JVM settings together. A run may
 # select one or a list with `resource_profiles: {group: scaling}`.
-# Concurrency is the only tuned resource. Partition sizes stay at each backend's own
-# recommended value -- Dask 100 MB chunks, SystemDS 128 MB Spark partitions through the
-# explicit Hadoop fs.local.block.size setting -- and each backend instead gets the largest thread count
-# whose concurrent partitions fit half its memory budget, capped at the 64 physical cores
-# of the benchmark host. Dask: 0.5 * dask_memory_limit / 100 MB. Spark: 0.5 * java_heap /
-# 128 MB. OOC bounds its own cache independently of the budget, so it keeps all 64.
+# Dask: 100 MB dense chunks, concurrency 0.25 of worker memory;
+# Spark: 128 MiB partitions, 4 tasks per 3 GiB heap, capped at 64; JVM cores stay independent.
 resource_profiles:
-  mem128: {memory_max: 128G, java_heap: 96g, dask_memory_limit: 96GiB, dask_threads: 64, spark_threads: 64}
-  mem32: {memory_max: 32G, java_heap: 24g, dask_memory_limit: 24GiB, dask_threads: 64, spark_threads: 64}
-  mem16: {memory_max: 16G, java_heap: 12g, dask_memory_limit: 12GiB, dask_threads: 64, spark_threads: 48}
-  # MLP uses 256 MiB weight chunks: 24 concurrent chunks occupy half of 12 GiB.
-  mem16_mlp: {memory_max: 16G, java_heap: 12g, dask_memory_limit: 12GiB, dask_threads: 24, spark_threads: 48}
-  mem8: {memory_max: 8G, java_heap: 6g, dask_memory_limit: 6GiB, dask_threads: 32, spark_threads: 24}
-  mem4: {memory_max: 4G, java_heap: 3g, dask_memory_limit: 3GiB, dask_threads: 16, spark_threads: 12}
+  mem128: {memory_max: 128G, java_heap: 96g, dask_memory_limit: 96GiB, dask_threads: 64, spark_threads: 64, ooc_replay_bytes: 402653184, ooc_replay_blocks: 16}
+  mem32: {memory_max: 32G, java_heap: 24g, dask_memory_limit: 24GiB, dask_threads: 64, spark_threads: 32, ooc_replay_bytes: 402653184, ooc_replay_blocks: 16}
+  mem16: {memory_max: 16G, java_heap: 12g, dask_memory_limit: 12GiB, dask_threads: 32, spark_threads: 16, ooc_replay_bytes: 402653184, ooc_replay_blocks: 16}
+  # MLP retains 256 MiB weight chunks: 12 concurrent chunks occupy one quarter of 12 GiB.
+  mem16_mlp: {memory_max: 16G, java_heap: 12g, dask_memory_limit: 12GiB, dask_threads: 12, spark_threads: 16, ooc_replay_bytes: 402653184, ooc_replay_blocks: 16}
+  mem8: {memory_max: 8G, java_heap: 6g, dask_memory_limit: 6GiB, dask_threads: 16, spark_threads: 8, ooc_replay_bytes: 241591910, ooc_replay_blocks: 16}
+  mem4: {memory_max: 4G, java_heap: 3g, dask_memory_limit: 3GiB, dask_threads: 8, spark_threads: 4, ooc_replay_bytes: 120795955, ooc_replay_blocks: 16}
 
 # Named sets of profiles, selected by a run as `resource_profiles: {group: <name>}` --
 # the same form `dataset: {group: ...}` uses. Adding a profile here reaches every run
@@ -103,7 +99,7 @@ templates:
     blocksize_sweep: ooc
     command: >-
       "${tools.java}" -Xms${resources.java_heap} -Xmx${resources.java_heap}
-      -XX:+UseG1GC -XX:G1HeapRegionSize=8m
+      -XX:+UseG1GC -XX:G1HeapRegionSize=32m
       -XX:ActiveProcessorCount=${resources.threads}
       --add-modules=jdk.incubator.vector -Djava.io.tmpdir="${run.results}/java-tmp"
       -jar "${tools.systemds_jar}" -f "${run.entrypoint}" -exec singlenode
@@ -116,7 +112,7 @@ templates:
   # reads the same X-bs<blen>.
   systemds-cp:
     comparable: true
-    enabled: true
+    enabled: false
     blocksize_sweep: ooc
     command: >-
       "${tools.java}" -Xms${resources.java_heap} -Xmx${resources.java_heap}
@@ -152,8 +148,8 @@ templates:
     command: >-
       "${tools.spark_submit}" --master "local[${resources.spark_threads}]"
       --driver-memory "${resources.java_heap}" --executor-memory "${resources.java_heap}"
-      --driver-java-options "-XX:+UseG1GC -XX:G1HeapRegionSize=8m
-      -XX:ActiveProcessorCount=${resources.spark_threads} --add-modules=jdk.incubator.vector
+      --driver-java-options "-XX:+UseG1GC -XX:G1HeapRegionSize=32m
+      -XX:ActiveProcessorCount=${resources.threads} --add-modules=jdk.incubator.vector
       --add-opens=java.base/java.nio=ALL-UNNAMED
       --add-opens=java.base/java.io=ALL-UNNAMED
       --add-opens=java.base/java.util=ALL-UNNAMED
@@ -163,7 +159,7 @@ templates:
       --add-opens=java.base/java.util.concurrent=ALL-UNNAMED
       --add-opens=java.base/sun.nio.ch=ALL-UNNAMED
       -Djava.io.tmpdir=${run.results}/java-tmp"
-      --conf "spark.executor.extraJavaOptions=--add-modules=jdk.incubator.vector
+      --conf "spark.executor.extraJavaOptions=-XX:ActiveProcessorCount=${resources.threads} --add-modules=jdk.incubator.vector
       --add-opens=java.base/java.nio=ALL-UNNAMED
       --add-opens=java.base/java.io=ALL-UNNAMED
       --add-opens=java.base/java.util=ALL-UNNAMED
@@ -187,7 +183,7 @@ templates:
       ${run.systemds_args}
   python:
     comparable: true
-    enabled: true
+    enabled: false
     required_python_modules: [numpy]
     environment:
       OMP_NUM_THREADS: ${resources.threads}
@@ -270,7 +266,7 @@ datasets:
               <sysds.scratch>${dataset.dir}/scratch/prepare-bs${run.blocksize}</sysds.scratch>
               <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>
               <sysds.ooc.io.direct>true</sysds.ooc.io.direct>
-              <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>
+              <sysds.ooc.io.reader.buffersize>8388608</sysds.ooc.io.reader.buffersize>
               <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>
               <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>
             </root>
@@ -475,10 +471,19 @@ systemds_setup: &systemds_setup
       <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>
       <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>
       <sysds.ooc.io.direct>true</sysds.ooc.io.direct>
-      <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>
+      <sysds.ooc.io.reader.buffersize>8388608</sysds.ooc.io.reader.buffersize>
       <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>
       <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>
       <!--<sysds.native.blas>openblas</sysds.native.blas>-->
+      <sysds.ooc.memory.broker.fraction>0.3333333333333333</sysds.ooc.memory.broker.fraction>
+      <sysds.ooc.memory.broker.max>4294967296</sysds.ooc.memory.broker.max>
+      <sysds.ooc.memory.prefetch.fraction>0.1</sysds.ooc.memory.prefetch.fraction>
+      <sysds.ooc.memory.prefetch.max>1073741824</sysds.ooc.memory.prefetch.max>
+      <sysds.ooc.memory.cache.fraction.soft>0.5</sysds.ooc.memory.cache.fraction.soft>
+      <sysds.ooc.memory.cache.fraction.hard>0.6</sysds.ooc.memory.cache.fraction.hard>
+      <sysds.ooc.source.replay.memory>${resources.ooc_replay_bytes}</sysds.ooc.source.replay.memory>
+      <sysds.ooc.source.bulksize>${resources.ooc_replay_bytes}</sysds.ooc.source.bulksize>
+      <sysds.ooc.source.replay.prefetch>${resources.ooc_replay_blocks}</sysds.ooc.source.replay.prefetch>
     </root>
     EOF
     sed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|' \
@@ -500,9 +505,9 @@ runs:
   #
   # `dask_chunk` is the row height of the prepared Zarr store, chosen as the largest
   # exact divisor of the dataset -- so no trailing chunk is padded -- that keeps the run's
-  # largest materialized tile inside Dask's ~100 MiB guidance. Which tile that is depends
+  # largest materialized tile inside its workload-specific bound. Which tile that is depends
   # on the kernel. Matvec and Gram reductions contract to something tiny, so the input
-  # band dominates and ~95 MiB bands are the answer. knn and kernel_ridge instead form a
+  # band dominates and 100 MB bands use the tuned LMCG target. knn and kernel_ridge instead form a
   # chunk x chunk distance or kernel matrix, so the row height squares into the output
   # tile and has to come down; see the note on each.
   #
@@ -529,7 +534,7 @@ runs:
     dataset: dense_d32
     resource_profiles: [mem16]
     entrypoint: ${plan.dir}/lmcg/systemds.dml
-    blocksize_sweeps: {ooc: [1500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1000], spark: [1000]}
     parameters:
       dask_chunk: 12500
       # raised from 2: conjugate gradient needs ~10-100 steps to be CG at all.
@@ -567,7 +572,7 @@ runs:
     dataset: dense_d32
     resource_profiles: [mem16]
     entrypoint: ${plan.dir}/kmeans/systemds.dml
-    blocksize_sweeps: {ooc: [1500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1000], spark: [1000]}
     parameters:
       dask_chunk: 12500
       clusters: 32
@@ -605,7 +610,7 @@ runs:
     dataset: dense_d32
     resource_profiles: [mem16]
     entrypoint: ${plan.dir}/l2svm/systemds.dml
-    blocksize_sweeps: {ooc: [1500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1000], spark: [1000]}
     parameters:
       dask_chunk: 12500
       # raised from 3: an SVM solved in 3 outer steps is not a converged fit, and at
@@ -648,7 +653,7 @@ runs:
     dataset: dense_d32
     resource_profiles: [mem16]
     entrypoint: ${plan.dir}/multilogreg/systemds.dml
-    blocksize_sweeps: {ooc: [1500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1000], spark: [1000]}
     parameters:
       dask_chunk: 12500
       # Raised from 1/1: one outer and one inner step is a single gradient step, not
@@ -692,7 +697,7 @@ runs:
     dataset: gnmf_d32
     resource_profiles: [mem16]
     entrypoint: ${plan.dir}/gnmf/systemds.dml
-    blocksize_sweeps: {ooc: [1500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1000], spark: [1000]}
     parameters:
       dask_chunk: 12500
       rank: 16
@@ -732,7 +737,7 @@ runs:
     resource_profiles: [mem16]
     parameter_cases: knn_anchor
     entrypoint: ${plan.dir}/knn/systemds.dml
-    blocksize_sweeps: {ooc: [1500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1000], spark: [1000]}
     parameters:
       # The distance matrix is chunk x chunk, so this row count sets the output tile
       # rather than the 512-column input band: 2,500 rows is a 50 MiB tile, where the
@@ -776,7 +781,7 @@ runs:
     resource_profiles: [mem16_mlp]
     parameter_cases: mlp_hidden
     entrypoint: ${plan.dir}/mlp/systemds.dml
-    blocksize_sweeps: {ooc: [1500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1000], spark: [1000]}
     parameters:
       # 512 rows is 67 MB at 16,384 columns and divides the dataset exactly,
       # giving 32 chunks. Sized on the input rather than the activation because
@@ -834,7 +839,7 @@ runs:
     dataset: dense_d32
     resource_profiles: {group: memory_rest}
     entrypoint: ${plan.dir}/lmcg/systemds.dml
-    blocksize_sweeps: {ooc: [1500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1000], spark: [1000]}
     parameters:
       dask_chunk: 12500
       # raised from 2: conjugate gradient needs ~10-100 steps to be CG at all.
@@ -873,7 +878,7 @@ runs:
     dataset: dense_d32
     resource_profiles: {group: memory_rest}
     entrypoint: ${plan.dir}/kmeans/systemds.dml
-    blocksize_sweeps: {ooc: [1500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1000], spark: [1000]}
     parameters:
       dask_chunk: 12500
       clusters: 32
@@ -912,7 +917,7 @@ runs:
     dataset: dense_d32
     resource_profiles: {group: memory_rest}
     entrypoint: ${plan.dir}/multilogreg/systemds.dml
-    blocksize_sweeps: {ooc: [1500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1000], spark: [1000]}
     parameters:
       dask_chunk: 12500
       # Raised from 1/1: one outer and one inner step is a single gradient step, not
@@ -950,6 +955,49 @@ runs:
           --tolerance ${run.tolerance} --reg ${run.reg} --threads ${resources.dask_threads}
           --memory-limit ${resources.dask_memory_limit} --temporary-directory "${run.results}/dask-spill"
           --output "${run.outputs}/dask-r${rep}.json"
+  # L2 SVM, CG with line search.
+  - &l2svm_memory_run
+    id: l2svm_memory
+    dataset: dense_d32
+    resource_profiles: {group: memory_rest}
+    entrypoint: ${plan.dir}/l2svm/systemds.dml
+    blocksize_sweeps: {ooc: [1000], spark: [1000]}
+    parameters:
+      dask_chunk: 12500
+      # raised from 3: an SVM solved in 3 outer steps is not a converged fit, and at
+      # 3 the ~15s JVM warmup dominated the measurement rather than the OOC path.
+      iterations: 10
+      inner_iterations: 20
+      tolerance: 0.0
+      reg: 1.0
+      systemds_args: >-
+        -args "${input.X}" "${input.y}" ${run.tolerance} ${run.reg}
+        ${run.iterations} ${run.inner_iterations}
+        "${run.outputs}/systemds-model-r${rep}"
+    inputs: {X: {artifact: X}, y: {artifact: binary_y}}
+    resources: {timeout_seconds: 1800}
+    setup: *systemds_setup
+    cold_cache: ["${dataset.dir}"]
+    implementations:
+      - {id: systemds-ooc, template: systemds-ooc}
+      - {id: systemds-spark, template: systemds-spark}
+      - {id: systemds-cp, template: systemds-cp}
+      - id: numpy-cg-linesearch
+        template: python
+        command: >-
+          "${tools.python}" "${plan.dir}/l2svm/numpy.py" "${dataset.dir}"
+          --iterations ${run.iterations} --inner-iterations ${run.inner_iterations}
+          --tolerance ${run.tolerance} --reg ${run.reg}
+          --output "${run.outputs}/numpy-r${rep}.json"
+      - id: dask-cg-linesearch
+        template: dask
+        command: >-
+          "${tools.python}" "${plan.dir}/l2svm/dask_array.py" "${dataset.dir}"
+          --iterations ${run.iterations} --inner-iterations ${run.inner_iterations}
+          --tolerance ${run.tolerance} --reg ${run.reg}
+          --threads ${resources.dask_threads}
+          --memory-limit ${resources.dask_memory_limit} --temporary-directory "${run.results}/dask-spill"
+          --output "${run.outputs}/dask-r${rep}.json"
 
   # ---------------------------------------------------------------------------
   # Phase 3 -- data size
@@ -962,7 +1010,7 @@ runs:
     dataset: {group: dense_ladder}
     resource_profiles: [mem32]
     entrypoint: ${plan.dir}/lmcg/systemds.dml
-    blocksize_sweeps: {ooc: [1500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1000], spark: [1000]}
     parameters:
       dask_chunk: 12500
       iterations: 10
@@ -999,7 +1047,7 @@ runs:
     dataset: {group: dense_ladder}
     resource_profiles: [mem32]
     entrypoint: ${plan.dir}/kmeans/systemds.dml
-    blocksize_sweeps: {ooc: [1500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1000], spark: [1000]}
     parameters:
       dask_chunk: 12500
       clusters: 32
@@ -1050,7 +1098,7 @@ runs:
     dataset: dense_d32_tall
     resource_profiles: [mem16]
     entrypoint: ${plan.dir}/lmcg/systemds.dml
-    blocksize_sweeps: {ooc: [1500], spark: [8000]}
+    blocksize_sweeps: {ooc: [1000], spark: [8000]}
     parameters:
       dask_chunk: 125000
       iterations: 10
@@ -1093,7 +1141,7 @@ runs:
     dataset: dense_d32_tall
     resource_profiles: [mem16]
     entrypoint: ${plan.dir}/kmeans/systemds.dml
-    blocksize_sweeps: {ooc: [1500], spark: [8000]}
+    blocksize_sweeps: {ooc: [1000], spark: [8000]}
     parameters:
       dask_chunk: 125000
       clusters: 32
@@ -1137,7 +1185,7 @@ runs:
     resource_profiles: [mem16]
     parameter_cases: knn_rest
     entrypoint: ${plan.dir}/knn/systemds.dml
-    blocksize_sweeps: {ooc: [1500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1000], spark: [1000]}
     parameters:
       # The distance matrix is chunk x chunk, so this row count sets the output tile
       # rather than the 512-column input band: 2,500 rows is a 50 MiB tile, where the
@@ -1194,7 +1242,7 @@ runs:
     resource_profiles: [mem16]
     parameter_cases: krr_anchor
     entrypoint: ${plan.dir}/kernel_ridge/systemds.dml
-    blocksize_sweeps: {ooc: [1500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1000], spark: [1000]}
     parameters:
       # 2,500 rows is 2.6 MB of input but 50 MB of Gram matrix once squared onto
       # the columns, and divides all three sizes in `krr_size` exactly.
@@ -1239,7 +1287,7 @@ runs:
     resource_profiles: [mem16]
     parameter_cases: krr_rest
     entrypoint: ${plan.dir}/kernel_ridge/systemds.dml
-    blocksize_sweeps: {ooc: [1500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1000], spark: [1000]}
     parameters:
       # 2,500 rows is 2.6 MB of input but 50 MB of Gram matrix once squared onto
       # the columns, and divides all three sizes in `krr_size` exactly.
@@ -1324,7 +1372,7 @@ runs:
     dataset: dense_d32_wide
     resource_profiles: [mem16]
     entrypoint: ${plan.dir}/lmcg/systemds.dml
-    blocksize_sweeps: {ooc: [1500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1000], spark: [1000]}
     parameters:
       dask_chunk: 125
       iterations: 10
@@ -1361,7 +1409,7 @@ runs:
     dataset: dense_d32_wide
     resource_profiles: [mem16]
     entrypoint: ${plan.dir}/kmeans/systemds.dml
-    blocksize_sweeps: {ooc: [1500], spark: [1000]}
+    blocksize_sweeps: {ooc: [1000], spark: [1000]}
     parameters:
       dask_chunk: 125
       clusters: 32

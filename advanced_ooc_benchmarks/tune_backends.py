@@ -164,7 +164,14 @@ def generate(args):
 def summarize(args):
     root = args.invocation.resolve()
     plan = yaml.safe_load((root / "benchmark-plan.yaml").read_text())
-    tuning = plan["tuning"]
+    tuning = dict(plan["tuning"])
+    configured = {run["id"] for run in plan["runs"]}
+    # A shortened sweep may remove complete round entries from `runs:` without
+    # rewriting the generated tuning manifest. Rank only executions that the
+    # runner could actually have launched.
+    tuning["runs"] = {name: meta for name, meta in tuning["runs"].items()
+                      if name in configured}
+    tuning["repetitions"] = len({meta["round"] for meta in tuning["runs"].values()})
     observations = []
     for name, meta in tuning["runs"].items():
         matches = list(root.glob(name + "-*/logs/*r1.metrics"))

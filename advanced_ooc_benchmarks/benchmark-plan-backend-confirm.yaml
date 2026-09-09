@@ -1,0 +1,2156 @@
+version: 1
+root: /media/jannik/data/OOCExperiments
+results: ${plan.root}/backend-tuning-confirm-results
+tools:
+  java: java
+  python: /home/jannik/.venvs/systemds/bin/python
+  spark_submit: /home/jannik/.venvs/spark35/bin/spark-submit
+  systemds_jar: /home/jannik/Dev/SystemDSTest/systemds/target/SystemDS.jar
+environment:
+  BENCH_ROOT: ${plan.root}
+  BENCH_TMP_DIR: ${plan.root}/tmp
+  SYSDS_LOCAL_TMPDIR: ${plan.root}/tmp/systemds
+  SYSDS_SCRATCH_DIR: ${plan.root}/scratch_space
+  JAVA_IO_TMPDIR: ${plan.root}/tmp/java
+  SPARK_HOME: /home/jannik/.venvs/spark35/lib/python3.13/site-packages/pyspark
+defaults:
+  repetitions: 1
+  prepare_timeout_seconds: 7200
+  resources:
+    threads: 64
+    dask_threads: auto
+    dask_chunk_size: 100MiB
+    dask_memory_limit: 3GiB
+    python_jobs: 4
+    spark_threads: auto
+    swap_max: 0
+    timeout_seconds: 60
+    timeout_grace_seconds: 30
+telemetry:
+  interval_seconds: 3
+resource_profiles:
+  mem128:
+    memory_max: 128G
+    java_heap: 96g
+    dask_memory_limit: 96GiB
+    dask_threads: 64
+    spark_threads: 64
+  mem32:
+    memory_max: 32G
+    java_heap: 24g
+    dask_memory_limit: 24GiB
+    dask_threads: 64
+    spark_threads: 64
+  mem16:
+    memory_max: 16G
+    java_heap: 12g
+    dask_memory_limit: 12GiB
+    dask_threads: 64
+    spark_threads: 48
+  mem16_mlp:
+    memory_max: 16G
+    java_heap: 12g
+    dask_memory_limit: 12GiB
+    dask_threads: 24
+    spark_threads: 48
+  mem8:
+    memory_max: 8G
+    java_heap: 6g
+    dask_memory_limit: 6GiB
+    dask_threads: 32
+    spark_threads: 24
+  mem4:
+    memory_max: 4G
+    java_heap: 3g
+    dask_memory_limit: 3GiB
+    dask_threads: 16
+    spark_threads: 12
+resource_groups:
+  memory_rest:
+  - mem128
+  - mem8
+  - mem4
+parameter_cases:
+  knn_anchor:
+  - id: knn4
+    reference_rows: 20000
+  knn_rest:
+  - id: knn8
+    reference_rows: 40000
+  - id: knn16
+    reference_rows: 80000
+  - id: knn32
+    reference_rows: 160000
+  krr_anchor:
+  - id: krr4
+    train_rows: 12500
+  krr_rest:
+  - id: krr8
+    train_rows: 25000
+  - id: krr16
+    train_rows: 50000
+  mlp_hidden:
+  - id: h40
+    hidden_size: 40960
+templates:
+  systemds-ooc:
+    comparable: true
+    blocksize_sweep: ooc
+    command: '"${tools.java}" -Xms${resources.java_heap} -Xmx${resources.java_heap} -XX:+UseG1GC -XX:G1HeapRegionSize=32m
+      -Xlog:gc*:file=${run.results}/gc.log:time,uptime,level,tags -XX:ActiveProcessorCount=${resources.threads} --add-modules=jdk.incubator.vector
+      -Djava.io.tmpdir="${run.results}/java-tmp" -jar "${tools.systemds_jar}" -f "${run.entrypoint}" -exec singlenode -config
+      "${run.results}/SystemDS-config.xml" -ooc -oocStats -stats ${run.systemds_args}'
+  systemds-cp:
+    comparable: true
+    enabled: true
+    blocksize_sweep: ooc
+    command: '"${tools.java}" -Xms${resources.java_heap} -Xmx${resources.java_heap} -XX:+UseG1GC -XX:G1HeapRegionSize=8m -XX:ActiveProcessorCount=${resources.threads}
+      --add-modules=jdk.incubator.vector -Djava.io.tmpdir="${run.results}/java-tmp" -jar "${tools.systemds_jar}" -f "${run.entrypoint}"
+      -exec singlenode -config "${run.results}/SystemDS-config.xml" -stats ${run.systemds_args}'
+  systemds-cp-spoof:
+    comparable: true
+    enabled: true
+    blocksize_sweep: ooc
+    command: '"${tools.java}" -Xms${resources.java_heap} -Xmx${resources.java_heap} -XX:+UseG1GC -XX:G1HeapRegionSize=8m -XX:ActiveProcessorCount=${resources.threads}
+      --add-modules=jdk.incubator.vector -Djava.io.tmpdir="${run.results}/java-tmp" -jar "${tools.systemds_jar}" -f "${run.entrypoint}"
+      -exec singlenode -config "${run.results}/SystemDS-config-spoof.xml" -stats ${run.systemds_args}'
+  systemds-spark:
+    comparable: true
+    enabled: true
+    blocksize_sweep: spark
+    required_tools:
+    - spark_submit
+    command: '"${tools.spark_submit}" --master "local[${resources.spark_threads}]" --driver-memory "${resources.java_heap}"
+      --executor-memory "${resources.java_heap}" --driver-java-options "-XX:+UseG1GC -XX:G1HeapRegionSize=32m -Xlog:gc*:file=${run.results}/gc.log:time,uptime,level,tags
+      -XX:ActiveProcessorCount=${resources.spark_threads} --add-modules=jdk.incubator.vector --add-opens=java.base/java.nio=ALL-UNNAMED
+      --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED
+      --add-opens=java.base/java.lang.ref=ALL-UNNAMED --add-opens=java.base/java.lang.invoke=ALL-UNNAMED --add-opens=java.base/java.util.concurrent=ALL-UNNAMED
+      --add-opens=java.base/sun.nio.ch=ALL-UNNAMED -Djava.io.tmpdir=${run.results}/java-tmp" --conf "spark.executor.extraJavaOptions=--add-modules=jdk.incubator.vector
+      --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED
+      --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.ref=ALL-UNNAMED --add-opens=java.base/java.lang.invoke=ALL-UNNAMED
+      --add-opens=java.base/java.util.concurrent=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED -Djava.io.tmpdir=${run.results}/java-tmp"
+      --conf "spark.local.dir=${run.results}/spark-local" --conf "spark.ui.enabled=false" --conf "spark.driver.maxResultSize=0"
+      --conf "spark.default.parallelism=${resources.spark_threads}" --conf "spark.sql.shuffle.partitions=${resources.spark_threads}"
+      --conf "spark.dynamicAllocation.enabled=false" --conf "spark.memory.fraction=${run.spark_memory_fraction}" --conf "spark.hadoop.fs.local.block.size=${run.spark_partition_bytes}"
+      "${tools.systemds_jar}" -f "${run.entrypoint}" -exec spark -config "${run.results}/SystemDS-config.xml" -stats ${run.systemds_args}'
+  python:
+    comparable: true
+    enabled: true
+    required_python_modules:
+    - numpy
+    environment:
+      OMP_NUM_THREADS: ${resources.threads}
+      OPENBLAS_NUM_THREADS: ${resources.threads}
+      MKL_NUM_THREADS: ${resources.threads}
+      MALLOC_ARENA_MAX: 2
+  dask:
+    comparable: true
+    enabled: true
+    required_python_modules:
+    - numpy
+    - dask.array
+    - distributed
+    - zarr
+    environment:
+      OMP_NUM_THREADS: 1
+      OPENBLAS_NUM_THREADS: 1
+      MKL_NUM_THREADS: 1
+      VECLIB_MAXIMUM_THREADS: 1
+      NUMEXPR_NUM_THREADS: 1
+      MALLOC_ARENA_MAX: 2
+      DASK_ARRAY__CHUNK_SIZE: ${resources.dask_chunk_size}
+datasets:
+  dense_1m:
+    directory: ${plan.root}/bench-data/dense
+    parameters:
+      rows: 1000000
+      cols: 1024
+      classes: 2
+      sparsity: 1.0
+      distribution: normal
+      seed: 7
+      generator_chunk_mib: 256
+      accept_legacy: true
+      systemds_chunk_mib: 128
+    ready: &id001
+    - metadata.json
+    artifacts: &id002
+      X_raw:
+        path: X.f64
+        size_bytes_product:
+        - ${dataset.rows}
+        - ${dataset.cols}
+        - 8
+        metadata:
+          path: metadata.json
+          expect:
+            rows: ${dataset.rows}
+            cols: ${dataset.cols}
+            classes: ${dataset.classes}
+            dtype: float64
+            layout: row-major raw files; matching SystemDS binary blocks written through the Python API
+            generator: prepare_dense_dataset.py
+            generator_version: 1
+            distribution: ${dataset.distribution}
+            sparsity_requested: ${dataset.sparsity}
+            seed: ${dataset.seed}
+          allow_fallback: ${dataset.accept_legacy}
+          fallback_expect:
+            rows: ${dataset.rows}
+            cols: ${dataset.cols}
+            classes: ${dataset.classes}
+            dtype: float64
+            layout: row-major raw files; matching SystemDS binary blocks written through the Python API
+      binary_y_raw:
+        path: binary_y.f64
+        size_bytes_product:
+        - ${dataset.rows}
+        - 8
+      nn_y_raw:
+        path: nn_y.f64
+        size_bytes_product:
+        - ${dataset.rows}
+        - 8
+    prepare: &id003
+      policy: auto
+      command: 'legacy_args=()
+
+        if [ "${dataset.accept_legacy}" = true ]; then legacy_args+=(--accept-legacy); fi
+
+        "${tools.python}" "${plan.dir}/prepare_dense_dataset.py" --out "${dataset.dir}" --rows ${dataset.rows} --cols ${dataset.cols}
+        --classes ${dataset.classes} --sparsity ${dataset.sparsity} --distribution ${dataset.distribution} --seed ${dataset.seed}
+        --chunk-mib ${dataset.generator_chunk_mib} "${legacy_args[@]}"
+
+        '
+    variants: &id004
+      blocksize:
+        artifacts:
+          X:
+            path: systemds/X-bs${run.blocksize}
+            metadata:
+              expect:
+                rows: ${dataset.rows}
+                cols: ${dataset.cols}
+                rows_in_block: ${run.blocksize}
+                cols_in_block: ${run.blocksize}
+          binary_y:
+            path: systemds/binary_y-bs${run.blocksize}
+            metadata:
+              expect:
+                rows: ${dataset.rows}
+                cols: 1
+                rows_in_block: ${run.blocksize}
+                cols_in_block: ${run.blocksize}
+          nn_y:
+            path: systemds/nn_y-bs${run.blocksize}
+            metadata:
+              expect:
+                rows: ${dataset.rows}
+                cols: 1
+                rows_in_block: ${run.blocksize}
+                cols_in_block: ${run.blocksize}
+        prepare:
+          policy: auto
+          command: "prep_root=\"${dataset.dir}/.sysds-root-bs${run.blocksize}\"\nmkdir -p \"$prep_root/target\" \"$prep_root/conf\"\
+            \ \"${dataset.dir}/tmp/prepare-bs${run.blocksize}\" \"${dataset.dir}/scratch/prepare-bs${run.blocksize}\" \"${plan.root}/tmp/java\"\
+            \nln -sfn \"${tools.systemds_jar}\" \"$prep_root/target/SystemDS.jar\"\nif [ -d \"$(dirname \"${tools.systemds_jar}\"\
+            )/lib\" ]; then\n  ln -sfn \"$(dirname \"${tools.systemds_jar}\")/lib\" \"$prep_root/target/lib\"\nfi\ncat > \"\
+            $prep_root/conf/SystemDS-config.xml\" <<EOF\n<root>\n  <sysds.localtmpdir>${dataset.dir}/tmp/prepare-bs${run.blocksize}</sysds.localtmpdir>\n\
+            \  <sysds.scratch>${dataset.dir}/scratch/prepare-bs${run.blocksize}</sysds.scratch>\n  <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>\n\
+            \  <sysds.ooc.io.direct>true</sysds.ooc.io.direct>\n  <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>\n\
+            \  <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>\n  <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>\n\
+            </root>\nEOF\n# 8g, raised from 3g: the reblock is itself an OOC job, and at blocksize 1000 each\n# block is 8MB\
+            \ against 2MB at 500. 3g survived the 16GB datasets and OOMed\n# assembling X-bs1000 for the 32GB ones. Prepare\
+            \ runs outside the run cgroups.\nSYSTEMDS_ROOT=\"$prep_root\" JAVA_TOOL_OPTIONS=\"-Djava.io.tmpdir=${plan.root}/tmp/java\"\
+            \ \"${tools.python}\" \"${plan.dir}/prepare_dense_systemds.py\" \"${dataset.dir}\" --rows ${dataset.rows} --cols\
+            \ ${dataset.cols} --blocksize ${run.blocksize} --chunk-mib ${dataset.systemds_chunk_mib} --java \"${tools.java}\"\
+            \ --systemds-jar \"${tools.systemds_jar}\" --config \"$prep_root/conf/SystemDS-config.xml\" --java-heap 8g --java-tmp\
+            \ \"${plan.root}/tmp/java\" --replace-invalid --x-output \"${dataset.dir}/systemds/X-bs${run.blocksize}\" --binary-y-output\
+            \ \"${dataset.dir}/systemds/binary_y-bs${run.blocksize}\" --nn-y-output \"${dataset.dir}/systemds/nn_y-bs${run.blocksize}\"\
+            \n"
+      dask_chunk:
+        baseline_only: true
+        artifacts:
+          X_zarr:
+            path: zarr/X.zarr
+            metadata:
+              path: zarr/X.zarr.json
+              expect:
+                rows: ${dataset.rows}
+                cols: ${dataset.cols}
+                row_chunk: ${run.dask_chunk}
+                col_chunk: ${dataset.cols}
+                dtype: float64
+                compressor: none
+                generator: prepare_zarr.py
+                generator_version: 1
+        prepare:
+          policy: auto
+          command: '"${tools.python}" "${plan.dir}/prepare_zarr.py" "${dataset.dir}/X.f64" "${dataset.dir}/zarr/X.zarr" --rows
+            ${dataset.rows} --cols ${dataset.cols} --row-chunk ${run.dask_chunk} --chunk-mib ${dataset.systemds_chunk_mib}
+            --replace-invalid
+
+            '
+  dense_d16:
+    directory: ${plan.root}/bench-data/dense-d16
+    parameters:
+      rows: 2000000
+      cols: 1000
+      classes: 2
+      sparsity: 1.0
+      distribution: normal
+      seed: 103
+      generator_chunk_mib: 256
+      accept_legacy: false
+      systemds_chunk_mib: 128
+    ready: *id001
+    artifacts: *id002
+    prepare: *id003
+    variants: *id004
+  dense_d32:
+    directory: ${plan.root}/bench-data/dense-d32
+    parameters:
+      rows: 4000000
+      cols: 1000
+      classes: 2
+      sparsity: 1.0
+      distribution: normal
+      seed: 104
+      generator_chunk_mib: 256
+      accept_legacy: false
+      systemds_chunk_mib: 128
+    ready: *id001
+    artifacts: *id002
+    prepare: *id003
+    variants: *id004
+  dense_d64:
+    directory: ${plan.root}/bench-data/dense-d64
+    parameters:
+      rows: 8000000
+      cols: 1000
+      classes: 2
+      sparsity: 1.0
+      distribution: normal
+      seed: 105
+      generator_chunk_mib: 256
+      accept_legacy: false
+      systemds_chunk_mib: 128
+    ready: *id001
+    artifacts: *id002
+    prepare: *id003
+    variants: *id004
+  dense_d32_tall:
+    directory: ${plan.root}/bench-data/dense-d32-tall
+    parameters:
+      rows: 40000000
+      cols: 100
+      classes: 2
+      sparsity: 1.0
+      distribution: normal
+      seed: 106
+      generator_chunk_mib: 256
+      accept_legacy: false
+      systemds_chunk_mib: 128
+    ready: *id001
+    artifacts: *id002
+    prepare: *id003
+    variants: *id004
+  dense_d32_wide:
+    directory: ${plan.root}/bench-data/dense-d32-wide
+    parameters:
+      rows: 40000
+      cols: 100000
+      classes: 2
+      sparsity: 1.0
+      distribution: normal
+      seed: 107
+      generator_chunk_mib: 256
+      accept_legacy: false
+      systemds_chunk_mib: 128
+    ready: *id001
+    artifacts: *id002
+    prepare: *id003
+    variants: *id004
+  gnmf_d32:
+    directory: ${plan.root}/bench-data/gnmf-d32
+    parameters:
+      rows: 4000000
+      cols: 1000
+      classes: 2
+      sparsity: 1.0
+      distribution: uniform_nonnegative
+      seed: 204
+      generator_chunk_mib: 256
+      accept_legacy: false
+      systemds_chunk_mib: 128
+    ready: *id001
+    artifacts: *id002
+    prepare: *id003
+    variants: *id004
+  mlp_wide:
+    directory: ${plan.root}/bench-data/mlp-wide
+    parameters:
+      rows: 16384
+      cols: 16384
+      classes: 2
+      sparsity: 1.0
+      distribution: normal
+      seed: 29
+      generator_chunk_mib: 128
+      accept_legacy: false
+      systemds_chunk_mib: 128
+    ready: *id001
+    artifacts: *id002
+    prepare: *id003
+    variants: *id004
+  krr_50k:
+    directory: ${plan.root}/bench-data/krr-50k
+    parameters:
+      rows: 50000
+      cols: 128
+      classes: 2
+      sparsity: 1.0
+      distribution: normal
+      seed: 47
+      generator_chunk_mib: 128
+      accept_legacy: false
+      systemds_chunk_mib: 128
+    ready: *id001
+    artifacts: *id002
+    prepare: *id003
+    variants: *id004
+  twitter_400k:
+    directory: ${plan.root}/bench-data/twitter-2010
+    parameters:
+      vertices: 41652230
+      edges: 1468365182
+      blocksize: 400000
+      seed: deterministic-affine-104729-12345
+      prepare_workers: 16
+      prepare_concurrency: 6
+    ready:
+    - metadata.json
+    artifacts:
+      G:
+        path: systemds/G
+        metadata:
+          expect:
+            rows: ${dataset.vertices}
+            cols: ${dataset.vertices}
+            nnz: ${dataset.edges}
+            rows_in_block: ${dataset.blocksize}
+            cols_in_block: ${dataset.blocksize}
+      dangling:
+        path: systemds/dangling
+        metadata:
+          expect:
+            rows: ${dataset.vertices}
+            rows_in_block: ${dataset.blocksize}
+      csr_row_ptr:
+        path: csr/row_ptr.i64
+        size_bytes_from_metadata:
+          path: metadata.json
+          key: vertices
+          multiplier: 8
+          add: 8
+      csr_col_idx:
+        path: csr/col_idx.i32
+        size_bytes_from_metadata:
+          path: metadata.json
+          key: edges
+          multiplier: 4
+      csr_values:
+        path: csr/values.f64
+        size_bytes_from_metadata:
+          path: metadata.json
+          key: edges
+          multiplier: 8
+        metadata:
+          path: metadata.json
+          expect:
+            vertices: ${dataset.vertices}
+            edges: ${dataset.edges}
+      dangling_raw:
+        path: dangling.u8
+        size_bytes_from_metadata:
+          path: metadata.json
+          key: vertices
+    prepare:
+      policy: auto
+      clean:
+      - systemds/G
+      - systemds/G.mtd
+      - systemds/dangling
+      - systemds/dangling.mtd
+      env:
+        PYTHON: ${tools.python}
+        SYSDS_JAR: ${tools.systemds_jar}
+        BENCH_DATA_DIR: ${plan.root}/bench-data
+        REAL_WORLD_BLOCKSIZE: ${dataset.blocksize}
+        REAL_WORLD_NATIVE_SUFFIX: ''
+        PREP_WORKERS: ${dataset.prepare_workers}
+        PREP_CONCURRENCY: ${dataset.prepare_concurrency}
+        PREP_JAVA_HEAP: 2g
+      command: '"${plan.dir}/real_world/prepare.sh" twitter-2010 "${dataset.dir}"'
+  knn_200k:
+    directory: ${plan.root}/bench-data/knn-200k
+    parameters:
+      rows: 200000
+      cols: 512
+      classes: 2
+      sparsity: 1.0
+      distribution: normal
+      seed: 43
+      generator_chunk_mib: 256
+      accept_legacy: false
+      systemds_chunk_mib: 128
+    ready: *id001
+    artifacts: *id002
+    prepare: *id003
+    variants: *id004
+dataset_groups:
+  dense_ladder:
+  - dense_d16
+  - dense_d32
+  - dense_d64
+systemds_setup:
+  command: "mkdir -p \"${run.results}/systemds-tmp\" \"${run.results}/systemds-scratch\" \"${run.results}/spark-local\" \"\
+    ${run.results}/java-tmp\"\ncat > \"${run.results}/SystemDS-config.xml\" <<EOF\n<root>\n  <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>\n\
+    \  <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>\n  <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>\n\
+    \  <sysds.ooc.io.direct>true</sysds.ooc.io.direct>\n  <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>\n\
+    \  <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>\n  <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>\n\
+    \  <!--<sysds.native.blas>openblas</sysds.native.blas>-->\n</root>\nEOF\nsed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|'\
+    \ \\\n  \"${run.results}/SystemDS-config.xml\" > \"${run.results}/SystemDS-config-spoof.xml\"\n"
+runs:
+- id: confirm_ooc_w5_p3_c1250_cap1_mem4_round1
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    ooc:
+    - 1500
+  parameters:
+    dask_chunk: 12500
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 4G
+    java_heap: 3g
+    dask_memory_limit: 3GiB
+    dask_threads: 16
+    spark_threads: 12
+    threads: 64
+  setup:
+    command: "mkdir -p \"${run.results}/systemds-tmp\" \"${run.results}/systemds-scratch\" \"${run.results}/spark-local\"\
+      \ \"${run.results}/java-tmp\"\ncat > \"${run.results}/SystemDS-config.xml\" <<EOF\n<root>\n  <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>\n\
+      \  <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>\n  <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>\n\
+      \  <sysds.ooc.io.direct>true</sysds.ooc.io.direct>\n  <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>\n\
+      \  <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>\n  <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>\n\
+      \  <!--<sysds.native.blas>openblas</sysds.native.blas>-->\n  <sysds.ooc.memory.broker.fraction>0.4166666666666667</sysds.ooc.memory.broker.fraction>\n\
+      \  <sysds.ooc.memory.broker.max>5368709120</sysds.ooc.memory.broker.max>\n  <sysds.ooc.memory.prefetch.fraction>0.25</sysds.ooc.memory.prefetch.fraction>\n\
+      \  <sysds.ooc.memory.prefetch.max>3221225472</sysds.ooc.memory.prefetch.max>\n  <sysds.ooc.memory.cache.fraction.soft>0.08333333333333333</sysds.ooc.memory.cache.fraction.soft>\n\
+      \  <sysds.ooc.memory.cache.fraction.hard>0.125</sysds.ooc.memory.cache.fraction.hard>\n  <sysds.ooc.source.replay.memory>301989888</sysds.ooc.source.replay.memory>\n\
+      \  <sysds.ooc.source.bulksize>301989888</sysds.ooc.source.bulksize>\n  <sysds.ooc.source.replay.prefetch>24</sysds.ooc.source.replay.prefetch>\n\
+      </root>\nEOF\nsed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|' \\\n  \"${run.results}/SystemDS-config.xml\"\
+      \ > \"${run.results}/SystemDS-config-spoof.xml\"\n"
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: systemds-ooc
+    template: systemds-ooc
+- id: confirm_spark_p128_t50_m25_mem4_round1
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    spark:
+    - 1000
+  parameters:
+    dask_chunk: 12500
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+    spark_partition_bytes: 134217728
+    spark_memory_fraction: 0.25
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 4G
+    java_heap: 3g
+    dask_memory_limit: 3GiB
+    dask_threads: 16
+    spark_threads: 12
+    threads: 64
+  setup:
+    command: "mkdir -p \"${run.results}/systemds-tmp\" \"${run.results}/systemds-scratch\" \"${run.results}/spark-local\"\
+      \ \"${run.results}/java-tmp\"\ncat > \"${run.results}/SystemDS-config.xml\" <<EOF\n<root>\n  <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>\n\
+      \  <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>\n  <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>\n\
+      \  <sysds.ooc.io.direct>true</sysds.ooc.io.direct>\n  <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>\n\
+      \  <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>\n  <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>\n\
+      \  <!--<sysds.native.blas>openblas</sysds.native.blas>-->\n</root>\nEOF\nsed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|'\
+      \ \\\n  \"${run.results}/SystemDS-config.xml\" > \"${run.results}/SystemDS-config-spoof.xml\"\n"
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: systemds-spark
+    template: systemds-spark
+- id: confirm_dask_p200_t25_m60_mem4_round1
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    ooc:
+    - 1500
+  parameters:
+    dask_chunk: 25000
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 4G
+    java_heap: 3g
+    dask_memory_limit: 3GiB
+    dask_threads: 4
+    spark_threads: 12
+    threads: 64
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: dask-cg
+    template: dask
+    command: '"${tools.python}" "${plan.dir}/lmcg/dask_array.py" "${dataset.dir}" --iterations ${run.iterations} --reg ${run.reg}
+      --tolerance ${run.tolerance} --threads ${resources.dask_threads} --memory-limit ${resources.dask_memory_limit} --temporary-directory
+      "${run.results}/dask-spill" --output "${run.outputs}/dask-r${rep}.json" --memory-target 0.6'
+- id: confirm_ooc_w5_p3_c1250_cap1_mem8_round1
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    ooc:
+    - 1500
+  parameters:
+    dask_chunk: 12500
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 8G
+    java_heap: 6g
+    dask_memory_limit: 6GiB
+    dask_threads: 32
+    spark_threads: 24
+    threads: 64
+  setup:
+    command: "mkdir -p \"${run.results}/systemds-tmp\" \"${run.results}/systemds-scratch\" \"${run.results}/spark-local\"\
+      \ \"${run.results}/java-tmp\"\ncat > \"${run.results}/SystemDS-config.xml\" <<EOF\n<root>\n  <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>\n\
+      \  <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>\n  <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>\n\
+      \  <sysds.ooc.io.direct>true</sysds.ooc.io.direct>\n  <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>\n\
+      \  <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>\n  <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>\n\
+      \  <!--<sysds.native.blas>openblas</sysds.native.blas>-->\n  <sysds.ooc.memory.broker.fraction>0.4166666666666667</sysds.ooc.memory.broker.fraction>\n\
+      \  <sysds.ooc.memory.broker.max>5368709120</sysds.ooc.memory.broker.max>\n  <sysds.ooc.memory.prefetch.fraction>0.25</sysds.ooc.memory.prefetch.fraction>\n\
+      \  <sysds.ooc.memory.prefetch.max>3221225472</sysds.ooc.memory.prefetch.max>\n  <sysds.ooc.memory.cache.fraction.soft>0.08333333333333333</sysds.ooc.memory.cache.fraction.soft>\n\
+      \  <sysds.ooc.memory.cache.fraction.hard>0.125</sysds.ooc.memory.cache.fraction.hard>\n  <sysds.ooc.source.replay.memory>603979776</sysds.ooc.source.replay.memory>\n\
+      \  <sysds.ooc.source.bulksize>603979776</sysds.ooc.source.bulksize>\n  <sysds.ooc.source.replay.prefetch>48</sysds.ooc.source.replay.prefetch>\n\
+      </root>\nEOF\nsed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|' \\\n  \"${run.results}/SystemDS-config.xml\"\
+      \ > \"${run.results}/SystemDS-config-spoof.xml\"\n"
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: systemds-ooc
+    template: systemds-ooc
+- id: confirm_spark_p128_t50_m25_mem8_round1
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    spark:
+    - 1000
+  parameters:
+    dask_chunk: 12500
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+    spark_partition_bytes: 134217728
+    spark_memory_fraction: 0.25
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 8G
+    java_heap: 6g
+    dask_memory_limit: 6GiB
+    dask_threads: 32
+    spark_threads: 24
+    threads: 64
+  setup:
+    command: "mkdir -p \"${run.results}/systemds-tmp\" \"${run.results}/systemds-scratch\" \"${run.results}/spark-local\"\
+      \ \"${run.results}/java-tmp\"\ncat > \"${run.results}/SystemDS-config.xml\" <<EOF\n<root>\n  <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>\n\
+      \  <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>\n  <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>\n\
+      \  <sysds.ooc.io.direct>true</sysds.ooc.io.direct>\n  <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>\n\
+      \  <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>\n  <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>\n\
+      \  <!--<sysds.native.blas>openblas</sysds.native.blas>-->\n</root>\nEOF\nsed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|'\
+      \ \\\n  \"${run.results}/SystemDS-config.xml\" > \"${run.results}/SystemDS-config-spoof.xml\"\n"
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: systemds-spark
+    template: systemds-spark
+- id: confirm_dask_p200_t25_m60_mem8_round1
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    ooc:
+    - 1500
+  parameters:
+    dask_chunk: 25000
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 8G
+    java_heap: 6g
+    dask_memory_limit: 6GiB
+    dask_threads: 8
+    spark_threads: 24
+    threads: 64
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: dask-cg
+    template: dask
+    command: '"${tools.python}" "${plan.dir}/lmcg/dask_array.py" "${dataset.dir}" --iterations ${run.iterations} --reg ${run.reg}
+      --tolerance ${run.tolerance} --threads ${resources.dask_threads} --memory-limit ${resources.dask_memory_limit} --temporary-directory
+      "${run.results}/dask-spill" --output "${run.outputs}/dask-r${rep}.json" --memory-target 0.6'
+- id: confirm_ooc_w5_p3_c1250_cap1_mem16_round1
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    ooc:
+    - 1500
+  parameters:
+    dask_chunk: 12500
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 16G
+    java_heap: 12g
+    dask_memory_limit: 12GiB
+    dask_threads: 64
+    spark_threads: 48
+    threads: 64
+  setup:
+    command: "mkdir -p \"${run.results}/systemds-tmp\" \"${run.results}/systemds-scratch\" \"${run.results}/spark-local\"\
+      \ \"${run.results}/java-tmp\"\ncat > \"${run.results}/SystemDS-config.xml\" <<EOF\n<root>\n  <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>\n\
+      \  <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>\n  <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>\n\
+      \  <sysds.ooc.io.direct>true</sysds.ooc.io.direct>\n  <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>\n\
+      \  <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>\n  <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>\n\
+      \  <!--<sysds.native.blas>openblas</sysds.native.blas>-->\n  <sysds.ooc.memory.broker.fraction>0.4166666666666667</sysds.ooc.memory.broker.fraction>\n\
+      \  <sysds.ooc.memory.broker.max>5368709120</sysds.ooc.memory.broker.max>\n  <sysds.ooc.memory.prefetch.fraction>0.25</sysds.ooc.memory.prefetch.fraction>\n\
+      \  <sysds.ooc.memory.prefetch.max>3221225472</sysds.ooc.memory.prefetch.max>\n  <sysds.ooc.memory.cache.fraction.soft>0.08333333333333333</sysds.ooc.memory.cache.fraction.soft>\n\
+      \  <sysds.ooc.memory.cache.fraction.hard>0.125</sysds.ooc.memory.cache.fraction.hard>\n  <sysds.ooc.source.replay.memory>1207959552</sysds.ooc.source.replay.memory>\n\
+      \  <sysds.ooc.source.bulksize>1207959552</sysds.ooc.source.bulksize>\n  <sysds.ooc.source.replay.prefetch>96</sysds.ooc.source.replay.prefetch>\n\
+      </root>\nEOF\nsed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|' \\\n  \"${run.results}/SystemDS-config.xml\"\
+      \ > \"${run.results}/SystemDS-config-spoof.xml\"\n"
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: systemds-ooc
+    template: systemds-ooc
+- id: confirm_spark_p128_t50_m25_mem16_round1
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    spark:
+    - 1000
+  parameters:
+    dask_chunk: 12500
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+    spark_partition_bytes: 134217728
+    spark_memory_fraction: 0.25
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 16G
+    java_heap: 12g
+    dask_memory_limit: 12GiB
+    dask_threads: 64
+    spark_threads: 48
+    threads: 64
+  setup:
+    command: "mkdir -p \"${run.results}/systemds-tmp\" \"${run.results}/systemds-scratch\" \"${run.results}/spark-local\"\
+      \ \"${run.results}/java-tmp\"\ncat > \"${run.results}/SystemDS-config.xml\" <<EOF\n<root>\n  <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>\n\
+      \  <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>\n  <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>\n\
+      \  <sysds.ooc.io.direct>true</sysds.ooc.io.direct>\n  <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>\n\
+      \  <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>\n  <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>\n\
+      \  <!--<sysds.native.blas>openblas</sysds.native.blas>-->\n</root>\nEOF\nsed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|'\
+      \ \\\n  \"${run.results}/SystemDS-config.xml\" > \"${run.results}/SystemDS-config-spoof.xml\"\n"
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: systemds-spark
+    template: systemds-spark
+- id: confirm_dask_p200_t25_m60_mem16_round1
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    ooc:
+    - 1500
+  parameters:
+    dask_chunk: 25000
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 16G
+    java_heap: 12g
+    dask_memory_limit: 12GiB
+    dask_threads: 16
+    spark_threads: 48
+    threads: 64
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: dask-cg
+    template: dask
+    command: '"${tools.python}" "${plan.dir}/lmcg/dask_array.py" "${dataset.dir}" --iterations ${run.iterations} --reg ${run.reg}
+      --tolerance ${run.tolerance} --threads ${resources.dask_threads} --memory-limit ${resources.dask_memory_limit} --temporary-directory
+      "${run.results}/dask-spill" --output "${run.outputs}/dask-r${rep}.json" --memory-target 0.6'
+- id: confirm_ooc_w5_p3_c1250_cap1_mem32_round1
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    ooc:
+    - 1500
+  parameters:
+    dask_chunk: 12500
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 32G
+    java_heap: 24g
+    dask_memory_limit: 24GiB
+    dask_threads: 64
+    spark_threads: 64
+    threads: 64
+  setup:
+    command: "mkdir -p \"${run.results}/systemds-tmp\" \"${run.results}/systemds-scratch\" \"${run.results}/spark-local\"\
+      \ \"${run.results}/java-tmp\"\ncat > \"${run.results}/SystemDS-config.xml\" <<EOF\n<root>\n  <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>\n\
+      \  <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>\n  <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>\n\
+      \  <sysds.ooc.io.direct>true</sysds.ooc.io.direct>\n  <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>\n\
+      \  <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>\n  <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>\n\
+      \  <!--<sysds.native.blas>openblas</sysds.native.blas>-->\n  <sysds.ooc.memory.broker.fraction>0.4166666666666667</sysds.ooc.memory.broker.fraction>\n\
+      \  <sysds.ooc.memory.broker.max>5368709120</sysds.ooc.memory.broker.max>\n  <sysds.ooc.memory.prefetch.fraction>0.25</sysds.ooc.memory.prefetch.fraction>\n\
+      \  <sysds.ooc.memory.prefetch.max>3221225472</sysds.ooc.memory.prefetch.max>\n  <sysds.ooc.memory.cache.fraction.soft>0.08333333333333333</sysds.ooc.memory.cache.fraction.soft>\n\
+      \  <sysds.ooc.memory.cache.fraction.hard>0.125</sysds.ooc.memory.cache.fraction.hard>\n  <sysds.ooc.source.replay.memory>1207959552</sysds.ooc.source.replay.memory>\n\
+      \  <sysds.ooc.source.bulksize>1207959552</sysds.ooc.source.bulksize>\n  <sysds.ooc.source.replay.prefetch>96</sysds.ooc.source.replay.prefetch>\n\
+      </root>\nEOF\nsed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|' \\\n  \"${run.results}/SystemDS-config.xml\"\
+      \ > \"${run.results}/SystemDS-config-spoof.xml\"\n"
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: systemds-ooc
+    template: systemds-ooc
+- id: confirm_spark_p128_t50_m25_mem32_round1
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    spark:
+    - 1000
+  parameters:
+    dask_chunk: 12500
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+    spark_partition_bytes: 134217728
+    spark_memory_fraction: 0.25
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 32G
+    java_heap: 24g
+    dask_memory_limit: 24GiB
+    dask_threads: 64
+    spark_threads: 64
+    threads: 64
+  setup:
+    command: "mkdir -p \"${run.results}/systemds-tmp\" \"${run.results}/systemds-scratch\" \"${run.results}/spark-local\"\
+      \ \"${run.results}/java-tmp\"\ncat > \"${run.results}/SystemDS-config.xml\" <<EOF\n<root>\n  <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>\n\
+      \  <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>\n  <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>\n\
+      \  <sysds.ooc.io.direct>true</sysds.ooc.io.direct>\n  <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>\n\
+      \  <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>\n  <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>\n\
+      \  <!--<sysds.native.blas>openblas</sysds.native.blas>-->\n</root>\nEOF\nsed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|'\
+      \ \\\n  \"${run.results}/SystemDS-config.xml\" > \"${run.results}/SystemDS-config-spoof.xml\"\n"
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: systemds-spark
+    template: systemds-spark
+- id: confirm_dask_p200_t25_m60_mem32_round1
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    ooc:
+    - 1500
+  parameters:
+    dask_chunk: 25000
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 32G
+    java_heap: 24g
+    dask_memory_limit: 24GiB
+    dask_threads: 32
+    spark_threads: 64
+    threads: 64
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: dask-cg
+    template: dask
+    command: '"${tools.python}" "${plan.dir}/lmcg/dask_array.py" "${dataset.dir}" --iterations ${run.iterations} --reg ${run.reg}
+      --tolerance ${run.tolerance} --threads ${resources.dask_threads} --memory-limit ${resources.dask_memory_limit} --temporary-directory
+      "${run.results}/dask-spill" --output "${run.outputs}/dask-r${rep}.json" --memory-target 0.6'
+- id: confirm_ooc_w5_p3_c1250_cap1_mem4_round2
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    ooc:
+    - 1500
+  parameters:
+    dask_chunk: 12500
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 4G
+    java_heap: 3g
+    dask_memory_limit: 3GiB
+    dask_threads: 16
+    spark_threads: 12
+    threads: 64
+  setup:
+    command: "mkdir -p \"${run.results}/systemds-tmp\" \"${run.results}/systemds-scratch\" \"${run.results}/spark-local\"\
+      \ \"${run.results}/java-tmp\"\ncat > \"${run.results}/SystemDS-config.xml\" <<EOF\n<root>\n  <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>\n\
+      \  <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>\n  <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>\n\
+      \  <sysds.ooc.io.direct>true</sysds.ooc.io.direct>\n  <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>\n\
+      \  <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>\n  <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>\n\
+      \  <!--<sysds.native.blas>openblas</sysds.native.blas>-->\n  <sysds.ooc.memory.broker.fraction>0.4166666666666667</sysds.ooc.memory.broker.fraction>\n\
+      \  <sysds.ooc.memory.broker.max>5368709120</sysds.ooc.memory.broker.max>\n  <sysds.ooc.memory.prefetch.fraction>0.25</sysds.ooc.memory.prefetch.fraction>\n\
+      \  <sysds.ooc.memory.prefetch.max>3221225472</sysds.ooc.memory.prefetch.max>\n  <sysds.ooc.memory.cache.fraction.soft>0.08333333333333333</sysds.ooc.memory.cache.fraction.soft>\n\
+      \  <sysds.ooc.memory.cache.fraction.hard>0.125</sysds.ooc.memory.cache.fraction.hard>\n  <sysds.ooc.source.replay.memory>301989888</sysds.ooc.source.replay.memory>\n\
+      \  <sysds.ooc.source.bulksize>301989888</sysds.ooc.source.bulksize>\n  <sysds.ooc.source.replay.prefetch>24</sysds.ooc.source.replay.prefetch>\n\
+      </root>\nEOF\nsed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|' \\\n  \"${run.results}/SystemDS-config.xml\"\
+      \ > \"${run.results}/SystemDS-config-spoof.xml\"\n"
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: systemds-ooc
+    template: systemds-ooc
+- id: confirm_spark_p128_t50_m25_mem4_round2
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    spark:
+    - 1000
+  parameters:
+    dask_chunk: 12500
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+    spark_partition_bytes: 134217728
+    spark_memory_fraction: 0.25
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 4G
+    java_heap: 3g
+    dask_memory_limit: 3GiB
+    dask_threads: 16
+    spark_threads: 12
+    threads: 64
+  setup:
+    command: "mkdir -p \"${run.results}/systemds-tmp\" \"${run.results}/systemds-scratch\" \"${run.results}/spark-local\"\
+      \ \"${run.results}/java-tmp\"\ncat > \"${run.results}/SystemDS-config.xml\" <<EOF\n<root>\n  <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>\n\
+      \  <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>\n  <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>\n\
+      \  <sysds.ooc.io.direct>true</sysds.ooc.io.direct>\n  <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>\n\
+      \  <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>\n  <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>\n\
+      \  <!--<sysds.native.blas>openblas</sysds.native.blas>-->\n</root>\nEOF\nsed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|'\
+      \ \\\n  \"${run.results}/SystemDS-config.xml\" > \"${run.results}/SystemDS-config-spoof.xml\"\n"
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: systemds-spark
+    template: systemds-spark
+- id: confirm_dask_p200_t25_m60_mem4_round2
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    ooc:
+    - 1500
+  parameters:
+    dask_chunk: 25000
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 4G
+    java_heap: 3g
+    dask_memory_limit: 3GiB
+    dask_threads: 4
+    spark_threads: 12
+    threads: 64
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: dask-cg
+    template: dask
+    command: '"${tools.python}" "${plan.dir}/lmcg/dask_array.py" "${dataset.dir}" --iterations ${run.iterations} --reg ${run.reg}
+      --tolerance ${run.tolerance} --threads ${resources.dask_threads} --memory-limit ${resources.dask_memory_limit} --temporary-directory
+      "${run.results}/dask-spill" --output "${run.outputs}/dask-r${rep}.json" --memory-target 0.6'
+- id: confirm_ooc_w5_p3_c1250_cap1_mem8_round2
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    ooc:
+    - 1500
+  parameters:
+    dask_chunk: 12500
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 8G
+    java_heap: 6g
+    dask_memory_limit: 6GiB
+    dask_threads: 32
+    spark_threads: 24
+    threads: 64
+  setup:
+    command: "mkdir -p \"${run.results}/systemds-tmp\" \"${run.results}/systemds-scratch\" \"${run.results}/spark-local\"\
+      \ \"${run.results}/java-tmp\"\ncat > \"${run.results}/SystemDS-config.xml\" <<EOF\n<root>\n  <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>\n\
+      \  <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>\n  <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>\n\
+      \  <sysds.ooc.io.direct>true</sysds.ooc.io.direct>\n  <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>\n\
+      \  <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>\n  <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>\n\
+      \  <!--<sysds.native.blas>openblas</sysds.native.blas>-->\n  <sysds.ooc.memory.broker.fraction>0.4166666666666667</sysds.ooc.memory.broker.fraction>\n\
+      \  <sysds.ooc.memory.broker.max>5368709120</sysds.ooc.memory.broker.max>\n  <sysds.ooc.memory.prefetch.fraction>0.25</sysds.ooc.memory.prefetch.fraction>\n\
+      \  <sysds.ooc.memory.prefetch.max>3221225472</sysds.ooc.memory.prefetch.max>\n  <sysds.ooc.memory.cache.fraction.soft>0.08333333333333333</sysds.ooc.memory.cache.fraction.soft>\n\
+      \  <sysds.ooc.memory.cache.fraction.hard>0.125</sysds.ooc.memory.cache.fraction.hard>\n  <sysds.ooc.source.replay.memory>603979776</sysds.ooc.source.replay.memory>\n\
+      \  <sysds.ooc.source.bulksize>603979776</sysds.ooc.source.bulksize>\n  <sysds.ooc.source.replay.prefetch>48</sysds.ooc.source.replay.prefetch>\n\
+      </root>\nEOF\nsed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|' \\\n  \"${run.results}/SystemDS-config.xml\"\
+      \ > \"${run.results}/SystemDS-config-spoof.xml\"\n"
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: systemds-ooc
+    template: systemds-ooc
+- id: confirm_spark_p128_t50_m25_mem8_round2
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    spark:
+    - 1000
+  parameters:
+    dask_chunk: 12500
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+    spark_partition_bytes: 134217728
+    spark_memory_fraction: 0.25
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 8G
+    java_heap: 6g
+    dask_memory_limit: 6GiB
+    dask_threads: 32
+    spark_threads: 24
+    threads: 64
+  setup:
+    command: "mkdir -p \"${run.results}/systemds-tmp\" \"${run.results}/systemds-scratch\" \"${run.results}/spark-local\"\
+      \ \"${run.results}/java-tmp\"\ncat > \"${run.results}/SystemDS-config.xml\" <<EOF\n<root>\n  <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>\n\
+      \  <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>\n  <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>\n\
+      \  <sysds.ooc.io.direct>true</sysds.ooc.io.direct>\n  <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>\n\
+      \  <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>\n  <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>\n\
+      \  <!--<sysds.native.blas>openblas</sysds.native.blas>-->\n</root>\nEOF\nsed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|'\
+      \ \\\n  \"${run.results}/SystemDS-config.xml\" > \"${run.results}/SystemDS-config-spoof.xml\"\n"
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: systemds-spark
+    template: systemds-spark
+- id: confirm_dask_p200_t25_m60_mem8_round2
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    ooc:
+    - 1500
+  parameters:
+    dask_chunk: 25000
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 8G
+    java_heap: 6g
+    dask_memory_limit: 6GiB
+    dask_threads: 8
+    spark_threads: 24
+    threads: 64
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: dask-cg
+    template: dask
+    command: '"${tools.python}" "${plan.dir}/lmcg/dask_array.py" "${dataset.dir}" --iterations ${run.iterations} --reg ${run.reg}
+      --tolerance ${run.tolerance} --threads ${resources.dask_threads} --memory-limit ${resources.dask_memory_limit} --temporary-directory
+      "${run.results}/dask-spill" --output "${run.outputs}/dask-r${rep}.json" --memory-target 0.6'
+- id: confirm_ooc_w5_p3_c1250_cap1_mem16_round2
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    ooc:
+    - 1500
+  parameters:
+    dask_chunk: 12500
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 16G
+    java_heap: 12g
+    dask_memory_limit: 12GiB
+    dask_threads: 64
+    spark_threads: 48
+    threads: 64
+  setup:
+    command: "mkdir -p \"${run.results}/systemds-tmp\" \"${run.results}/systemds-scratch\" \"${run.results}/spark-local\"\
+      \ \"${run.results}/java-tmp\"\ncat > \"${run.results}/SystemDS-config.xml\" <<EOF\n<root>\n  <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>\n\
+      \  <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>\n  <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>\n\
+      \  <sysds.ooc.io.direct>true</sysds.ooc.io.direct>\n  <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>\n\
+      \  <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>\n  <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>\n\
+      \  <!--<sysds.native.blas>openblas</sysds.native.blas>-->\n  <sysds.ooc.memory.broker.fraction>0.4166666666666667</sysds.ooc.memory.broker.fraction>\n\
+      \  <sysds.ooc.memory.broker.max>5368709120</sysds.ooc.memory.broker.max>\n  <sysds.ooc.memory.prefetch.fraction>0.25</sysds.ooc.memory.prefetch.fraction>\n\
+      \  <sysds.ooc.memory.prefetch.max>3221225472</sysds.ooc.memory.prefetch.max>\n  <sysds.ooc.memory.cache.fraction.soft>0.08333333333333333</sysds.ooc.memory.cache.fraction.soft>\n\
+      \  <sysds.ooc.memory.cache.fraction.hard>0.125</sysds.ooc.memory.cache.fraction.hard>\n  <sysds.ooc.source.replay.memory>1207959552</sysds.ooc.source.replay.memory>\n\
+      \  <sysds.ooc.source.bulksize>1207959552</sysds.ooc.source.bulksize>\n  <sysds.ooc.source.replay.prefetch>96</sysds.ooc.source.replay.prefetch>\n\
+      </root>\nEOF\nsed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|' \\\n  \"${run.results}/SystemDS-config.xml\"\
+      \ > \"${run.results}/SystemDS-config-spoof.xml\"\n"
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: systemds-ooc
+    template: systemds-ooc
+- id: confirm_spark_p128_t50_m25_mem16_round2
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    spark:
+    - 1000
+  parameters:
+    dask_chunk: 12500
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+    spark_partition_bytes: 134217728
+    spark_memory_fraction: 0.25
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 16G
+    java_heap: 12g
+    dask_memory_limit: 12GiB
+    dask_threads: 64
+    spark_threads: 48
+    threads: 64
+  setup:
+    command: "mkdir -p \"${run.results}/systemds-tmp\" \"${run.results}/systemds-scratch\" \"${run.results}/spark-local\"\
+      \ \"${run.results}/java-tmp\"\ncat > \"${run.results}/SystemDS-config.xml\" <<EOF\n<root>\n  <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>\n\
+      \  <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>\n  <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>\n\
+      \  <sysds.ooc.io.direct>true</sysds.ooc.io.direct>\n  <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>\n\
+      \  <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>\n  <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>\n\
+      \  <!--<sysds.native.blas>openblas</sysds.native.blas>-->\n</root>\nEOF\nsed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|'\
+      \ \\\n  \"${run.results}/SystemDS-config.xml\" > \"${run.results}/SystemDS-config-spoof.xml\"\n"
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: systemds-spark
+    template: systemds-spark
+- id: confirm_dask_p200_t25_m60_mem16_round2
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    ooc:
+    - 1500
+  parameters:
+    dask_chunk: 25000
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 16G
+    java_heap: 12g
+    dask_memory_limit: 12GiB
+    dask_threads: 16
+    spark_threads: 48
+    threads: 64
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: dask-cg
+    template: dask
+    command: '"${tools.python}" "${plan.dir}/lmcg/dask_array.py" "${dataset.dir}" --iterations ${run.iterations} --reg ${run.reg}
+      --tolerance ${run.tolerance} --threads ${resources.dask_threads} --memory-limit ${resources.dask_memory_limit} --temporary-directory
+      "${run.results}/dask-spill" --output "${run.outputs}/dask-r${rep}.json" --memory-target 0.6'
+- id: confirm_ooc_w5_p3_c1250_cap1_mem32_round2
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    ooc:
+    - 1500
+  parameters:
+    dask_chunk: 12500
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 32G
+    java_heap: 24g
+    dask_memory_limit: 24GiB
+    dask_threads: 64
+    spark_threads: 64
+    threads: 64
+  setup:
+    command: "mkdir -p \"${run.results}/systemds-tmp\" \"${run.results}/systemds-scratch\" \"${run.results}/spark-local\"\
+      \ \"${run.results}/java-tmp\"\ncat > \"${run.results}/SystemDS-config.xml\" <<EOF\n<root>\n  <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>\n\
+      \  <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>\n  <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>\n\
+      \  <sysds.ooc.io.direct>true</sysds.ooc.io.direct>\n  <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>\n\
+      \  <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>\n  <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>\n\
+      \  <!--<sysds.native.blas>openblas</sysds.native.blas>-->\n  <sysds.ooc.memory.broker.fraction>0.4166666666666667</sysds.ooc.memory.broker.fraction>\n\
+      \  <sysds.ooc.memory.broker.max>5368709120</sysds.ooc.memory.broker.max>\n  <sysds.ooc.memory.prefetch.fraction>0.25</sysds.ooc.memory.prefetch.fraction>\n\
+      \  <sysds.ooc.memory.prefetch.max>3221225472</sysds.ooc.memory.prefetch.max>\n  <sysds.ooc.memory.cache.fraction.soft>0.08333333333333333</sysds.ooc.memory.cache.fraction.soft>\n\
+      \  <sysds.ooc.memory.cache.fraction.hard>0.125</sysds.ooc.memory.cache.fraction.hard>\n  <sysds.ooc.source.replay.memory>1207959552</sysds.ooc.source.replay.memory>\n\
+      \  <sysds.ooc.source.bulksize>1207959552</sysds.ooc.source.bulksize>\n  <sysds.ooc.source.replay.prefetch>96</sysds.ooc.source.replay.prefetch>\n\
+      </root>\nEOF\nsed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|' \\\n  \"${run.results}/SystemDS-config.xml\"\
+      \ > \"${run.results}/SystemDS-config-spoof.xml\"\n"
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: systemds-ooc
+    template: systemds-ooc
+- id: confirm_spark_p128_t50_m25_mem32_round2
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    spark:
+    - 1000
+  parameters:
+    dask_chunk: 12500
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+    spark_partition_bytes: 134217728
+    spark_memory_fraction: 0.25
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 32G
+    java_heap: 24g
+    dask_memory_limit: 24GiB
+    dask_threads: 64
+    spark_threads: 64
+    threads: 64
+  setup:
+    command: "mkdir -p \"${run.results}/systemds-tmp\" \"${run.results}/systemds-scratch\" \"${run.results}/spark-local\"\
+      \ \"${run.results}/java-tmp\"\ncat > \"${run.results}/SystemDS-config.xml\" <<EOF\n<root>\n  <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>\n\
+      \  <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>\n  <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>\n\
+      \  <sysds.ooc.io.direct>true</sysds.ooc.io.direct>\n  <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>\n\
+      \  <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>\n  <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>\n\
+      \  <!--<sysds.native.blas>openblas</sysds.native.blas>-->\n</root>\nEOF\nsed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|'\
+      \ \\\n  \"${run.results}/SystemDS-config.xml\" > \"${run.results}/SystemDS-config-spoof.xml\"\n"
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: systemds-spark
+    template: systemds-spark
+- id: confirm_dask_p200_t25_m60_mem32_round2
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    ooc:
+    - 1500
+  parameters:
+    dask_chunk: 25000
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 32G
+    java_heap: 24g
+    dask_memory_limit: 24GiB
+    dask_threads: 32
+    spark_threads: 64
+    threads: 64
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: dask-cg
+    template: dask
+    command: '"${tools.python}" "${plan.dir}/lmcg/dask_array.py" "${dataset.dir}" --iterations ${run.iterations} --reg ${run.reg}
+      --tolerance ${run.tolerance} --threads ${resources.dask_threads} --memory-limit ${resources.dask_memory_limit} --temporary-directory
+      "${run.results}/dask-spill" --output "${run.outputs}/dask-r${rep}.json" --memory-target 0.6'
+- id: confirm_ooc_w5_p3_c1250_cap1_mem4_round3
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    ooc:
+    - 1500
+  parameters:
+    dask_chunk: 12500
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 4G
+    java_heap: 3g
+    dask_memory_limit: 3GiB
+    dask_threads: 16
+    spark_threads: 12
+    threads: 64
+  setup:
+    command: "mkdir -p \"${run.results}/systemds-tmp\" \"${run.results}/systemds-scratch\" \"${run.results}/spark-local\"\
+      \ \"${run.results}/java-tmp\"\ncat > \"${run.results}/SystemDS-config.xml\" <<EOF\n<root>\n  <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>\n\
+      \  <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>\n  <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>\n\
+      \  <sysds.ooc.io.direct>true</sysds.ooc.io.direct>\n  <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>\n\
+      \  <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>\n  <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>\n\
+      \  <!--<sysds.native.blas>openblas</sysds.native.blas>-->\n  <sysds.ooc.memory.broker.fraction>0.4166666666666667</sysds.ooc.memory.broker.fraction>\n\
+      \  <sysds.ooc.memory.broker.max>5368709120</sysds.ooc.memory.broker.max>\n  <sysds.ooc.memory.prefetch.fraction>0.25</sysds.ooc.memory.prefetch.fraction>\n\
+      \  <sysds.ooc.memory.prefetch.max>3221225472</sysds.ooc.memory.prefetch.max>\n  <sysds.ooc.memory.cache.fraction.soft>0.08333333333333333</sysds.ooc.memory.cache.fraction.soft>\n\
+      \  <sysds.ooc.memory.cache.fraction.hard>0.125</sysds.ooc.memory.cache.fraction.hard>\n  <sysds.ooc.source.replay.memory>301989888</sysds.ooc.source.replay.memory>\n\
+      \  <sysds.ooc.source.bulksize>301989888</sysds.ooc.source.bulksize>\n  <sysds.ooc.source.replay.prefetch>24</sysds.ooc.source.replay.prefetch>\n\
+      </root>\nEOF\nsed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|' \\\n  \"${run.results}/SystemDS-config.xml\"\
+      \ > \"${run.results}/SystemDS-config-spoof.xml\"\n"
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: systemds-ooc
+    template: systemds-ooc
+- id: confirm_spark_p128_t50_m25_mem4_round3
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    spark:
+    - 1000
+  parameters:
+    dask_chunk: 12500
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+    spark_partition_bytes: 134217728
+    spark_memory_fraction: 0.25
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 4G
+    java_heap: 3g
+    dask_memory_limit: 3GiB
+    dask_threads: 16
+    spark_threads: 12
+    threads: 64
+  setup:
+    command: "mkdir -p \"${run.results}/systemds-tmp\" \"${run.results}/systemds-scratch\" \"${run.results}/spark-local\"\
+      \ \"${run.results}/java-tmp\"\ncat > \"${run.results}/SystemDS-config.xml\" <<EOF\n<root>\n  <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>\n\
+      \  <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>\n  <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>\n\
+      \  <sysds.ooc.io.direct>true</sysds.ooc.io.direct>\n  <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>\n\
+      \  <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>\n  <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>\n\
+      \  <!--<sysds.native.blas>openblas</sysds.native.blas>-->\n</root>\nEOF\nsed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|'\
+      \ \\\n  \"${run.results}/SystemDS-config.xml\" > \"${run.results}/SystemDS-config-spoof.xml\"\n"
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: systemds-spark
+    template: systemds-spark
+- id: confirm_dask_p200_t25_m60_mem4_round3
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    ooc:
+    - 1500
+  parameters:
+    dask_chunk: 25000
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 4G
+    java_heap: 3g
+    dask_memory_limit: 3GiB
+    dask_threads: 4
+    spark_threads: 12
+    threads: 64
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: dask-cg
+    template: dask
+    command: '"${tools.python}" "${plan.dir}/lmcg/dask_array.py" "${dataset.dir}" --iterations ${run.iterations} --reg ${run.reg}
+      --tolerance ${run.tolerance} --threads ${resources.dask_threads} --memory-limit ${resources.dask_memory_limit} --temporary-directory
+      "${run.results}/dask-spill" --output "${run.outputs}/dask-r${rep}.json" --memory-target 0.6'
+- id: confirm_ooc_w5_p3_c1250_cap1_mem8_round3
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    ooc:
+    - 1500
+  parameters:
+    dask_chunk: 12500
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 8G
+    java_heap: 6g
+    dask_memory_limit: 6GiB
+    dask_threads: 32
+    spark_threads: 24
+    threads: 64
+  setup:
+    command: "mkdir -p \"${run.results}/systemds-tmp\" \"${run.results}/systemds-scratch\" \"${run.results}/spark-local\"\
+      \ \"${run.results}/java-tmp\"\ncat > \"${run.results}/SystemDS-config.xml\" <<EOF\n<root>\n  <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>\n\
+      \  <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>\n  <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>\n\
+      \  <sysds.ooc.io.direct>true</sysds.ooc.io.direct>\n  <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>\n\
+      \  <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>\n  <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>\n\
+      \  <!--<sysds.native.blas>openblas</sysds.native.blas>-->\n  <sysds.ooc.memory.broker.fraction>0.4166666666666667</sysds.ooc.memory.broker.fraction>\n\
+      \  <sysds.ooc.memory.broker.max>5368709120</sysds.ooc.memory.broker.max>\n  <sysds.ooc.memory.prefetch.fraction>0.25</sysds.ooc.memory.prefetch.fraction>\n\
+      \  <sysds.ooc.memory.prefetch.max>3221225472</sysds.ooc.memory.prefetch.max>\n  <sysds.ooc.memory.cache.fraction.soft>0.08333333333333333</sysds.ooc.memory.cache.fraction.soft>\n\
+      \  <sysds.ooc.memory.cache.fraction.hard>0.125</sysds.ooc.memory.cache.fraction.hard>\n  <sysds.ooc.source.replay.memory>603979776</sysds.ooc.source.replay.memory>\n\
+      \  <sysds.ooc.source.bulksize>603979776</sysds.ooc.source.bulksize>\n  <sysds.ooc.source.replay.prefetch>48</sysds.ooc.source.replay.prefetch>\n\
+      </root>\nEOF\nsed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|' \\\n  \"${run.results}/SystemDS-config.xml\"\
+      \ > \"${run.results}/SystemDS-config-spoof.xml\"\n"
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: systemds-ooc
+    template: systemds-ooc
+- id: confirm_spark_p128_t50_m25_mem8_round3
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    spark:
+    - 1000
+  parameters:
+    dask_chunk: 12500
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+    spark_partition_bytes: 134217728
+    spark_memory_fraction: 0.25
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 8G
+    java_heap: 6g
+    dask_memory_limit: 6GiB
+    dask_threads: 32
+    spark_threads: 24
+    threads: 64
+  setup:
+    command: "mkdir -p \"${run.results}/systemds-tmp\" \"${run.results}/systemds-scratch\" \"${run.results}/spark-local\"\
+      \ \"${run.results}/java-tmp\"\ncat > \"${run.results}/SystemDS-config.xml\" <<EOF\n<root>\n  <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>\n\
+      \  <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>\n  <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>\n\
+      \  <sysds.ooc.io.direct>true</sysds.ooc.io.direct>\n  <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>\n\
+      \  <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>\n  <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>\n\
+      \  <!--<sysds.native.blas>openblas</sysds.native.blas>-->\n</root>\nEOF\nsed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|'\
+      \ \\\n  \"${run.results}/SystemDS-config.xml\" > \"${run.results}/SystemDS-config-spoof.xml\"\n"
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: systemds-spark
+    template: systemds-spark
+- id: confirm_dask_p200_t25_m60_mem8_round3
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    ooc:
+    - 1500
+  parameters:
+    dask_chunk: 25000
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 8G
+    java_heap: 6g
+    dask_memory_limit: 6GiB
+    dask_threads: 8
+    spark_threads: 24
+    threads: 64
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: dask-cg
+    template: dask
+    command: '"${tools.python}" "${plan.dir}/lmcg/dask_array.py" "${dataset.dir}" --iterations ${run.iterations} --reg ${run.reg}
+      --tolerance ${run.tolerance} --threads ${resources.dask_threads} --memory-limit ${resources.dask_memory_limit} --temporary-directory
+      "${run.results}/dask-spill" --output "${run.outputs}/dask-r${rep}.json" --memory-target 0.6'
+- id: confirm_ooc_w5_p3_c1250_cap1_mem16_round3
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    ooc:
+    - 1500
+  parameters:
+    dask_chunk: 12500
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 16G
+    java_heap: 12g
+    dask_memory_limit: 12GiB
+    dask_threads: 64
+    spark_threads: 48
+    threads: 64
+  setup:
+    command: "mkdir -p \"${run.results}/systemds-tmp\" \"${run.results}/systemds-scratch\" \"${run.results}/spark-local\"\
+      \ \"${run.results}/java-tmp\"\ncat > \"${run.results}/SystemDS-config.xml\" <<EOF\n<root>\n  <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>\n\
+      \  <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>\n  <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>\n\
+      \  <sysds.ooc.io.direct>true</sysds.ooc.io.direct>\n  <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>\n\
+      \  <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>\n  <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>\n\
+      \  <!--<sysds.native.blas>openblas</sysds.native.blas>-->\n  <sysds.ooc.memory.broker.fraction>0.4166666666666667</sysds.ooc.memory.broker.fraction>\n\
+      \  <sysds.ooc.memory.broker.max>5368709120</sysds.ooc.memory.broker.max>\n  <sysds.ooc.memory.prefetch.fraction>0.25</sysds.ooc.memory.prefetch.fraction>\n\
+      \  <sysds.ooc.memory.prefetch.max>3221225472</sysds.ooc.memory.prefetch.max>\n  <sysds.ooc.memory.cache.fraction.soft>0.08333333333333333</sysds.ooc.memory.cache.fraction.soft>\n\
+      \  <sysds.ooc.memory.cache.fraction.hard>0.125</sysds.ooc.memory.cache.fraction.hard>\n  <sysds.ooc.source.replay.memory>1207959552</sysds.ooc.source.replay.memory>\n\
+      \  <sysds.ooc.source.bulksize>1207959552</sysds.ooc.source.bulksize>\n  <sysds.ooc.source.replay.prefetch>96</sysds.ooc.source.replay.prefetch>\n\
+      </root>\nEOF\nsed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|' \\\n  \"${run.results}/SystemDS-config.xml\"\
+      \ > \"${run.results}/SystemDS-config-spoof.xml\"\n"
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: systemds-ooc
+    template: systemds-ooc
+- id: confirm_spark_p128_t50_m25_mem16_round3
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    spark:
+    - 1000
+  parameters:
+    dask_chunk: 12500
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+    spark_partition_bytes: 134217728
+    spark_memory_fraction: 0.25
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 16G
+    java_heap: 12g
+    dask_memory_limit: 12GiB
+    dask_threads: 64
+    spark_threads: 48
+    threads: 64
+  setup:
+    command: "mkdir -p \"${run.results}/systemds-tmp\" \"${run.results}/systemds-scratch\" \"${run.results}/spark-local\"\
+      \ \"${run.results}/java-tmp\"\ncat > \"${run.results}/SystemDS-config.xml\" <<EOF\n<root>\n  <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>\n\
+      \  <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>\n  <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>\n\
+      \  <sysds.ooc.io.direct>true</sysds.ooc.io.direct>\n  <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>\n\
+      \  <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>\n  <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>\n\
+      \  <!--<sysds.native.blas>openblas</sysds.native.blas>-->\n</root>\nEOF\nsed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|'\
+      \ \\\n  \"${run.results}/SystemDS-config.xml\" > \"${run.results}/SystemDS-config-spoof.xml\"\n"
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: systemds-spark
+    template: systemds-spark
+- id: confirm_dask_p200_t25_m60_mem16_round3
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    ooc:
+    - 1500
+  parameters:
+    dask_chunk: 25000
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 16G
+    java_heap: 12g
+    dask_memory_limit: 12GiB
+    dask_threads: 16
+    spark_threads: 48
+    threads: 64
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: dask-cg
+    template: dask
+    command: '"${tools.python}" "${plan.dir}/lmcg/dask_array.py" "${dataset.dir}" --iterations ${run.iterations} --reg ${run.reg}
+      --tolerance ${run.tolerance} --threads ${resources.dask_threads} --memory-limit ${resources.dask_memory_limit} --temporary-directory
+      "${run.results}/dask-spill" --output "${run.outputs}/dask-r${rep}.json" --memory-target 0.6'
+- id: confirm_ooc_w5_p3_c1250_cap1_mem32_round3
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    ooc:
+    - 1500
+  parameters:
+    dask_chunk: 12500
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 32G
+    java_heap: 24g
+    dask_memory_limit: 24GiB
+    dask_threads: 64
+    spark_threads: 64
+    threads: 64
+  setup:
+    command: "mkdir -p \"${run.results}/systemds-tmp\" \"${run.results}/systemds-scratch\" \"${run.results}/spark-local\"\
+      \ \"${run.results}/java-tmp\"\ncat > \"${run.results}/SystemDS-config.xml\" <<EOF\n<root>\n  <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>\n\
+      \  <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>\n  <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>\n\
+      \  <sysds.ooc.io.direct>true</sysds.ooc.io.direct>\n  <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>\n\
+      \  <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>\n  <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>\n\
+      \  <!--<sysds.native.blas>openblas</sysds.native.blas>-->\n  <sysds.ooc.memory.broker.fraction>0.4166666666666667</sysds.ooc.memory.broker.fraction>\n\
+      \  <sysds.ooc.memory.broker.max>5368709120</sysds.ooc.memory.broker.max>\n  <sysds.ooc.memory.prefetch.fraction>0.25</sysds.ooc.memory.prefetch.fraction>\n\
+      \  <sysds.ooc.memory.prefetch.max>3221225472</sysds.ooc.memory.prefetch.max>\n  <sysds.ooc.memory.cache.fraction.soft>0.08333333333333333</sysds.ooc.memory.cache.fraction.soft>\n\
+      \  <sysds.ooc.memory.cache.fraction.hard>0.125</sysds.ooc.memory.cache.fraction.hard>\n  <sysds.ooc.source.replay.memory>1207959552</sysds.ooc.source.replay.memory>\n\
+      \  <sysds.ooc.source.bulksize>1207959552</sysds.ooc.source.bulksize>\n  <sysds.ooc.source.replay.prefetch>96</sysds.ooc.source.replay.prefetch>\n\
+      </root>\nEOF\nsed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|' \\\n  \"${run.results}/SystemDS-config.xml\"\
+      \ > \"${run.results}/SystemDS-config-spoof.xml\"\n"
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: systemds-ooc
+    template: systemds-ooc
+- id: confirm_spark_p128_t50_m25_mem32_round3
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    spark:
+    - 1000
+  parameters:
+    dask_chunk: 12500
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+    spark_partition_bytes: 134217728
+    spark_memory_fraction: 0.25
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 32G
+    java_heap: 24g
+    dask_memory_limit: 24GiB
+    dask_threads: 64
+    spark_threads: 64
+    threads: 64
+  setup:
+    command: "mkdir -p \"${run.results}/systemds-tmp\" \"${run.results}/systemds-scratch\" \"${run.results}/spark-local\"\
+      \ \"${run.results}/java-tmp\"\ncat > \"${run.results}/SystemDS-config.xml\" <<EOF\n<root>\n  <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>\n\
+      \  <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>\n  <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>\n\
+      \  <sysds.ooc.io.direct>true</sysds.ooc.io.direct>\n  <sysds.ooc.io.reader.buffersize>18874368</sysds.ooc.io.reader.buffersize>\n\
+      \  <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>\n  <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>\n\
+      \  <!--<sysds.native.blas>openblas</sysds.native.blas>-->\n</root>\nEOF\nsed 's|</root>|<sysds.codegen.enabled>true</sysds.codegen.enabled></root>|'\
+      \ \\\n  \"${run.results}/SystemDS-config.xml\" > \"${run.results}/SystemDS-config-spoof.xml\"\n"
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: systemds-spark
+    template: systemds-spark
+- id: confirm_dask_p200_t25_m60_mem32_round3
+  dataset: dense_d32
+  entrypoint: ${plan.dir}/lmcg/systemds.dml
+  blocksize_sweeps:
+    ooc:
+    - 1500
+  parameters:
+    dask_chunk: 25000
+    iterations: 10
+    reg: 1e-7
+    tolerance: 0.0
+    systemds_args: -args "${input.X}" "${input.y}" ${run.reg} ${run.iterations} ${run.tolerance} "${run.outputs}/systemds-beta-r${rep}"
+  inputs:
+    X:
+      artifact: X
+    y:
+      artifact: binary_y
+  resources:
+    timeout_seconds: 800
+    memory_max: 32G
+    java_heap: 24g
+    dask_memory_limit: 24GiB
+    dask_threads: 32
+    spark_threads: 64
+    threads: 64
+  cold_cache:
+  - ${dataset.dir}
+  implementations:
+  - id: dask-cg
+    template: dask
+    command: '"${tools.python}" "${plan.dir}/lmcg/dask_array.py" "${dataset.dir}" --iterations ${run.iterations} --reg ${run.reg}
+      --tolerance ${run.tolerance} --threads ${resources.dask_threads} --memory-limit ${resources.dask_memory_limit} --temporary-directory
+      "${run.results}/dask-spill" --output "${run.outputs}/dask-r${rep}.json" --memory-target 0.6'
+tuning:
+  workload: lmcg/dense_d32/10 iterations
+  seed: 1709
+  repetitions: 3
+  policies:
+    ooc_w5_p3_c1250_cap1:
+      backend: ooc
+      worker_fraction: 0.4166666666666667
+      worker_cap_gib: 5
+      prefetch_fraction: 0.25
+      prefetch_cap_gib: 3
+      cache_hard_fraction: 0.125
+      cache_soft_fraction: 0.08333333333333333
+    spark_p128_t50_m25:
+      backend: spark
+      partition_size: 128
+      concurrency_fraction: 0.5
+      retention_fraction: 0.25
+    dask_p200_t25_m60:
+      backend: dask
+      partition_size: 200
+      concurrency_fraction: 0.25
+      retention_fraction: 0.6
+  runs:
+    confirm_ooc_w5_p3_c1250_cap1_mem4_round1:
+      backend: ooc
+      memory_gib: 4
+      policies:
+      - ooc_w5_p3_c1250_cap1
+      round: 1
+    confirm_spark_p128_t50_m25_mem4_round1:
+      backend: spark
+      memory_gib: 4
+      policies:
+      - spark_p128_t50_m25
+      round: 1
+    confirm_dask_p200_t25_m60_mem4_round1:
+      backend: dask
+      memory_gib: 4
+      policies:
+      - dask_p200_t25_m60
+      round: 1
+    confirm_ooc_w5_p3_c1250_cap1_mem8_round1:
+      backend: ooc
+      memory_gib: 8
+      policies:
+      - ooc_w5_p3_c1250_cap1
+      round: 1
+    confirm_spark_p128_t50_m25_mem8_round1:
+      backend: spark
+      memory_gib: 8
+      policies:
+      - spark_p128_t50_m25
+      round: 1
+    confirm_dask_p200_t25_m60_mem8_round1:
+      backend: dask
+      memory_gib: 8
+      policies:
+      - dask_p200_t25_m60
+      round: 1
+    confirm_ooc_w5_p3_c1250_cap1_mem16_round1:
+      backend: ooc
+      memory_gib: 16
+      policies:
+      - ooc_w5_p3_c1250_cap1
+      round: 1
+    confirm_spark_p128_t50_m25_mem16_round1:
+      backend: spark
+      memory_gib: 16
+      policies:
+      - spark_p128_t50_m25
+      round: 1
+    confirm_dask_p200_t25_m60_mem16_round1:
+      backend: dask
+      memory_gib: 16
+      policies:
+      - dask_p200_t25_m60
+      round: 1
+    confirm_ooc_w5_p3_c1250_cap1_mem32_round1:
+      backend: ooc
+      memory_gib: 32
+      policies:
+      - ooc_w5_p3_c1250_cap1
+      round: 1
+    confirm_spark_p128_t50_m25_mem32_round1:
+      backend: spark
+      memory_gib: 32
+      policies:
+      - spark_p128_t50_m25
+      round: 1
+    confirm_dask_p200_t25_m60_mem32_round1:
+      backend: dask
+      memory_gib: 32
+      policies:
+      - dask_p200_t25_m60
+      round: 1
+    confirm_ooc_w5_p3_c1250_cap1_mem4_round2:
+      backend: ooc
+      memory_gib: 4
+      policies:
+      - ooc_w5_p3_c1250_cap1
+      round: 2
+    confirm_spark_p128_t50_m25_mem4_round2:
+      backend: spark
+      memory_gib: 4
+      policies:
+      - spark_p128_t50_m25
+      round: 2
+    confirm_dask_p200_t25_m60_mem4_round2:
+      backend: dask
+      memory_gib: 4
+      policies:
+      - dask_p200_t25_m60
+      round: 2
+    confirm_ooc_w5_p3_c1250_cap1_mem8_round2:
+      backend: ooc
+      memory_gib: 8
+      policies:
+      - ooc_w5_p3_c1250_cap1
+      round: 2
+    confirm_spark_p128_t50_m25_mem8_round2:
+      backend: spark
+      memory_gib: 8
+      policies:
+      - spark_p128_t50_m25
+      round: 2
+    confirm_dask_p200_t25_m60_mem8_round2:
+      backend: dask
+      memory_gib: 8
+      policies:
+      - dask_p200_t25_m60
+      round: 2
+    confirm_ooc_w5_p3_c1250_cap1_mem16_round2:
+      backend: ooc
+      memory_gib: 16
+      policies:
+      - ooc_w5_p3_c1250_cap1
+      round: 2
+    confirm_spark_p128_t50_m25_mem16_round2:
+      backend: spark
+      memory_gib: 16
+      policies:
+      - spark_p128_t50_m25
+      round: 2
+    confirm_dask_p200_t25_m60_mem16_round2:
+      backend: dask
+      memory_gib: 16
+      policies:
+      - dask_p200_t25_m60
+      round: 2
+    confirm_ooc_w5_p3_c1250_cap1_mem32_round2:
+      backend: ooc
+      memory_gib: 32
+      policies:
+      - ooc_w5_p3_c1250_cap1
+      round: 2
+    confirm_spark_p128_t50_m25_mem32_round2:
+      backend: spark
+      memory_gib: 32
+      policies:
+      - spark_p128_t50_m25
+      round: 2
+    confirm_dask_p200_t25_m60_mem32_round2:
+      backend: dask
+      memory_gib: 32
+      policies:
+      - dask_p200_t25_m60
+      round: 2
+    confirm_ooc_w5_p3_c1250_cap1_mem4_round3:
+      backend: ooc
+      memory_gib: 4
+      policies:
+      - ooc_w5_p3_c1250_cap1
+      round: 3
+    confirm_spark_p128_t50_m25_mem4_round3:
+      backend: spark
+      memory_gib: 4
+      policies:
+      - spark_p128_t50_m25
+      round: 3
+    confirm_dask_p200_t25_m60_mem4_round3:
+      backend: dask
+      memory_gib: 4
+      policies:
+      - dask_p200_t25_m60
+      round: 3
+    confirm_ooc_w5_p3_c1250_cap1_mem8_round3:
+      backend: ooc
+      memory_gib: 8
+      policies:
+      - ooc_w5_p3_c1250_cap1
+      round: 3
+    confirm_spark_p128_t50_m25_mem8_round3:
+      backend: spark
+      memory_gib: 8
+      policies:
+      - spark_p128_t50_m25
+      round: 3
+    confirm_dask_p200_t25_m60_mem8_round3:
+      backend: dask
+      memory_gib: 8
+      policies:
+      - dask_p200_t25_m60
+      round: 3
+    confirm_ooc_w5_p3_c1250_cap1_mem16_round3:
+      backend: ooc
+      memory_gib: 16
+      policies:
+      - ooc_w5_p3_c1250_cap1
+      round: 3
+    confirm_spark_p128_t50_m25_mem16_round3:
+      backend: spark
+      memory_gib: 16
+      policies:
+      - spark_p128_t50_m25
+      round: 3
+    confirm_dask_p200_t25_m60_mem16_round3:
+      backend: dask
+      memory_gib: 16
+      policies:
+      - dask_p200_t25_m60
+      round: 3
+    confirm_ooc_w5_p3_c1250_cap1_mem32_round3:
+      backend: ooc
+      memory_gib: 32
+      policies:
+      - ooc_w5_p3_c1250_cap1
+      round: 3
+    confirm_spark_p128_t50_m25_mem32_round3:
+      backend: spark
+      memory_gib: 32
+      policies:
+      - spark_p128_t50_m25
+      round: 3
+    confirm_dask_p200_t25_m60_mem32_round3:
+      backend: dask
+      memory_gib: 32
+      policies:
+      - dask_p200_t25_m60
+      round: 3

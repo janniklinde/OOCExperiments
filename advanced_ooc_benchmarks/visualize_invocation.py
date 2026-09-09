@@ -55,6 +55,7 @@ _SYSTEM_ORDER = ("systemds-ooc", "systemds-spark", "numpy", "dask")
 _LEGEND_NAMES = {
     "systemds-ooc": "ACES",
     "systemds-spark": "SysDS-SP",
+    "systemds-cp": "SysDS-CP",
     "numpy": "NumPy",
     "dask": "Dask",
 }
@@ -160,6 +161,24 @@ def profile_key(profile):
     return int(match.group(1)) if match else math.inf
 
 
+def bar_axis(rows):
+    """Choose the experiment's varying dimension for the x-axis."""
+    profiles = {row["memory_profile"] for row in rows}
+    datasets = {row.get("dataset") for row in rows if row.get("dataset_bytes") is not None}
+    if len(profiles) == 1 and len(datasets) > 1:
+        values = sorted(datasets, key=lambda dataset: rows_for_dataset(rows, dataset))
+        labels = [f"{rows_for_dataset(rows, dataset) / 1e9:g}GB" for dataset in values]
+        return "dataset", values, labels, "Dataset Size"
+    values = sorted(profiles, key=profile_key, reverse=True)
+    labels = [f"{profile_key(profile):g}GB" if math.isfinite(profile_key(profile)) else profile
+              for profile in values]
+    return "memory_profile", values, labels, "CGroup Size"
+
+
+def rows_for_dataset(rows, dataset):
+    return next(row["dataset_bytes"] for row in rows if row.get("dataset") == dataset)
+
+
 def workload_name(base_id):
     """Strip the plan's scaling/size suffixes to get the suite's workload directory name."""
     return str(base_id).removesuffix("_scaling").removesuffix("_3g")
@@ -176,15 +195,15 @@ def workload_dir(suite_root, base_id, invocation):
 
 
 def grouped_bars(axis, rows, value_key, title, ylabel, log_scale=False, log_limits=None):
-    profiles = sorted({row["memory_profile"] for row in rows}, key=profile_key, reverse=True)
+    axis_key, values, labels, xlabel = bar_axis(rows)
     implementations = sorted({row["implementation"] for row in rows}, key=implementation_key)
-    lookup = {(row["memory_profile"], row["implementation"]): row for row in rows}
+    lookup = {(row.get(axis_key), row["implementation"]): row for row in rows}
     width = 0.60 / max(1, len(implementations))
-    centers = list(range(len(profiles)))
+    centers = list(range(len(values)))
     for index, implementation in enumerate(implementations):
         offset = (index - (len(implementations) - 1) / 2) * width
-        for center, profile in zip(centers, profiles):
-            row = lookup.get((profile, implementation))
+        for center, value in zip(centers, values):
+            row = lookup.get((value, implementation))
             value = number(row.get(value_key)) if row else math.nan
             color, hatch = implementation_style(implementation)
             shown = value if math.isfinite(value) and value > 0 else 0
@@ -197,10 +216,8 @@ def grouped_bars(axis, rows, value_key, title, ylabel, log_scale=False, log_limi
                           rotation=90, rotation_mode="anchor",
                           fontsize=plt.rcParams["font.size"] * 0.8, color="#b00020",
                           fontweight="bold", clip_on=True)
-    labels = [f"{profile_key(profile):g}GB" if math.isfinite(profile_key(profile)) else profile
-              for profile in profiles]
-    axis.set(xlabel="CGroup Size", ylabel=ylabel, xticks=centers, xticklabels=labels)
-    axis.set_xlim(-0.5, len(profiles) - 0.5)
+    axis.set(xlabel=xlabel, ylabel=ylabel, xticks=centers, xticklabels=labels)
+    axis.set_xlim(-0.5, len(values) - 0.5)
     if title:
         axis.set_title(title, loc="left", pad=34)
     if log_scale:
@@ -241,17 +258,17 @@ def save_cpu(target, base_id, rows):
 
 def mirrored_io_bars(axis, rows, log_limits=(1, 10_000), legend=True):
     """Draw read volume upwards and write volume mirrored downwards on one symmetric log axis."""
-    profiles = sorted({row["memory_profile"] for row in rows}, key=profile_key, reverse=True)
+    axis_key, values, labels, xlabel = bar_axis(rows)
     implementations = sorted({row["implementation"] for row in rows}, key=implementation_key)
-    lookup = {(row["memory_profile"], row["implementation"]): row for row in rows}
+    lookup = {(row.get(axis_key), row["implementation"]): row for row in rows}
     width = 0.60 / max(1, len(implementations))
-    centers = list(range(len(profiles)))
+    centers = list(range(len(values)))
     low, high = log_limits
     for index, implementation in enumerate(implementations):
         offset = (index - (len(implementations) - 1) / 2) * width
         color, hatch = implementation_style(implementation)
-        for center, profile in zip(centers, profiles):
-            row = lookup.get((profile, implementation))
+        for center, value in zip(centers, values):
+            row = lookup.get((value, implementation))
             if not row:
                 continue
             if row["status"] == "ok":
@@ -267,11 +284,9 @@ def mirrored_io_bars(axis, rows, log_limits=(1, 10_000), legend=True):
                           fontsize=plt.rcParams["font.size"] * 0.8, color="#b00020",
                           fontweight="bold", clip_on=True)
 
-    labels = [f"{profile_key(profile):g}GB" if math.isfinite(profile_key(profile)) else profile
-              for profile in profiles]
-    axis.set(xlabel="CGroup Size", ylabel="Data Volume [GiB]",
+    axis.set(xlabel=xlabel, ylabel="Data Volume [GiB]",
              xticks=centers, xticklabels=labels)
-    axis.set_xlim(-0.5, len(profiles) - 0.5)
+    axis.set_xlim(-0.5, len(values) - 0.5)
     axis.set_yscale("symlog", linthresh=low, linscale=1.0)
     axis.set_ylim(-high, high)
     exponents = range(round(math.log10(low)), round(math.log10(high)) + 1)

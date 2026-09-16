@@ -12,7 +12,7 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 plan="${BENCHMARK_PLAN:-$here/benchmark-plan.yaml}"
 
-host="${BENCH_REMOTE_HOST:-so014}"
+host="${BENCH_REMOTE_HOST:-su02}"
 remote="${BENCH_REMOTE_DIR:-bench}"
 data_dir="${BENCH_REMOTE_DATA_DIR:-}"
 write_env=1
@@ -25,7 +25,7 @@ usage() {
   cat <<'USAGE'
 Usage: ./sync_remote.sh [HOST] [REMOTE_DIR] [options]
 
-  HOST         ssh destination (default: so014, or $BENCH_REMOTE_HOST)
+  HOST         ssh destination (default: su02, or $BENCH_REMOTE_HOST)
   REMOTE_DIR   path under the remote home (default: bench, or $BENCH_REMOTE_DIR)
 
   --data-dir PATH   remote dataset/results root written into docker/.env

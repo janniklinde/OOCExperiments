@@ -1,0 +1,6 @@
+X = read($1);
+e = read($2);
+min_support = max(ceil(0.01 * nrow(X)), 8);
+[TK, TKC, D] = sliceLine(X=X, e=e, k=10, alpha=0.95, maxL=2,
+  minSup=min_support, tpEval=FALSE, selFeat=TRUE, verbose=FALSE);
+write(TKC, $3, format="binary");

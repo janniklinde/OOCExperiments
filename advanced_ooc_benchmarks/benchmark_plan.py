@@ -51,6 +51,20 @@ _RETENTION_METRICS = {
 }
 
 
+def _parse_size_bytes(value):
+    """Bytes from '3GiB'/'768M'/plain-number memory-limit style values."""
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip().lower()
+    units = {"kib": 1024, "mib": 1024 ** 2, "gib": 1024 ** 3, "tib": 1024 ** 4,
+             "kb": 1000, "mb": 1000 ** 2, "gb": 1000 ** 3, "tb": 1000 ** 4,
+             "k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, "t": 1024 ** 4, "b": 1}
+    for suffix in sorted(units, key=len, reverse=True):
+        if text.endswith(suffix):
+            return int(float(text[: -len(suffix)]) * units[suffix])
+    return int(float(text))
+
+
 def _validation_workload(base_id):
     for prefix, metrics in _RETENTION_METRICS.items():
         if base_id == prefix or base_id.startswith(prefix + "_"):
@@ -300,7 +314,7 @@ def command_run(command, cwd, env, log=None, timeout=None):
                                    start_new_session=True)
         try:
             return process.wait(timeout=timeout or None)
-        except subprocess.TimeoutExpired:
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
             for number in (signal.SIGTERM, signal.SIGKILL):
                 try:
                     os.killpg(process.pid, number)
@@ -1380,6 +1394,20 @@ def execute_plan(plan_path, validate_only=False, prepare_only=False, only=(),
             raise ValueError(f"Run {run_id} resources.dask_threads must be a positive integer "
                              "or auto")
         resources["dask_threads"] = dask_threads
+        dask_workers = resources.get("dask_workers", "auto")
+        if str(dask_workers).lower() == "auto":
+            # Runner-side mirror of dask_support.worker_count, the runtime authority:
+            # one Dask worker process per 3 GiB of dask_memory_limit, capped at 8 and at
+            # one per thread. Profiles pin the value explicitly; auto is the fallback for
+            # profiles or defaults that omit it.
+            dask_budget = _parse_size_bytes(resources.get("dask_memory_limit", "3GiB"))
+            dask_workers = max(1, min(dask_budget // (3 * 1024 ** 3), dask_threads, 8))
+        else:
+            dask_workers = int(dask_workers)
+        if dask_workers < 1:
+            raise ValueError(f"Run {run_id} resources.dask_workers must be a positive integer "
+                             "or auto")
+        resources["dask_workers"] = dask_workers
         flatten("resources", resources, run_context)
         run_context["run.entrypoint"] = expand(str(run.get("entrypoint", "")), run_context)
         for name, value in run.get("inputs", {}).items():

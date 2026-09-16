@@ -18,9 +18,9 @@ def initialize(rows, cols, rank, seed):
     row_ids = np.arange(1, rows + 1, dtype=np.float64)[:, None]
     component_ids = np.arange(1, rank + 1, dtype=np.float64)[None, :]
     col_ids = np.arange(1, cols + 1, dtype=np.float64)[None, :]
-    w = 0.01 + np.remainder(row_ids * component_ids + seed, 97.0) / 97.0
-    h = 0.01 + np.remainder(component_ids.T * col_ids + 3 * seed, 89.0) / 89.0
-    return w, h
+    W = 0.01 + np.remainder(row_ids * component_ids + seed, 97.0) / 97.0
+    H = 0.01 + np.remainder(component_ids.T * col_ids + 3 * seed, 89.0) / 89.0
+    return W, H
 
 
 def main():
@@ -38,22 +38,22 @@ def main():
     start = time.perf_counter()
     metadata = json.loads((args.data / "X.f64.json").read_text(encoding="utf-8"))
     rows, cols = metadata["rows"], metadata["cols"]
-    matrix = np.memmap(args.data / "X.f64", dtype=np.float64, mode="r",
+    X = np.memmap(args.data / "X.f64", dtype=np.float64, mode="r",
                        shape=(rows, cols))
-    w, h = initialize(rows, cols, args.rank, args.seed)
+    W, H = initialize(rows, cols, args.rank, args.seed)
     for _ in range(args.iterations):
-        h *= (w.T @ matrix) / ((w.T @ w) @ h + args.epsilon)
-        w *= (matrix @ h.T) / (w @ (h @ h.T) + args.epsilon)
+        H *= (W.T @ X) / ((W.T @ W) @ H + args.epsilon)
+        W *= (X @ H.T) / (W @ (H @ H.T) + args.epsilon)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    np.save(args.output.with_name(args.output.stem + "-W.npy"), w)
-    np.save(args.output.with_name(args.output.stem + "-H.npy"), h)
+    np.save(args.output.with_name(args.output.stem + "-W.npy"), W)
+    np.save(args.output.with_name(args.output.stem + "-H.npy"), H)
     report = {
         "implementation": "numpy-gnmf",
         "seconds": time.perf_counter() - start,
         "iterations": args.iterations,
-        "w_checksum": float(w.sum()),
-        "h_checksum": float(h.sum()),
+        "w_checksum": float(W.sum()),
+        "h_checksum": float(H.sum()),
     }
     args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report))

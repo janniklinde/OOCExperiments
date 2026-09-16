@@ -29,28 +29,26 @@ def main():
     shape = (metadata["rows"], metadata["cols"])
     if args.clusters > shape[0]:
         raise ValueError("clusters cannot exceed the number of rows")
-    matrix = np.memmap(args.data / "X.f64", dtype=np.float64, mode="r", shape=shape)
-    centers = np.array(matrix[:args.clusters], dtype=np.float64, copy=True)
-    cluster_ids = np.arange(args.clusters)
+    X = np.memmap(args.data / "X.f64", dtype=np.float64, mode="r", shape=shape)
+    C = np.array(X[:args.clusters], dtype=np.float64, copy=True)
+    sum_x_sq = float(np.einsum("ij,ij->", X, X, optimize=True))
 
     for _ in range(args.iterations):
-        distances = -2.0 * (matrix @ centers.T) + np.sum(centers * centers, axis=1)
-        labels = np.argmin(distances, axis=1)
-        del distances
-        membership = (labels[:, None] == cluster_ids).astype(np.float64)
-        counts = membership.sum(axis=0)
-        if np.any(counts == 0):
-            raise RuntimeError("an empty cluster was encountered")
-        centers = (membership.T @ matrix) / counts[:, None]
-        del membership
+        D = -2.0 * (X @ C.T) + np.sum(C * C, axis=1)
+        min_d = np.min(D, axis=1)
+        P = (D <= min_d[:, None]).astype(np.float64)
+        P /= P.sum(axis=1, keepdims=True)
+        counts = P.sum(axis=0)
+        C = (P.T @ X) / counts[:, None]
+        del D, P
 
-    distances = -2.0 * (matrix @ centers.T) + np.sum(centers * centers, axis=1)
-    labels = np.argmin(distances, axis=1)
-    inertia = float(np.einsum("ij,ij->", matrix, matrix, optimize=True)
-                    + np.min(distances, axis=1).sum())
+    D = -2.0 * (X @ C.T) + np.sum(C * C, axis=1)
+    # rowIndexMin selects the last column when distances tie.
+    Y = args.clusters - 1 - np.argmin(D[:, ::-1], axis=1)
+    inertia = float(sum_x_sq + np.min(D, axis=1).sum())
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    np.save(args.output.with_name(args.output.stem + "-centers.npy"), centers)
-    np.save(args.output.with_name(args.output.stem + "-labels.npy"), labels + 1)
+    np.save(args.output.with_name(args.output.stem + "-centers.npy"), C)
+    np.save(args.output.with_name(args.output.stem + "-labels.npy"), Y + 1)
     report = {"implementation": "numpy-kmeans", "seconds": time.perf_counter() - start,
               "clusters": args.clusters, "iterations": args.iterations, "inertia": inertia}
     args.output.write_text(json.dumps(report, indent=2) + "\n")

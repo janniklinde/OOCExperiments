@@ -45,6 +45,8 @@ def main():
                         help="stem of the prepared projection, without .f64/.json")
     parser.add_argument("--reg", type=float, default=1.0)
     parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=0,
+                        help="worker processes; 0 derives one per 3 GiB of the memory limit")
     parser.add_argument("--memory-limit", default="3GiB")
     parser.add_argument("--temporary-directory", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -53,7 +55,7 @@ def main():
         raise ValueError("reg must be non-negative")
     if args.threads < 1:
         raise ValueError("threads must be positive")
-    client = create_client(args.threads, args.memory_limit, args.temporary_directory)
+    client = create_client(args.threads, args.memory_limit, args.temporary_directory, workers=args.workers)
 
     start = time.perf_counter()
     metadata = json.loads((args.data / "metadata.json").read_text())

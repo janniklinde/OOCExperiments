@@ -31,13 +31,15 @@ def main():
     parser.add_argument("--rank", type=int, default=16)
     parser.add_argument("--seed", type=int, default=31)
     parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=0,
+                        help="worker processes; 0 derives one per 3 GiB of the memory limit")
     parser.add_argument("--memory-limit", default="3GiB")
     parser.add_argument("--temporary-directory", type=Path, required=True)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if args.threads < 1:
         raise ValueError("threads must be positive")
-    client = create_client(args.threads, args.memory_limit, args.temporary_directory)
+    client = create_client(args.threads, args.memory_limit, args.temporary_directory, workers=args.workers)
     compute_options = {}
     start = time.perf_counter()
     metadata = json.loads((args.data / "metadata.json").read_text())

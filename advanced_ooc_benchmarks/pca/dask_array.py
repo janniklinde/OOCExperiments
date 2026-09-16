@@ -25,13 +25,15 @@ def main():
                              "(default: <data>/zarr/X.zarr)")
     parser.add_argument("--components", type=int, default=16)
     parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=0,
+                        help="worker processes; 0 derives one per 3 GiB of the memory limit")
     parser.add_argument("--memory-limit", default="3GiB")
     parser.add_argument("--temporary-directory", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.threads < 1:
         raise ValueError("threads must be positive")
-    client = create_client(args.threads, args.memory_limit, args.temporary_directory)
+    client = create_client(args.threads, args.memory_limit, args.temporary_directory, workers=args.workers)
     compute_options = {}
 
     start = time.perf_counter()
@@ -39,17 +41,18 @@ def main():
     shape = (metadata["rows"], metadata["cols"])
     if not 1 <= args.components <= shape[1] or shape[0] < 2:
         raise ValueError("components must be in [1, cols] and at least two rows are required")
-    matrix = load_zarr(resolve_zarr(args.data, args.zarr))
-    center, gram = da.compute(matrix.mean(axis=0), matrix.T @ matrix, **compute_options)
-    covariance = gram / (shape[0] - 1)
-    covariance -= (shape[0] / (shape[0] - 1)) * np.outer(center, center)
-    values, vectors = np.linalg.eigh(covariance)
-    order = np.argsort(values)[::-1][:args.components]
-    eigenvalues = values[order]
-    components = vectors[:, order]
+    X = load_zarr(resolve_zarr(args.data, args.zarr))
+    sums, gram = da.compute(X.sum(axis=0), X.T @ X, **compute_options)
+    center_correction = np.outer(sums, sums) / shape[0]
+    covariance = (gram - center_correction) / (shape[0] - 1)
+    all_values, all_vectors = np.linalg.eigh(covariance)
+    decreasing_idx = np.argsort(all_values)[::-1][:args.components]
+    eigenvalues = all_values[decreasing_idx]
+    components = all_vectors[:, decreasing_idx]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     score_path = args.output.with_name(args.output.stem + "-scores.zarr")
-    score_array = matrix @ components - center @ components
+    sum_projection = sums @ components
+    score_array = X @ components - sum_projection / shape[0]
     # Do not materialize the tall score matrix in the Python heap.  Returning
     # the stored chunks lets Dask share their computation with the checksum.
     stored = store_tall(score_array, score_path)

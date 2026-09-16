@@ -1,0 +1,20 @@
+F = read($1, data_type="frame", format="csv", sep="\t", header=FALSE);
+
+spec = "{ids:true,recode:[15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40],bin:["
+  + "{id:2,method:equi-width,numbins:10},{id:3,method:equi-width,numbins:10},"
+  + "{id:4,method:equi-width,numbins:10},{id:5,method:equi-width,numbins:10},"
+  + "{id:6,method:equi-width,numbins:10},{id:7,method:equi-width,numbins:10},"
+  + "{id:8,method:equi-width,numbins:10},{id:9,method:equi-width,numbins:10},"
+  + "{id:10,method:equi-width,numbins:10},{id:11,method:equi-width,numbins:10},"
+  + "{id:12,method:equi-width,numbins:10},{id:13,method:equi-width,numbins:10},"
+  + "{id:14,method:equi-width,numbins:10}]}";
+
+[X, M] = transformencode(target=F, spec=spec);
+y = X[,1] + 1;
+X = replace(target=X[,2:ncol(X)], pattern=NaN, replacement=0);
+B = multiLogReg(X=X, Y=y, icpt=1, maxi=10, reg=0.001, verbose=FALSE);
+[M, yhat, acc] = multiLogRegPredict(X=X, B=B, Y=y, verbose=FALSE);
+e = y != yhat;
+
+write(X, $2, format="binary", rows_in_block=$4, cols_in_block=$4);
+write(e, $3, format="binary", rows_in_block=$4, cols_in_block=$4);

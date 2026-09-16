@@ -26,8 +26,18 @@ case "$dataset" in
     vertices=41652230
     edges=1468365182
     blocksize="${REAL_WORLD_BLOCKSIZE:-400000}"
-    permutation_multiplier=104729
-    permutation_offset=12345
+    case "${REAL_WORLD_VERTEX_ORDER:-affine}" in
+      affine)
+        permutation_multiplier=104729
+        permutation_offset=12345
+        ;;
+      published)
+        ;;
+      *)
+        echo "REAL_WORLD_VERTEX_ORDER must be affine or published" >&2
+        exit 2
+        ;;
+    esac
     ;;
   *)
     echo "Unknown real-world dataset: $dataset" >&2
@@ -80,9 +90,9 @@ else
   exit 2
 fi
 webgraph_cp="$java_project/target/classes:$java_project/target/dependency/*"
-if [[ -s "$out/metadata.json" && -n "${permutation_multiplier:-}" ]]; then
+if [[ -s "$out/metadata.json" ]]; then
   prepared_multiplier="$($PYTHON -c 'import json,sys; print(json.load(open(sys.argv[1])).get("vertex_permutation", {}).get("multiplier", ""))' "$out/metadata.json")"
-  if [[ "$prepared_multiplier" != "$permutation_multiplier" ]]; then
+  if [[ "$prepared_multiplier" != "${permutation_multiplier:-}" ]]; then
     echo "existing derived data uses a different vertex ordering; regenerating it" >&2
     rm -rf "$out/csr" "$out/coo" "$out/systemds" "$out/dangling.u8" "$out/metadata.json"
     mkdir -p "$out/systemds"

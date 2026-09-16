@@ -74,6 +74,8 @@ def main():
     parser.add_argument("--learning-rate", type=float, default=0.003)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=0,
+                        help="worker processes; 0 derives one per 3 GiB of the memory limit")
     parser.add_argument("--memory-limit", default="3GiB")
     parser.add_argument("--temporary-directory", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -82,14 +84,14 @@ def main():
            args.threads) < 1:
         raise ValueError("epochs, batch-size, hidden-size, hidden-chunk and threads"
                          " must be positive")
-    client = create_client(args.threads, args.memory_limit, args.temporary_directory)
+    client = create_client(args.threads, args.memory_limit, args.temporary_directory, workers=args.workers)
 
     start = time.perf_counter()
     metadata = json.loads((args.data / "metadata.json").read_text(encoding="utf-8"))
     rows, cols, hidden = metadata["rows"], metadata["cols"], args.hidden_size
     hidden_chunk = min(args.hidden_chunk, hidden)
-    matrix = load_zarr(resolve_zarr(args.data, args.zarr))
-    labels = read_vector(args.data / "nn_y.f64", rows).reshape(-1, 1)
+    X = load_zarr(resolve_zarr(args.data, args.zarr))
+    Y = read_vector(args.data / "nn_y.f64", rows).reshape(-1, 1)
 
     # Parameter stores live beside the spill directory: they are working state of
     # this execution, and the runner clears that path before and after the run.
@@ -105,11 +107,11 @@ def main():
     zeros_store(velocity_stores[1], cols, hidden, hidden_chunk)
     current = 0
 
-    w2 = np.random.default_rng(args.seed).standard_normal((hidden, 1)) * math.sqrt(2 / hidden)
+    W2 = np.random.default_rng(args.seed).standard_normal((hidden, 1)) * math.sqrt(2 / hidden)
     b1, b2 = np.zeros((1, hidden)), np.zeros((1, 1))
-    velocity_b1 = np.zeros_like(b1)
-    velocity_w2, velocity_b2 = np.zeros_like(w2), np.zeros_like(b2)
-    learning_rate, momentum, keep = args.learning_rate, 0.0, 0.35
+    vb1 = np.zeros_like(b1)
+    vW2, vb2 = np.zeros_like(W2), np.zeros_like(b2)
+    lr, mu, p = args.learning_rate, 0.0, 0.35
     epoch_loss = 0.0
 
     for epoch in range(args.epochs):
@@ -117,61 +119,60 @@ def main():
         for first in range(0, rows, args.batch_size):
             last = min(rows, first + args.batch_size)
             count = last - first
-            x = matrix[first:last]
-            y = labels[first:last]
+            X_batch = X[first:last]
+            Y_batch = Y[first:last]
             dask_w1 = da.from_zarr(str(w1_stores[current]))
             dask_velocity = da.from_zarr(str(velocity_stores[current]))
-            dask_w2 = da.from_array(w2, chunks=((hidden_chunk,) * (hidden // hidden_chunk)
+            dask_w2 = da.from_array(W2, chunks=((hidden_chunk,) * (hidden // hidden_chunk)
                                                 + ((hidden % hidden_chunk,)
                                                    if hidden % hidden_chunk else ()), (1,)))
 
-            affine = x @ dask_w1 + b1
+            affine = X_batch @ dask_w1 + b1
             relu = da.maximum(affine, 0)
             dropout_rng = da.random.RandomState(
                 int(np.random.SeedSequence([args.seed, epoch, first]).generate_state(1)[0]))
-            mask = dropout_rng.random_sample(relu.shape, chunks=relu.chunks) < keep
-            dropped = relu * mask / keep
-            prediction = 1 / (1 + da.exp(-(dropped @ dask_w2 + b2)))
-            clipped = da.clip(prediction, np.finfo(np.float64).eps,
-                              1 - np.finfo(np.float64).eps)
-            loss = (-y * da.log(clipped) - (1 - y) * da.log(1 - clipped)).sum() / count
-            d_prediction = (prediction - y) / (prediction * (1 - prediction)) / count
-            dout = d_prediction * prediction * (1 - prediction)
-            dw2 = dropped.T @ dout
+            mask = dropout_rng.random_sample(relu.shape, chunks=relu.chunks) < p
+            dropped = relu * mask / p
+            outs2 = 1 / (1 + da.exp(-(dropped @ dask_w2 + b2)))
+            # Match log_loss::forward: no framework-specific probability clipping.
+            loss = (-Y_batch * da.log(outs2) - (1 - Y_batch) * da.log(1 - outs2)).sum() / count
+            dout2 = (outs2 - Y_batch) / (outs2 * (1 - outs2)) / count
+            dout = dout2 * outs2 * (1 - outs2)
+            dW2 = dropped.T @ dout
             db2 = dout.sum(axis=0, keepdims=True)
-            hidden_gradient = (dout @ dask_w2.T) * mask / keep * (affine > 0)
-            dw1 = (x.T @ hidden_gradient).rechunk(dask_w1.chunks)
+            hidden_gradient = (dout @ dask_w2.T) * mask / p * (affine > 0)
+            dW1 = (X_batch.T @ hidden_gradient).rechunk(dask_w1.chunks)
             db1 = hidden_gradient.sum(axis=0, keepdims=True)
 
             # Nesterov, fused into the same graph as the gradient so dw1 is built
             # once and never lands anywhere but the destination store.
-            next_velocity = momentum * dask_velocity - learning_rate * dw1
-            next_w1 = dask_w1 + (-momentum * dask_velocity
-                                 + (1.0 + momentum) * next_velocity)
+            next_velocity = mu * dask_velocity - lr * dW1
+            next_w1 = dask_w1 + (-mu * dask_velocity
+                                 + (1.0 + mu) * next_velocity)
             other = 1 - current
             write_w1 = da.to_zarr(next_w1, str(w1_stores[other]), overwrite=True,
                                   compute=False)
             write_velocity = da.to_zarr(next_velocity, str(velocity_stores[other]),
                                         overwrite=True, compute=False)
             _, _, grad_b1, grad_w2, grad_b2, batch_loss = da.compute(
-                write_w1, write_velocity, db1, dw2, db2, loss)
+                write_w1, write_velocity, db1, dW2, db2, loss)
             current = other
             epoch_loss += float(batch_loss)
 
-            for value, gradient, velocity in ((w2, grad_w2, velocity_w2),
-                                              (b2, grad_b2, velocity_b2),
-                                              (b1, grad_b1, velocity_b1)):
+            for value, gradient, velocity in ((W2, grad_w2, vW2),
+                                              (b2, grad_b2, vb2),
+                                              (b1, grad_b1, vb1)):
                 previous = velocity.copy()
-                velocity *= momentum
-                velocity -= learning_rate * gradient
-                value += -momentum * previous + (1.0 + momentum) * velocity
-        momentum += (0.999 - momentum) / (args.epochs - epoch)
-        learning_rate *= 0.99
+                velocity *= mu
+                velocity -= lr * gradient
+                value += -mu * previous + (1.0 + mu) * velocity
+        mu += (0.999 - mu) / (args.epochs - epoch)
+        lr *= 0.99
 
-    model_checksum = float(da.from_zarr(str(w1_stores[current])).sum().compute()) \
-        + float(w2.sum())
+    model_checksum = float(da.from_zarr(str(w1_stores[current])).sum().compute())\
+        + float(W2.sum())
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    np.save(args.output.with_name(args.output.stem + "-W2.npy"), w2)
+    np.save(args.output.with_name(args.output.stem + "-W2.npy"), W2)
     da.to_zarr(da.from_zarr(str(w1_stores[current])),
                str(args.output.with_name(args.output.stem + "-W1.zarr")), overwrite=True)
     report = {

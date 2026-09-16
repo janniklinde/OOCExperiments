@@ -40,7 +40,7 @@ def column_band(rows, dtype=np.float64):
     return max(1, BAND_BYTES // max(1, rows * np.dtype(dtype).itemsize))
 
 
-def nesterov_update(value, gradient, velocity, learning_rate, momentum):
+def nesterov_update(value, gradient, velocity, lr, mu):
     """In-place Nesterov step, banded so it never allocates a full copy of `velocity`.
 
     The original formulation needs the pre-update velocity, which for an in-RAM
@@ -49,18 +49,18 @@ def nesterov_update(value, gradient, velocity, learning_rate, momentum):
     """
     if value.ndim == 1 or value.shape[0] * value.shape[1] * 8 <= BAND_BYTES:
         previous = np.array(velocity, copy=True)
-        velocity *= momentum
-        velocity -= learning_rate * gradient
-        value += -momentum * previous + (1.0 + momentum) * velocity
+        velocity *= mu
+        velocity -= lr * gradient
+        value += -mu * previous + (1.0 + mu) * velocity
         return
     band = column_band(value.shape[0])
     for first in range(0, value.shape[1], band):
         last = min(value.shape[1], first + band)
         previous = np.array(velocity[:, first:last], copy=True)
-        updated = velocity[:, first:last] * momentum
-        updated -= learning_rate * gradient[:, first:last]
+        updated = velocity[:, first:last] * mu
+        updated -= lr * gradient[:, first:last]
         velocity[:, first:last] = updated
-        value[:, first:last] += -momentum * previous + (1.0 + momentum) * updated
+        value[:, first:last] += -mu * previous + (1.0 + mu) * updated
 
 
 def init_affine(destination, fan_in, seed):
@@ -111,8 +111,8 @@ def main():
     n, cols, hidden = metadata["rows"], metadata["cols"], args.hidden_size
     if min(args.epochs, args.batch_size, hidden) < 1:
         raise ValueError("epochs, batch-size, and hidden-size must be positive")
-    matrix = np.memmap(args.data / "X.f64", dtype=np.float64, mode="r", shape=(n, cols))
-    labels = np.memmap(args.data / "nn_y.f64", dtype=np.float64, mode="r", shape=(n, 1))
+    X = np.memmap(args.data / "X.f64", dtype=np.float64, mode="r", shape=(n, cols))
+    Y = np.memmap(args.data / "nn_y.f64", dtype=np.float64, mode="r", shape=(n, 1))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     work_root = Path(os.environ.get("BENCH_RUN_TMP", args.output.parent))
     work_root.mkdir(parents=True, exist_ok=True)
@@ -127,27 +127,27 @@ def main():
         # companions are the model, and at wide hidden layers they are what does
         # not fit, so all three live on disk. W2 is (hidden, 1) and b1 is
         # (1, hidden): both are a single vector and stay resident.
-        w1 = init_affine(create_memmap(work / "w1.f64", (cols, hidden)), cols, args.seed)
-        w2 = np.random.default_rng(args.seed).standard_normal((hidden, 1)) * math.sqrt(2 / hidden)
+        W1 = init_affine(create_memmap(work / "w1.f64", (cols, hidden)), cols, args.seed)
+        W2 = np.random.default_rng(args.seed).standard_normal((hidden, 1)) * math.sqrt(2 / hidden)
         b1, b2 = np.zeros((1, hidden)), np.zeros((1, 1))
         dropout_rng = np.random.default_rng()
-        velocity_w1 = create_memmap(work / "velocity-w1.f64", (cols, hidden))
-        velocity_w1[:] = 0
-        dw1 = create_memmap(work / "dw1.f64", (cols, hidden))
-        velocities = [velocity_w1] + [np.zeros_like(value) for value in (b1, w2, b2)]
-        learning_rate, momentum, keep = args.learning_rate, 0.0, 0.35
+        vW1 = create_memmap(work / "velocity-w1.f64", (cols, hidden))
+        vW1[:] = 0
+        dW1 = create_memmap(work / "dw1.f64", (cols, hidden))
+        velocities = [vW1] + [np.zeros_like(value) for value in (b1, W2, b2)]
+        lr, mu, p = args.learning_rate, 0.0, 0.35
         epoch_loss = 0.0
         for epoch in range(args.epochs):
             epoch_loss = 0.0
             for first in range(0, n, args.batch_size):
                 last = min(n, first + args.batch_size)
-                x, y = matrix[first:last], labels[first:last]
+                X_batch, Y_batch = X[first:last], Y[first:last]
                 activation_shape = (last - first, hidden)
                 activation = create_memmap(work / "activation.f64", activation_shape)
                 active = create_memmap(work / "active.u8", activation_shape, np.uint8)
                 mask = create_memmap(work / "mask.u8", activation_shape, np.uint8)
 
-                np.matmul(x, w1, out=activation)
+                np.matmul(X_batch, W1, out=activation)
                 np.add(activation, b1, out=activation)
                 np.greater(activation, 0, out=active)
                 np.maximum(activation, 0, out=activation)
@@ -157,41 +157,41 @@ def main():
                 random_rows = max(1, (32 * 1024 * 1024) // (hidden * 8))
                 for row in range(0, activation_shape[0], random_rows):
                     stop = min(activation_shape[0], row + random_rows)
-                    mask[row:stop] = dropout_rng.random((stop - row, hidden)) < keep
+                    mask[row:stop] = dropout_rng.random((stop - row, hidden)) < p
                 np.multiply(activation, mask, out=activation)
-                np.divide(activation, keep, out=activation)
+                np.divide(activation, p, out=activation)
 
-                prediction = activation @ w2 + b2
+                outs2 = activation @ W2 + b2
                 # Match ffTrain's log_loss::forward/backward followed by sigmoid::backward.
-                prediction = 1 / (1 + np.exp(-prediction))
-                epoch_loss += float((-y * np.log(prediction) - (1 - y) * np.log(1 - prediction)).sum()) / len(x)
-                d_prediction = (prediction - y) / (prediction * (1 - prediction)) / len(x)
-                dout = d_prediction * prediction * (1 - prediction)
-                dw2, db2 = activation.T @ dout, dout.sum(axis=0, keepdims=True)
+                outs2 = 1 / (1 + np.exp(-outs2))
+                epoch_loss += float((-Y_batch * np.log(outs2) - (1 - Y_batch) * np.log(1 - outs2)).sum()) / len(X_batch)
+                dout2 = (outs2 - Y_batch) / (outs2 * (1 - outs2)) / len(X_batch)
+                dout = dout2 * outs2 * (1 - outs2)
+                dW2, db2 = activation.T @ dout, dout.sum(axis=0, keepdims=True)
 
                 hidden_gradient = create_memmap(work / "hidden-gradient.f64", activation_shape)
-                np.matmul(dout, w2.T, out=hidden_gradient)
+                np.matmul(dout, W2.T, out=hidden_gradient)
                 np.multiply(hidden_gradient, mask, out=hidden_gradient)
-                np.divide(hidden_gradient, keep, out=hidden_gradient)
+                np.divide(hidden_gradient, p, out=hidden_gradient)
                 np.multiply(hidden_gradient, active, out=hidden_gradient)
                 # (cols, hidden), the same size as the model: written straight
                 # into its memmap rather than returned as a fresh array.
-                np.matmul(np.asarray(x).T, hidden_gradient, out=dw1)
+                np.matmul(np.asarray(X_batch).T, hidden_gradient, out=dW1)
                 db1 = hidden_gradient.sum(axis=0, keepdims=True)
-                for value, gradient, velocity in zip((w2, b2, w1, b1), (dw2, db2, dw1, db1),
+                for value, gradient, velocity in zip((W2, b2, W1, b1), (dW2, db2, dW1, db1),
                                                       (velocities[2], velocities[3], velocities[0], velocities[1])):
-                    nesterov_update(value, gradient, velocity, learning_rate, momentum)
+                    nesterov_update(value, gradient, velocity, lr, mu)
                 del activation, active, mask, hidden_gradient
-            momentum += (0.999 - momentum) / (args.epochs - epoch)
-            learning_rate *= 0.99
-        model_checksum = banded_sum(w1) + float(w2.sum())
+            mu += (0.999 - mu) / (args.epochs - epoch)
+            lr *= 0.99
+        model_checksum = banded_sum(W1) + float(W2.sum())
         # Written before the work directory goes away; W1 is the model, so the
         # SystemDS arm writes it too and the volume is symmetric across arms.
-        np.save(args.output.with_name(args.output.stem + "-W1.npy"), np.asarray(w1))
+        np.save(args.output.with_name(args.output.stem + "-W1.npy"), np.asarray(W1))
         succeeded = True
     finally:
         if succeeded:
-            del w1, velocity_w1, dw1
+            del W1, vW1, dW1
             shutil.rmtree(work)
         else:
             print(f"memmap intermediates await runner cleanup after failure: {work}",
@@ -199,7 +199,7 @@ def main():
     report = {"implementation": "python-mlp", "seconds": time.perf_counter() - start,
               "model_checksum": model_checksum, "last_epoch_loss": epoch_loss,
               "model_bytes": cols * hidden * 8, "activation_bytes": args.batch_size * hidden * 8}
-    np.save(args.output.with_name(args.output.stem + "-W2.npy"), w2)
+    np.save(args.output.with_name(args.output.stem + "-W2.npy"), W2)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report))
 

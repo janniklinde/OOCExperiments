@@ -20,7 +20,7 @@ m_pca_covariance = function(Matrix[Double] X, Integer k)
   [all_values, all_vectors] = eigen(covariance);
   decreasing_idx = order(target=all_values, by=1, decreasing=TRUE, index.return=TRUE);
   permutation = table(seq(1, d), decreasing_idx);
-  sorted_vectors = all_vectors %*% permutation;
+  sorted_vectors = all_vectors %*% t(permutation);
   sorted_values = permutation %*% all_values;
   components = sorted_vectors[, 1:k];
   eigenvalues = sorted_values[1:k, ];

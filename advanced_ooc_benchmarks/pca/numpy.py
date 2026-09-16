@@ -26,20 +26,22 @@ def main():
     shape = (metadata["rows"], metadata["cols"])
     if not 1 <= args.components <= shape[1] or shape[0] < 2:
         raise ValueError("components must be in [1, cols] and at least two rows are required")
-    matrix = np.memmap(args.data / "X.f64", dtype=np.float64, mode="r", shape=shape)
-    center = np.mean(matrix, axis=0)
-    covariance = (matrix.T @ matrix) / (shape[0] - 1)
-    covariance -= (shape[0] / (shape[0] - 1)) * np.outer(center, center)
-    values, vectors = np.linalg.eigh(covariance)
-    order = np.argsort(values)[::-1][:args.components]
-    eigenvalues = values[order]
-    components = vectors[:, order]
+    X = np.memmap(args.data / "X.f64", dtype=np.float64, mode="r", shape=shape)
+    sums = np.sum(X, axis=0)
+    gram = X.T @ X
+    center_correction = np.outer(sums, sums) / shape[0]
+    covariance = (gram - center_correction) / (shape[0] - 1)
+    all_values, all_vectors = np.linalg.eigh(covariance)
+    decreasing_idx = np.argsort(all_values)[::-1][:args.components]
+    eigenvalues = all_values[decreasing_idx]
+    components = all_vectors[:, decreasing_idx]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     score_path = args.output.with_name(args.output.stem + "-scores.npy")
     scores = np.lib.format.open_memmap(
         score_path, mode="w+", dtype=np.float64, shape=(shape[0], args.components))
-    np.matmul(matrix, components, out=scores)
-    np.subtract(scores, center @ components, out=scores)
+    np.matmul(X, components, out=scores)
+    sum_projection = sums @ components
+    np.subtract(scores, sum_projection / shape[0], out=scores)
     score_norm_sq = float(np.einsum("ij,ij->", scores, scores, optimize=True))
     scores.flush()
     np.save(args.output.with_name(args.output.stem + "-components.npy"), components)

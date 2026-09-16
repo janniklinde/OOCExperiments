@@ -61,9 +61,19 @@ only by `lmcg_spoof`, `kmeans_spoof`, and `multilogreg_spoof` at `mem128`
   `bench-data/randomforest` directory. SystemDS
   and sklearn both train fixed-depth, Gini-classification forests without row bootstrapping and
   materialize their learned models.
-- `pagerank/` reuses the prepared Twitter-2010 graph from `experiments/real_world`, including its
-  deterministic vertex permutation, normalized CSR representation, dangling bitmap, and native
-  400,000-by-400,000 SystemDS tiles used by the established Twitter experiments.
+- `pagerank/` uses the published Twitter-2010 vertex ordering directly, its normalized CSR
+  representation and dangling bitmap, and blocksize-qualified 20,000-by-20,000 native SystemDS
+  tiles. The OOC arm packs the resulting ultra-sparse source tiles into 16 MiB spillable groups;
+  the Spark and SciPy arms retain their native physical representations.
+- `sliceline/` uses the complete CriteoD21 day, the largest dataset in the
+  SliceLine paper. Preparation automatically stages the published Criteo Click Logs Parquet
+  shards for `day=2015-03-08`: the historical source files were zero-indexed, so this is
+  `day_21.gz`. It pins the resolved Hugging Face revision in `parquet-manifest.json`, converts
+  shards sequentially with Spark into a bounded-memory canonical TSV, then applies the paper's
+  binning/recode specification, trains the same ten-iteration multinomial logistic-regression
+  model to derive its error vector, and stores the 39-column recoded matrix. The timed OOC and
+  local-Spark arms run SliceLine through level two with the paper's top-k, score weight, support
+  threshold, and data-parallel slice evaluation.
 - `connected_components/` computes connected components by max-label propagation over a sparse
   symmetric graph. `prepare.py` generates it with a planted component structure and exact ground
   truth, as CSR over raw files; SystemDS, SciPy, and Dask all read that one representation. The
@@ -84,6 +94,9 @@ only by `lmcg_spoof`, `kmeans_spoof`, and `multilogreg_spoof` at `mem128`
   implementation and silently hands the JVM a null `MatrixBlock`.
 
 ## Comparability contract
+
+See [BASELINE_COMPARABILITY.md](BASELINE_COMPARABILITY.md) for per-workload
+equation correspondence, remaining physical/RNG differences, and small numerical checks.
 
 The suite aligns major logical operations and output materialization while deliberately allowing each runtime to choose its
 own physical plan. The SystemDS entrypoints import the vendored DML implementation rather than
@@ -351,11 +364,20 @@ Cold-cache traversal ignores preparation symlinks to tools such as the SystemDS 
 The implementation template's `blocksize_sweep` field associates it with `ooc` or `spark`.
 Implementations without an association, such as NumPy, sklearn, SciPy, and Dask, are grouped in the
 single `-baseline` case. This case skips SystemDS native conversion and SystemDS-specific setup.
-The dedicated Dask template uses one in-process threaded scheduler, limits it with
-`resources.dask_threads`, targets `resources.dask_chunk_size` per automatically selected chunk,
-and fixes BLAS libraries to one thread per task, avoiding nested Dask-by-BLAS parallelism. The
-default 32 MiB target controls task granularity, while each memory profile scales Dask's managed
-memory limit to 12, 6, or 3 GiB; neither setting is a SystemDS blocksize. Tall Dask outputs such as
+The dedicated Dask template fixes BLAS libraries to one thread per task, avoiding nested
+Dask-by-BLAS parallelism, and targets `resources.dask_chunk_size` per automatically selected
+chunk; that 100 MB target controls task granularity, while each memory profile scales
+Dask's managed memory limit to 12, 6, or 3 GiB; neither setting is a SystemDS blocksize. The
+Dask scheduler itself runs as `resources.dask_workers` worker processes -- one per 3 GiB of the
+profile's Dask memory budget, capped at 8 (mem16: 4 workers x 8 threads; mem8: 2 x 8; mem4:
+one in-process worker) -- with the profile's `dask_threads` allowance split evenly across them
+and each worker's memory limit set to its share of the budget. One process per 3 GiB keeps
+per-worker chunk residency (threads x chunk x ~2.5 transient copies) below the pause threshold
+with the suite-wide 100 MiB chunks: measured on lmcg, kmeans, and multilogreg, a single
+in-process worker leaves 3-5 of 16-64 threads busy regardless of the thread count, while this
+split ran the same scripts 1.25-1.96x faster with bit-identical results and no spill or pause
+events; 200 MiB chunks against 3 GiB workers instead caused pause/restart churn and 33% read
+amplification, which is why the chunk size stays 100 MiB. Tall Dask outputs such as
 PCA scores and GNMF `W` are streamed into an uncompressed Zarr store rather than first being
 collected into the Python heap. They previously targeted an `np.lib.format.open_memmap`, which
 does not work under a distributed client: the memmap is serialized to the worker, which writes

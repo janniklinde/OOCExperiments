@@ -25,105 +25,110 @@ def main():
     args = parser.parse_args()
     start = time.perf_counter()
     metadata = json.loads((args.data / "metadata.json").read_text())
-    n, d, classes = metadata["rows"], metadata["cols"], metadata["classes"]
-    matrix = np.memmap(args.data / "X.f64", dtype=np.float64, mode="r", shape=(n, d))
+    N, D, classes = metadata["rows"], metadata["cols"], metadata["classes"]
+    X = np.memmap(args.data / "X.f64", dtype=np.float64, mode="r", shape=(N, D))
     # The vendored SystemDS implementation performs this full-input robustness
     # scan before training. The benchmark dataset contract excludes missing values,
     # but retain the scan so both arms perform the same logical input check.
-    if np.isnan(matrix).any():
-        raise ValueError("benchmark input X.f64 contains NaN values")
-    labels = np.memmap(args.data / "nn_y.f64", dtype=np.float64, mode="r", shape=n)
-    labels = np.where(labels > 0, 1, 2).astype(np.int64) - 1
-    k = classes - 1
-    beta = np.zeros((d, k))
-    probabilities = np.full((n, classes), 1.0 / classes)
+    if np.isnan(X).any():
+        X = np.where(np.isnan(X), 0.0, X)
+    labels = np.memmap(args.data / "nn_y.f64", dtype=np.float64, mode="r", shape=N)
+    max_y = int(labels.max())
+    if labels.min() <= 0:
+        labels = np.where(labels <= 0, max_y + 1, labels)
+        max_y += 1
+    classes = max_y
+    labels = labels.astype(np.int64) - 1
+    K = classes - 1
+    B = np.zeros((D, K))
+    P = np.full((N, classes), 1.0 / classes)
 
-    def gradient(probability, value):
-        residual = probability[:, :k].copy()
-        rows = np.arange(n)
-        active = labels < k
-        residual[rows[active], labels[active]] -= 1
-        return matrix.T @ residual + args.reg * value
+    def gradient(P, value):
+        R = P[:, :K].copy()
+        rows = np.arange(N)
+        active = labels < K
+        R[rows[active], labels[active]] -= 1
+        return X.T @ R + args.reg * value
 
-    max_norm = float(np.sqrt(np.einsum("ij,ij->i", matrix, matrix)).max())
+    max_norm = float(np.sqrt(np.einsum("ij,ij->i", X, X)).max())
 
     def evaluate(value):
-        logits = np.column_stack((matrix @ value, np.zeros(n)))
+        logits = np.column_stack((X @ value, np.zeros(N)))
         logits -= logits.max(axis=1, keepdims=True)
         exp_logits = np.exp(logits)
-        probability = exp_logits / exp_logits.sum(axis=1, keepdims=True)
-        objective = 0.5 * args.reg * float((value * value).sum())
-        objective -= float(logits[np.arange(n), labels].sum())
-        objective += float(np.log(exp_logits.sum(axis=1)).sum())
-        return probability, objective
+        P = exp_logits / exp_logits.sum(axis=1, keepdims=True)
+        obj = 0.5 * args.reg * float((value * value).sum())
+        obj -= float(logits[np.arange(N), labels].sum())
+        obj += float(np.log(exp_logits.sum(axis=1)).sum())
+        return P, obj
 
-    delta = 0.5 * math.sqrt(d) / max_norm
-    objective = n * math.log(classes)
-    grad = gradient(probabilities, beta)
-    initial_norm = np.linalg.norm(grad)
+    delta = 0.5 * math.sqrt(D) / max_norm
+    obj = N * math.log(classes)
+    Grad = gradient(P, B)
+    norm_Grad_initial = np.linalg.norm(Grad)
     for outer in range(args.iterations):
-        grad_norm = np.linalg.norm(grad)
-        if grad_norm < args.tolerance * initial_norm:
+        norm_Grad = np.linalg.norm(Grad)
+        if norm_Grad < args.tolerance * (1.0 if outer == 0 else norm_Grad_initial):
             break
-        step = np.zeros_like(beta)
-        residual = -grad
-        direction = residual.copy()
-        residual_norm2 = float((residual * residual).sum())
-        boundary = False
+        S = np.zeros_like(B)
+        R = -Grad
+        V = R.copy()
+        norm_R2 = float((R * R).sum())
+        is_trust_boundary_reached = False
         for _ in range(args.inner_iterations):
-            xv = matrix @ direction
-            p = probabilities[:, :k]
-            q = p * xv
-            hv = matrix.T @ (q - p * q.sum(axis=1, keepdims=True)) + args.reg * direction
-            alpha = residual_norm2 / float((direction * hv).sum())
-            candidate = step + alpha * direction
+            XV = X @ V
+            p = P[:, :K]
+            Q = p * XV
+            HV = X.T @ (Q - p * Q.sum(axis=1, keepdims=True)) + args.reg * V
+            alpha = norm_R2 / float((V * HV).sum())
+            candidate = S + alpha * V
             if float((candidate * candidate).sum()) > delta * delta:
-                boundary = True
-                sv = float((step * direction).sum())
-                v2 = float((direction * direction).sum())
-                s2 = float((step * step).sum())
+                is_trust_boundary_reached = True
+                sv = float((S * V).sum())
+                v2 = float((V * V).sum())
+                s2 = float((S * S).sum())
                 radius = math.sqrt(sv * sv + v2 * (delta * delta - s2))
                 alpha = (delta * delta - s2) / (sv + radius) if sv >= 0 else (radius - sv) / v2
-                step += alpha * direction
-                residual -= alpha * hv
+                S += alpha * V
+                R -= alpha * HV
                 break
-            step = candidate
-            residual -= alpha * hv
-            old = residual_norm2
-            residual_norm2 = float((residual * residual).sum())
-            if math.sqrt(residual_norm2) <= 0.1 * grad_norm:
+            S = candidate
+            R -= alpha * HV
+            old = norm_R2
+            norm_R2 = float((R * R).sum())
+            if math.sqrt(norm_R2) <= 0.1 * norm_Grad:
                 break
-            direction = residual + residual_norm2 / old * direction
-        candidate_probability, candidate_objective = evaluate(beta + step)
-        gs = float((step * grad).sum())
-        predicted_reduction = -0.5 * (gs - float((step * residual).sum()))
-        actual_reduction = objective - candidate_objective
-        rho = actual_reduction / predicted_reduction
-        step_norm = np.linalg.norm(step)
+            V = R + norm_R2 / old * V
+        P_new, obj_new = evaluate(B + S)
+        gs = float((S * Grad).sum())
+        qk = -0.5 * (gs - float((S * R).sum()))
+        actred = obj - obj_new
+        rho = actred / qk
+        snorm = np.linalg.norm(S)
         if outer == 0:
-            delta = min(delta, step_norm)
-        alpha2 = candidate_objective - objective - gs
+            delta = min(delta, snorm)
+        alpha2 = obj_new - obj - gs
         alpha = 4.0 if alpha2 <= 0 else max(0.25, -0.5 * gs / alpha2)
         if rho < 0.0001:
-            delta = min(max(alpha, 0.25) * step_norm, 0.5 * delta)
+            delta = min(max(alpha, 0.25) * snorm, 0.5 * delta)
         elif rho < 0.25:
-            delta = max(0.25 * delta, min(alpha * step_norm, 0.5 * delta))
+            delta = max(0.25 * delta, min(alpha * snorm, 0.5 * delta))
         elif rho < 0.75:
-            delta = max(0.25 * delta, min(alpha * step_norm, 4.0 * delta))
+            delta = max(0.25 * delta, min(alpha * snorm, 4.0 * delta))
         else:
-            delta = max(delta, min(alpha * step_norm, 4.0 * delta))
+            delta = max(delta, min(alpha * snorm, 4.0 * delta))
         if rho > 0.0001:
-            beta += step
-            probabilities = candidate_probability
-            objective = candidate_objective
-            grad = gradient(probabilities, beta)
-        if not boundary and abs(actual_reduction) < (abs(objective) + abs(candidate_objective)) * 1e-14:
+            B += S
+            P = P_new
+            obj = obj_new
+            Grad = gradient(P, B)
+        if not is_trust_boundary_reached and abs(actred) < (abs(obj) + abs(obj_new)) * 1e-14:
             break
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        np.save(args.output.with_name(args.output.stem + "-B.npy"), beta)
+        np.save(args.output.with_name(args.output.stem + "-B.npy"), B)
     report = {"implementation": "python-multilogreg", "seconds": time.perf_counter() - start,
-              "coefficient_norm": float(np.linalg.norm(beta)), "objective": float(objective)}
+              "coefficient_norm": float(np.linalg.norm(B)), "objective": float(obj)}
     if args.output:
         args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report))

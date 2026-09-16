@@ -30,6 +30,8 @@ def main():
     parser.add_argument("--tolerance", type=float, default=1e-8)
     parser.add_argument("--reg", type=float, default=1.0)
     parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=0,
+                        help="worker processes; 0 derives one per 3 GiB of the memory limit")
     parser.add_argument("--memory-limit", default="3GiB")
     parser.add_argument("--temporary-directory", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -39,132 +41,137 @@ def main():
     if args.reg < 0 or args.tolerance < 0:
         raise ValueError("reg and tolerance must be non-negative")
 
-    client = create_client(args.threads, args.memory_limit, args.temporary_directory)
+    client = create_client(args.threads, args.memory_limit, args.temporary_directory, workers=args.workers)
     try:
         start = time.perf_counter()
         metadata = json.loads((args.data / "metadata.json").read_text())
-        n, d, classes = metadata["rows"], metadata["cols"], metadata["classes"]
-        k = classes - 1
-        matrix = load_zarr(resolve_zarr(args.data, args.zarr))
-        row_chunk = matrix.chunks[0][0]
-        # nn_y holds {0,1}; the vendored SystemDS implementation turns the same file into a
-        # {1,2} label column and then an indicator matrix whose first K columns are the
-        # non-baseline categories. Class index 0 is therefore the positive label.
-        raw_labels = read_vector(args.data / "nn_y.f64", n)
-        label_index = np.where(raw_labels > 0, 0.0, 1.0)
+        N, D, classes = metadata["rows"], metadata["cols"], metadata["classes"]
+        K = classes - 1
+        X = load_zarr(resolve_zarr(args.data, args.zarr))
+        row_chunk = X.chunks[0][0]
+        # Match DML's conversion of nonpositive labels into the baseline category.
+        raw_labels = read_vector(args.data / "nn_y.f64", N)
+        max_y = int(raw_labels.max())
+        if raw_labels.min() <= 0:
+            raw_labels = np.where(raw_labels <= 0, max_y + 1, raw_labels)
+            max_y += 1
+        classes = max_y
+        K = classes - 1
+        label_index = raw_labels - 1
         # Build the indicators in NumPy (n-by-classes is 64 MB at four million rows), then
         # hand them back to Dask on X's exact row chunking. A bare NumPy operand would be
         # captured whole by every task that touches it rather than sliced per block.
-        indicators = da.from_array(
+        Y = da.from_array(
             np.concatenate([(label_index == c).astype(np.float64) for c in range(classes)],
                            axis=1),
-            chunks=(matrix.chunks[0], classes))
+            chunks=(X.chunks[0], classes))
 
         # The vendored SystemDS implementation performs this full-input robustness scan
         # before training. The benchmark dataset contract excludes missing values, but
         # retain the scan so every arm performs the same logical input check. It shares
         # one pass over X with the row-norm bound the trust region is initialized from.
         has_nan, max_norm = da.compute(
-            da.isnan(matrix).any(), da.sqrt((matrix * matrix).sum(axis=1)).max())
+            da.isnan(X).any(), da.sqrt((X * X).sum(axis=1)).max())
         if bool(has_nan):
-            raise ValueError("benchmark input X.f64 contains NaN values")
+            X = da.where(da.isnan(X), 0.0, X)
+            max_norm = float(da.sqrt((X * X).sum(axis=1)).max().compute())
         max_norm = float(max_norm)
 
-        beta = np.zeros((d, k))
-        probabilities = da.full((n, classes), 1.0 / classes, chunks=(row_chunk, classes))
+        B = np.zeros((D, K))
+        P = da.full((N, classes), 1.0 / classes, chunks=(row_chunk, classes))
 
-        def gradient(probability, value):
-            residual = probability[:, :k] - indicators[:, :k]
-            return (matrix.T @ residual).compute() + args.reg * value
+        def gradient(P, value):
+            R = P[:, :K] - Y[:, :K]
+            return (X.T @ R).compute() + args.reg * value
 
         def evaluate(value):
             """Probabilities and objective at `value`, both from a single pass over X."""
             logits = da.concatenate(
-                [matrix @ value, da.zeros((n, 1), chunks=(row_chunk, 1))], axis=1)
+                [X @ value, da.zeros((N, 1), chunks=(row_chunk, 1))], axis=1)
             logits = logits - logits.max(axis=1, keepdims=True)
             exp_logits = da.exp(logits)
             total = exp_logits.sum(axis=1, keepdims=True)
-            probability = exp_logits / total
-            negative_likelihood = da.log(total[:, 0]).sum() - (logits * indicators).sum()
-            probability, negative_likelihood = dask.persist(probability, negative_likelihood)
-            objective = (0.5 * args.reg * float((value * value).sum())
+            P = exp_logits / total
+            negative_likelihood = da.log(total[:, 0]).sum() - (logits * Y).sum()
+            P, negative_likelihood = dask.persist(P, negative_likelihood)
+            obj = (0.5 * args.reg * float((value * value).sum())
                          + float(negative_likelihood.compute()))
-            return probability, objective
+            return P, obj
 
-        delta = 0.5 * math.sqrt(d) / max_norm
-        objective = n * math.log(classes)
-        grad = gradient(probabilities, beta)
-        initial_norm = np.linalg.norm(grad)
+        delta = 0.5 * math.sqrt(D) / max_norm
+        obj = N * math.log(classes)
+        Grad = gradient(P, B)
+        norm_Grad_initial = np.linalg.norm(Grad)
         completed = 0
         for outer in range(args.iterations):
-            grad_norm = np.linalg.norm(grad)
-            if grad_norm < args.tolerance * initial_norm:
+            norm_Grad = np.linalg.norm(Grad)
+            if norm_Grad < args.tolerance * (1.0 if outer == 0 else norm_Grad_initial):
                 break
             completed += 1
-            step = np.zeros_like(beta)
-            residual = -grad
-            direction = residual.copy()
-            residual_norm2 = float((residual * residual).sum())
-            boundary = False
+            S = np.zeros_like(B)
+            R = -Grad
+            V = R.copy()
+            norm_R2 = float((R * R).sum())
+            is_trust_boundary_reached = False
             for _ in range(args.inner_iterations):
                 # One compute() so the two matmuls share a single read of each X block.
-                p = probabilities[:, :k]
-                q = p * (matrix @ direction)
-                hv = (matrix.T @ (q - p * q.sum(axis=1, keepdims=True))).compute()
-                hv += args.reg * direction
-                alpha = residual_norm2 / float((direction * hv).sum())
-                candidate = step + alpha * direction
+                p = P[:, :K]
+                Q = p * (X @ V)
+                HV = (X.T @ (Q - p * Q.sum(axis=1, keepdims=True))).compute()
+                HV += args.reg * V
+                alpha = norm_R2 / float((V * HV).sum())
+                candidate = S + alpha * V
                 if float((candidate * candidate).sum()) > delta * delta:
-                    boundary = True
-                    sv = float((step * direction).sum())
-                    v2 = float((direction * direction).sum())
-                    s2 = float((step * step).sum())
+                    is_trust_boundary_reached = True
+                    sv = float((S * V).sum())
+                    v2 = float((V * V).sum())
+                    s2 = float((S * S).sum())
                     radius = math.sqrt(sv * sv + v2 * (delta * delta - s2))
                     alpha = (delta * delta - s2) / (sv + radius) if sv >= 0 else (radius - sv) / v2
-                    step += alpha * direction
-                    residual -= alpha * hv
+                    S += alpha * V
+                    R -= alpha * HV
                     break
-                step = candidate
-                residual -= alpha * hv
-                old = residual_norm2
-                residual_norm2 = float((residual * residual).sum())
-                if math.sqrt(residual_norm2) <= 0.1 * grad_norm:
+                S = candidate
+                R -= alpha * HV
+                old = norm_R2
+                norm_R2 = float((R * R).sum())
+                if math.sqrt(norm_R2) <= 0.1 * norm_Grad:
                     break
-                direction = residual + residual_norm2 / old * direction
-            candidate_probability, candidate_objective = evaluate(beta + step)
-            gs = float((step * grad).sum())
-            predicted_reduction = -0.5 * (gs - float((step * residual).sum()))
-            actual_reduction = objective - candidate_objective
-            rho = actual_reduction / predicted_reduction
-            step_norm = np.linalg.norm(step)
+                V = R + norm_R2 / old * V
+            P_new, obj_new = evaluate(B + S)
+            gs = float((S * Grad).sum())
+            qk = -0.5 * (gs - float((S * R).sum()))
+            actred = obj - obj_new
+            rho = actred / qk
+            snorm = np.linalg.norm(S)
             if outer == 0:
-                delta = min(delta, step_norm)
-            alpha2 = candidate_objective - objective - gs
+                delta = min(delta, snorm)
+            alpha2 = obj_new - obj - gs
             alpha = 4.0 if alpha2 <= 0 else max(0.25, -0.5 * gs / alpha2)
             if rho < 0.0001:
-                delta = min(max(alpha, 0.25) * step_norm, 0.5 * delta)
+                delta = min(max(alpha, 0.25) * snorm, 0.5 * delta)
             elif rho < 0.25:
-                delta = max(0.25 * delta, min(alpha * step_norm, 0.5 * delta))
+                delta = max(0.25 * delta, min(alpha * snorm, 0.5 * delta))
             elif rho < 0.75:
-                delta = max(0.25 * delta, min(alpha * step_norm, 4.0 * delta))
+                delta = max(0.25 * delta, min(alpha * snorm, 4.0 * delta))
             else:
-                delta = max(delta, min(alpha * step_norm, 4.0 * delta))
+                delta = max(delta, min(alpha * snorm, 4.0 * delta))
             if rho > 0.0001:
-                beta += step
-                probabilities = candidate_probability
-                objective = candidate_objective
-                grad = gradient(probabilities, beta)
-            if not boundary and abs(actual_reduction) < (abs(objective) + abs(candidate_objective)) * 1e-14:
+                B += S
+                P = P_new
+                obj = obj_new
+                Grad = gradient(P, B)
+            if not is_trust_boundary_reached and abs(actred) < (abs(obj) + abs(obj_new)) * 1e-14:
                 break
 
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        np.save(args.output.with_name(args.output.stem + "-B.npy"), beta)
+        np.save(args.output.with_name(args.output.stem + "-B.npy"), B)
         report = {
             "implementation": "dask-multilogreg",
             "seconds": time.perf_counter() - start,
             "iterations": completed,
-            "coefficient_norm": float(np.linalg.norm(beta)),
-            "objective": float(objective),
+            "coefficient_norm": float(np.linalg.norm(B)),
+            "objective": float(obj),
         }
         args.output.write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps(report))

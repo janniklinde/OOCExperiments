@@ -8,7 +8,7 @@ import dask.array as da
 import numpy as np
 from dask.base import tokenize
 from dask.delayed import delayed
-from dask.utils import parse_bytes
+from dask.utils import format_bytes, parse_bytes
 from distributed import Client
 
 
@@ -187,10 +187,51 @@ def load_matrix(path, shape, dtype=np.float64, row_chunk=None, row_range=None):
     return da.concatenate(blocks, axis=0)
 
 
-def create_client(threads, memory_limit, temporary_directory, memory_target=0.60):
-    """Create one spill-capable in-process worker with bounded concurrency."""
+#: One Dask worker process per this much of the aggregate memory budget; see `worker_count`.
+WORKER_MEMORY_FLOOR = parse_bytes("3GiB")
+#: Cap on worker processes: each adds a nanny, an interpreter (~200 MiB RSS), and scheduler
+#: dispatch load, and topologies beyond 8 workers are unvalidated.
+MAX_WORKERS = 8
+
+
+def worker_count(memory_limit, override=0):
+    """Worker processes for a Dask aggregate memory budget: one per 3 GiB, capped at 8.
+
+    Measured on the dense scaling datasets (lmcg, kmeans, multilogreg): a single
+    in-process worker leaves only 3-5 of 16-64 threads busy regardless of the thread
+    count, because the scheduler, comm loops, and every task share one GIL; splitting
+    the same aggregate thread allowance across worker processes ran the same scripts
+    1.25-1.96x faster with bit-identical results. The floor exists because in-flight
+    chunk residency is threads-per-worker x chunk bytes x ~2.5 transient copies:
+    kmeans with 200 MiB chunks against 3 GiB workers paused 15 times, restarted 8
+    times, and re-read 33% more bytes than the algorithm needs. A 3 GiB budget yields
+    one worker, which keeps the smallest profile on the historical in-process
+    configuration. `override` forces a count for diagnostic runs; 0 derives it.
+    """
+    if override and override > 0:
+        return max(1, int(override))
+    total = memory_limit if isinstance(memory_limit, int) else parse_bytes(str(memory_limit))
+    return max(1, min(total // WORKER_MEMORY_FLOOR, MAX_WORKERS))
+
+
+def create_client(threads, memory_limit, temporary_directory, memory_target=0.60, workers=0):
+    """Create spill-capable Dask workers with bounded concurrency.
+
+    `threads` and `memory_limit` are the aggregate, profile-level quantities the
+    plan already passes: the same host-wide thread allowance the other arms get,
+    and the profile's whole Dask memory budget. They are split here into
+    `worker_count(memory_limit, workers)` processes, each with an equal share of
+    the threads and of the managed-memory budget. A single worker stays
+    in-process (`processes=False`): with nothing to isolate, a nanny and a second
+    interpreter would only add overhead, so the smallest profiles keep today's
+    exact configuration.
+    """
     temporary_directory = Path(temporary_directory)
     temporary_directory.mkdir(parents=True, exist_ok=True)
+    workers = min(worker_count(memory_limit, workers), max(1, int(threads)))
+    threads_per_worker = -(-int(threads) // workers)
+    total_bytes = memory_limit if isinstance(memory_limit, int) else parse_bytes(str(memory_limit))
+    per_worker_limit = max(1, total_bytes // workers)
     dask.config.set({
         # Low-level fusion stays enabled. The alias layer that made it unsafe came from
         # `load_matrix`'s from_delayed/concatenate construction; `load_zarr` has no alias,
@@ -201,11 +242,14 @@ def create_client(threads, memory_limit, temporary_directory, memory_target=0.60
         "distributed.worker.memory.pause": 0.82,
         "distributed.worker.memory.terminate": 0.95,
     })
-    return Client(
-        processes=False,
-        n_workers=1,
-        threads_per_worker=threads,
-        memory_limit=memory_limit,
+    client = Client(
+        processes=workers > 1,
+        n_workers=workers,
+        threads_per_worker=threads_per_worker,
+        memory_limit=per_worker_limit,
         local_directory=str(temporary_directory),
         dashboard_address=None,
     )
+    print(f"dask client: {workers} worker(s) x {threads_per_worker} threads, "
+          f"memory limit {format_bytes(per_worker_limit)} each", flush=True)
+    return client

@@ -28,31 +28,31 @@ def main():
     start = time.perf_counter()
     metadata = json.loads((args.data / "metadata.json").read_text())
     shape = (metadata["rows"], metadata["cols"])
-    matrix = np.memmap(args.data / "X.f64", dtype=np.float64, mode="r", shape=shape)
-    response = np.memmap(args.data / "binary_y.f64", dtype=np.float64, mode="r",
+    X = np.memmap(args.data / "X.f64", dtype=np.float64, mode="r", shape=shape)
+    y = np.memmap(args.data / "binary_y.f64", dtype=np.float64, mode="r",
                          shape=(shape[0], 1))
     beta = np.zeros((shape[1], 1), dtype=np.float64)
-    residual = -(matrix.T @ response)
-    direction = -residual
-    residual_sq = (residual.T @ residual).item()
-    target = residual_sq * args.tolerance * args.tolerance
+    r = -(X.T @ y)
+    p = -r
+    norm_r2 = (r.T @ r).item()
+    target = norm_r2 * args.tolerance * args.tolerance
 
-    completed = 0
-    while completed < args.iterations and residual_sq > target:
-        projected = matrix @ direction
-        curvature = matrix.T @ projected + args.reg * direction
-        alpha = residual_sq / (direction.T @ curvature).item()
-        beta += alpha * direction
-        residual += alpha * curvature
-        old_residual_sq = residual_sq
-        residual_sq = (residual.T @ residual).item()
-        direction = -residual + (residual_sq / old_residual_sq) * direction
-        completed += 1
+    i = 0
+    while i < args.iterations and norm_r2 > target:
+        Xp = X @ p
+        q = X.T @ Xp + args.reg * p
+        alpha = norm_r2 / (p.T @ q).item()
+        beta += alpha * p
+        r += alpha * q
+        old_norm_r2 = norm_r2
+        norm_r2 = (r.T @ r).item()
+        p = -r + (norm_r2 / old_norm_r2) * p
+        i += 1
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     np.save(args.output.with_name(args.output.stem + "-beta.npy"), beta)
     report = {"implementation": "numpy-lmcg", "seconds": time.perf_counter() - start,
-              "iterations": completed, "residual_norm": residual_sq ** 0.5,
+              "iterations": i, "residual_norm": norm_r2 ** 0.5,
               "beta_checksum": float(beta.sum())}
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report))

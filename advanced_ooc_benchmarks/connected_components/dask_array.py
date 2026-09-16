@@ -35,6 +35,8 @@ def main():
     parser.add_argument("--iterations", type=int, default=0,
                         help="maximum label-propagation iterations, 0 = until convergence")
     parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=0,
+                        help="worker processes; 0 derives one per 3 GiB of the memory limit")
     parser.add_argument("--memory-limit", default="3GiB")
     parser.add_argument("--temporary-directory", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -42,7 +44,7 @@ def main():
     if args.iterations < 0 or min(args.threads, args.band_rows) < 1:
         raise ValueError("iterations must be non-negative; threads and band-rows positive")
 
-    client = create_client(args.threads, args.memory_limit, args.temporary_directory)
+    client = create_client(args.threads, args.memory_limit, args.temporary_directory, workers=args.workers)
     try:
         start = time.perf_counter()
         metadata = json.loads((args.data / "metadata.json").read_text(encoding="utf-8"))

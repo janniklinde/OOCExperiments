@@ -43,13 +43,15 @@ def main():
     parser.add_argument("--no-persist-kernel", dest="persist_kernel",
                         action="store_false")
     parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=0,
+                        help="worker processes; 0 derives one per 3 GiB of the memory limit")
     parser.add_argument("--memory-limit", default="3GiB")
     parser.add_argument("--temporary-directory", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if min(args.train_rows, args.cg_iterations, args.chunk_rows, args.threads) < 1:
         raise ValueError("train-rows, cg-iterations, chunk-rows and threads must be positive")
-    client = create_client(args.threads, args.memory_limit, args.temporary_directory)
+    client = create_client(args.threads, args.memory_limit, args.temporary_directory, workers=args.workers)
 
     start = time.perf_counter()
     metadata = json.loads((args.data / "metadata.json").read_text(encoding="utf-8"))

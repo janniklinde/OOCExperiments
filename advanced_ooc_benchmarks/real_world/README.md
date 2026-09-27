@@ -55,3 +55,26 @@ uniform dangling-mass redistribution and fixed iterations.
 The graph is described in Haewoon Kwak, Changhyun Lee, Hosung Park, and Sue
 Moon, “What is Twitter, a Social Network or a News Media?”, WWW 2010. Follow
 LAW's dataset citation and redistribution terms when publishing results.
+
+For the published-order PageRank blocksize sweep, `pagerank-blen-plan.yaml` uses
+the streaming CSR converter for staging blocks at each tile size, then uses
+`reblock_systemds.sh` to read and write each measured variant through SystemDS
+OOC. This repacks the native files without changing the tile size; the generic
+OOC tile-size repartition remains much more expensive on this graph. The variants
+have distinct `G-ooc-bs*` and `dangling-ooc-bs*` paths, so
+the older directly converted datasets are not overwritten. Preparation uses
+16 writer threads and requires at least 16 graph output files; the
+benchmark uses 16 source-reader threads. The reblocker sets
+`<sysds.ooc.write.empty.blocks>true</sysds.ooc.write.empty.blocks>` so every
+logical tile is emitted, as required by the current OOC full-grid reader. Set
+that XML option to `false` only for consumers that support absent empty tiles.
+It is independent of `sysds.ooc.sparse.coo`, which controls sparse block
+representation during OOC reads.
+The PageRank sweep uses a 1 MiB direct-reader buffer: its bounded source phases
+otherwise reread substantial 8 MiB buffer tails at each restart. OOC currently
+schedules one source scan per file, so skewed files still cause a straggler;
+SequenceFile sync markers permit within-file splitting, but that is not yet
+implemented in the production source reader.
+For staging blocks of 2.5k or smaller, preparation temporarily packs source
+tiles to avoid the cache-entry metadata limit; the benchmark configuration
+keeps `sysds.ooc.cache.pack.bytes=0`.

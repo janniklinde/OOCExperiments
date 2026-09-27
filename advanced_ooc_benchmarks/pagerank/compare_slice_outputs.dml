@@ -1,0 +1,9 @@
+cp_rank = read($1);
+ooc_10k_rank = read($2);
+ooc_5k_rank = read($3);
+
+print("cp_sum=" + sum(cp_rank));
+print("ooc_10k_sum=" + sum(ooc_10k_rank));
+print("ooc_5k_sum=" + sum(ooc_5k_rank));
+print("cp_vs_ooc_10k_max_abs=" + max(abs(cp_rank - ooc_10k_rank)));
+print("cp_vs_ooc_5k_max_abs=" + max(abs(cp_rank - ooc_5k_rank)));

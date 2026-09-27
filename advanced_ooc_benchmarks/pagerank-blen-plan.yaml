@@ -1,0 +1,169 @@
+# Local, published-order Twitter PageRank OOC blocksize comparison.
+# Each measured variant is generated directly from the same canonical CSR graph.
+# The native binary-block input is shared across SystemDS backends.
+version: 1
+root: /media/jannik/data/OOCExperiments
+results: ${plan.root}/pagerank-blen-results
+
+tools:
+  java: java
+  python: /home/jannik/.venvs/systemds/bin/python
+  systemds_jar: /home/jannik/Dev/SystemDSTest/systemds/target/SystemDS.jar
+
+defaults:
+  repetitions: 1
+  prepare_timeout_seconds: 21600
+  resources:
+    threads: 16
+    ooc_broker_max: 4294967296
+    swap_max: 0
+    timeout_seconds: 1000
+    timeout_grace_seconds: 30
+
+telemetry: {interval_seconds: 3}
+
+resource_profiles:
+  mem16_pagerank:
+    memory_max: 16G
+    java_heap: 12g
+    ooc_replay_bytes: 1073741824
+    ooc_replay_blocks: 4
+    ooc_partition_bytes: 16777216
+
+templates:
+  systemds-ooc:
+    comparable: true
+    blocksize_sweep: ooc
+    command: >-
+      "${tools.java}" -Xms${resources.java_heap} -Xmx${resources.java_heap}
+      -XX:+UseG1GC -XX:G1HeapRegionSize=32m
+      -XX:ActiveProcessorCount=${resources.threads}
+      --add-modules=jdk.incubator.vector -Djava.io.tmpdir="${run.results}/java-tmp"
+      -jar "${tools.systemds_jar}" -f "${run.entrypoint}" -exec singlenode
+      -config "${run.results}/SystemDS-config.xml" -ooc -oocStats -stats
+      ${run.systemds_args}
+
+datasets:
+  twitter_2010:
+    directory: ${plan.root}/bench-data/twitter-2010
+    parameters: {vertices: 41652230, edges: 1468365182}
+    ready: [metadata.json]
+    artifacts:
+      source_g:
+        path: systemds/G-bs10000
+        metadata:
+          expect: {rows: "${dataset.vertices}", cols: "${dataset.vertices}", nnz: "${dataset.edges}", rows_in_block: 10000, cols_in_block: 10000}
+      source_dangling:
+        path: systemds/dangling-bs10000
+        metadata:
+          expect: {rows: "${dataset.vertices}", cols: 1, rows_in_block: 10000, cols_in_block: 10000}
+      csr_row_ptr:
+        path: csr/row_ptr.i64
+        size_bytes_from_metadata: {path: metadata.json, key: vertices, multiplier: 8, add: 8}
+      csr_col_idx:
+        path: csr/col_idx.i32
+        size_bytes_from_metadata: {path: metadata.json, key: edges, multiplier: 4}
+      csr_values:
+        path: csr/values.f64
+        size_bytes_from_metadata: {path: metadata.json, key: edges, multiplier: 8}
+      dangling_raw:
+        path: dangling.u8
+        size_bytes_from_metadata: {path: metadata.json, key: vertices}
+    prepare:
+      policy: auto
+      clean: [systemds/G-bs10000, systemds/G-bs10000.mtd,
+              systemds/G-bs10000.complete-blocks,
+              systemds/dangling-bs10000, systemds/dangling-bs10000.mtd,
+              systemds/dangling-bs10000.complete-blocks]
+      env:
+        PYTHON: ${tools.python}
+        SYSDS_JAR: ${tools.systemds_jar}
+        BENCH_DATA_DIR: ${plan.root}/bench-data
+        REAL_WORLD_BLOCKSIZE: 10000
+        REAL_WORLD_NATIVE_SUFFIX: -bs10000
+        REAL_WORLD_VERTEX_ORDER: published
+        PREP_WORKERS: 4
+        PREP_CONCURRENCY: 1
+        PREP_JAVA_HEAP: 20g
+        PREP_EMIT_EMPTY_BLOCKS: 1
+      command: >-
+        "${plan.dir}/real_world/prepare.sh" twitter-2010 "${dataset.dir}"
+    variants:
+      blocksize:
+        artifacts:
+          G:
+            path: systemds/G-bs${run.blocksize}
+            metadata:
+              expect: {rows: "${dataset.vertices}", cols: "${dataset.vertices}", nnz: "${dataset.edges}", rows_in_block: "${run.blocksize}", cols_in_block: "${run.blocksize}"}
+          G_complete:
+            path: systemds/G-bs${run.blocksize}.complete-blocks
+          dangling:
+            path: systemds/dangling-bs${run.blocksize}
+            metadata:
+              expect: {rows: "${dataset.vertices}", cols: 1, rows_in_block: "${run.blocksize}", cols_in_block: "${run.blocksize}"}
+          dangling_complete:
+            path: systemds/dangling-bs${run.blocksize}.complete-blocks
+        prepare:
+          policy: auto
+          clean: ["systemds/G-bs${run.blocksize}", "systemds/G-bs${run.blocksize}.mtd",
+                  "systemds/G-bs${run.blocksize}.complete-blocks",
+                  "systemds/dangling-bs${run.blocksize}", "systemds/dangling-bs${run.blocksize}.mtd",
+                  "systemds/dangling-bs${run.blocksize}.complete-blocks"]
+          env:
+            PYTHON: ${tools.python}
+            SYSDS_JAR: ${tools.systemds_jar}
+            BENCH_DATA_DIR: ${plan.root}/bench-data
+            REAL_WORLD_BLOCKSIZE: ${run.blocksize}
+            REAL_WORLD_NATIVE_SUFFIX: -bs${run.blocksize}
+            REAL_WORLD_VERTEX_ORDER: published
+            PREP_WORKERS: 4
+            PREP_CONCURRENCY: 1
+            PREP_JAVA_HEAP: 20g
+            PREP_EMIT_EMPTY_BLOCKS: 1
+          command: >-
+            "${plan.dir}/real_world/prepare.sh" twitter-2010 "${dataset.dir}"
+
+systemds_setup: &systemds_setup
+  command: |
+    mkdir -p "${run.results}/systemds-tmp" "${run.results}/systemds-scratch" "${run.results}/java-tmp"
+    cat > "${run.results}/SystemDS-config.xml" <<EOF
+    <root>
+      <sysds.localtmpdir>${run.results}/systemds-tmp</sysds.localtmpdir>
+      <sysds.scratch>${run.results}/systemds-scratch</sysds.scratch>
+      <sysds.defaultblocksize>${run.blocksize}</sysds.defaultblocksize>
+      <sysds.ooc.io.direct>true</sysds.ooc.io.direct>
+      <sysds.ooc.write.empty.blocks>true</sysds.ooc.write.empty.blocks>
+      <sysds.ooc.io.reader.buffersize>1048576</sysds.ooc.io.reader.buffersize>
+      <sysds.ooc.io.reader.threads>16</sysds.ooc.io.reader.threads>
+      <sysds.ooc.io.reader.poolsize>16</sysds.ooc.io.reader.poolsize>
+      <sysds.ooc.materialized.partition.bytes>${resources.ooc_partition_bytes}</sysds.ooc.materialized.partition.bytes>
+      <sysds.ooc.cache.pack.bytes>0</sysds.ooc.cache.pack.bytes>
+      <sysds.ooc.memory.broker.fraction>0.3333333333333333</sysds.ooc.memory.broker.fraction>
+      <sysds.ooc.memory.broker.max>${resources.ooc_broker_max}</sysds.ooc.memory.broker.max>
+      <sysds.ooc.memory.prefetch.fraction>0.1</sysds.ooc.memory.prefetch.fraction>
+      <sysds.ooc.memory.prefetch.max>1073741824</sysds.ooc.memory.prefetch.max>
+      <sysds.ooc.memory.cache.fraction.soft>0.5</sysds.ooc.memory.cache.fraction.soft>
+      <sysds.ooc.memory.cache.fraction.hard>0.6</sysds.ooc.memory.cache.fraction.hard>
+      <sysds.ooc.source.replay.memory>${resources.ooc_replay_bytes}</sysds.ooc.source.replay.memory>
+      <sysds.ooc.source.bulksize>${resources.ooc_replay_bytes}</sysds.ooc.source.bulksize>
+      <sysds.ooc.source.replay.prefetch>${resources.ooc_replay_blocks}</sysds.ooc.source.replay.prefetch>
+    </root>
+    EOF
+
+runs:
+  - id: pagerank_blen
+    dataset: twitter_2010
+    resource_profiles: [mem16_pagerank]
+    entrypoint: ${plan.dir}/pagerank/systemds.dml
+    blocksize_sweeps: {ooc: [2500, 5000, 10000]}
+    parameters:
+      iterations: 15
+      alpha: 0.85
+      systemds_args: >-
+        -args "${input.G}" "${input.dangling}" ${run.alpha} ${run.iterations}
+        "${run.outputs}/systemds-r${rep}"
+    inputs: {G: {artifact: G}, dangling: {artifact: dangling}}
+    setup: *systemds_setup
+    cold_cache: ["${input.G}", "${input.dangling}"]
+    implementations:
+      - {id: systemds-ooc, template: systemds-ooc}

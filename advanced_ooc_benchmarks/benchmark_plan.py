@@ -20,6 +20,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 try:
@@ -63,6 +64,49 @@ def _parse_size_bytes(value):
         if text.endswith(suffix):
             return int(float(text[: -len(suffix)]) * units[suffix])
     return int(float(text))
+
+
+def direct_cgroup_parent():
+    """Find a delegated sibling cgroup when no user systemd manager is available."""
+    path = next((line.split(":", 2)[2].strip() for line in
+                 Path("/proc/self/cgroup").read_text().splitlines() if line.startswith("0::")), None)
+    if not path or path == "/":
+        return None
+    parent = (Path("/sys/fs/cgroup") / path.lstrip("/")).parent
+    if parent == Path("/sys/fs/cgroup"):
+        return None
+    try:
+        controllers = set((parent / "cgroup.subtree_control").read_text().split())
+    except OSError:
+        return None
+    return parent if {"memory", "io"} <= controllers and os.access(parent, os.W_OK) else None
+
+
+def run_direct_cgroup(parent, unit, memory, swap, runner_args, plan_dir, env, log):
+    """Execute the existing accounting wrapper in an enforced cgroup-v2 sibling."""
+    group = parent / unit
+    group.mkdir()
+    try:
+        (group / "memory.max").write_text(str(_parse_size_bytes(memory)))
+        (group / "memory.swap.max").write_text(str(_parse_size_bytes(swap)))
+        # The shell moves itself before exec, so the wrapper and all payload descendants
+        # inherit the limit; there is no child-start race in the Python parent.
+        scope = ["bash", "-c", 'printf "%s\\n" "$$" > "$1"; shift; exec "$@"',
+                 "cgroup-enter", str(group / "cgroup.procs"), *runner_args]
+        with open(log, "a", encoding="utf-8") as output:
+            return subprocess.run(scope, cwd=plan_dir, env=env, stdout=output,
+                                  stderr=subprocess.STDOUT).returncode
+    finally:
+        if (group / "cgroup.procs").read_text().strip():
+            (group / "cgroup.kill").write_text("1")
+        for attempt in range(10):
+            try:
+                group.rmdir()
+                break
+            except OSError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.1)
 
 
 def _validation_workload(base_id):
@@ -862,12 +906,44 @@ printf 'exit_status=running\n' >"$metrics"
 cg=$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup)
 root="/sys/fs/cgroup${cg}"
 
+# io.stat can report the same request at a RAID/device-mapper device and its
+# backing devices. Count the lowest reported layer, preserving raw rows below.
+io_device_edges=""
+for io_parent in /sys/dev/block/*; do
+  for io_slave in "$io_parent"/slaves/*; do
+    [[ -r "$io_slave/dev" ]] || continue
+    read -r io_child < "$io_slave/dev"
+    io_device_edges+=" ${io_parent##*/}>$io_child"
+    # Block I/O accounting can name the whole disk even when a RAID slave is
+    # a partition. Connect that partition to its physical accounting device.
+    if [[ -r "$io_slave/partition" && -r "$io_slave/../dev" ]]; then
+      read -r io_disk < "$io_slave/../dev"
+      io_device_edges+=" $io_child>$io_disk"
+    fi
+  done
+done
+
 stat_value() {
   awk -v key="$2" '$1 == key {print $2; found=1; exit} END {if (!found) print 0}' "$1" 2>/dev/null
 }
 
 io_totals() {
-  awk '{for (i=2; i<=NF; i++) {split($i, value, "="); totals[value[1]] += value[2]}} END {printf "%d,%d,%d,%d,%d,%d", totals["rbytes"], totals["wbytes"], totals["rios"], totals["wios"], totals["dbytes"], totals["dios"]}' "$1" 2>/dev/null
+  awk -v edges="$io_device_edges" '
+    function reported_below(device, edge, parts) {
+      for (edge in graph) {
+        split(edge, parts, SUBSEP)
+        if (parts[1]==device && (seen[parts[2]] || reported_below(parts[2]))) return 1
+      }
+      return 0
+    }
+    {seen[$1]=1; for (i=2; i<=NF; i++) {split($i, value, "="); counters[$1, value[1]]=value[2]}}
+    END {
+      n=split(edges, relations, " ")
+      for (i=1; i<=n; i++) {split(relations[i], pair, ">"); graph[pair[1], pair[2]]=1}
+      for (device in seen) if (reported_below(device)) excluded[device]=1
+      for (key in counters) {split(key, pair, SUBSEP); if (!excluded[pair[1]]) totals[pair[2]]+=counters[key]}
+      printf "%.0f,%.0f,%.0f,%.0f,%.0f,%.0f", totals["rbytes"], totals["wbytes"], totals["rios"], totals["wios"], totals["dbytes"], totals["dios"]
+    }' "$1" 2>/dev/null
 }
 
 cgroup_values() {
@@ -876,11 +952,19 @@ cgroup_values() {
       "$root/cpu.pressure" "$root/memory.pressure" "$root/io.pressure"; do
     [[ -r "$candidate" ]] && files+=("$candidate")
   done
-  awk -v pids="$1" '
+  awk -v pids="$1" -v edges="$io_device_edges" '
+    function reported_below(device, edge, parts) {
+      for (edge in graph) {
+        split(edge, parts, SUBSEP)
+        if (parts[1]==device && (seen[parts[2]] || reported_below(parts[2]))) return 1
+      }
+      return 0
+    }
     FILENAME ~ /memory\.stat$/ {mem[$1]=$2; next}
     FILENAME ~ /cpu\.stat$/ {cpu[$1]=$2; next}
     FILENAME ~ /io\.stat$/ {
-      for (i=2; i<=NF; i++) {split($i, value, "="); io[value[1]] += value[2]}
+      seen[$1]=1
+      for (i=2; i<=NF; i++) {split($i, value, "="); counters[$1, value[1]]=value[2]}
       next
     }
     FILENAME ~ /\.pressure$/ {
@@ -893,16 +977,20 @@ cgroup_values() {
       }
     }
     END {
-      printf "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d", mem["anon"], mem["file"],
+      n=split(edges, relations, " ")
+      for (i=1; i<=n; i++) {split(relations[i], pair, ">"); graph[pair[1], pair[2]]=1}
+      for (device in seen) if (reported_below(device)) excluded[device]=1
+      for (key in counters) {split(key, pair, SUBSEP); if (!excluded[pair[1]]) io[pair[2]]+=counters[key]}
+      printf "%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f", mem["anon"], mem["file"],
         mem["shmem"], mem["file_dirty"], mem["file_writeback"], mem["pgfault"],
         mem["pgmajfault"], mem["workingset_refault_anon"],
         mem["workingset_refault_file"], mem["workingset_activate_file"]
-      printf ",%d,%d,%d,%d,%d,%d", cpu["usage_usec"], cpu["user_usec"],
+      printf ",%.0f,%.0f,%.0f,%.0f,%.0f,%.0f", cpu["usage_usec"], cpu["user_usec"],
         cpu["system_usec"], cpu["nr_periods"], cpu["nr_throttled"],
         cpu["throttled_usec"]
-      printf ",%d,%d,%d,%d,%d,%d,%d", pids, io["rbytes"], io["wbytes"], io["rios"],
+      printf ",%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f", pids, io["rbytes"], io["wbytes"], io["rios"],
         io["wios"], io["dbytes"], io["dios"]
-      printf ",%d,%d,%d,%d,%d,%d", pressure["cpu:some"], pressure["cpu:full"],
+      printf ",%.0f,%.0f,%.0f,%.0f,%.0f,%.0f", pressure["cpu:some"], pressure["cpu:full"],
         pressure["memory:some"], pressure["memory:full"], pressure["io:some"],
         pressure["io:full"]
     }
@@ -911,8 +999,8 @@ cgroup_values() {
 
 proc_io_values() {
   # rchar counts bytes returned by read() syscalls, read_bytes counts bytes actually fetched
-  # from the block device. Their ratio is the read amplification the page cache introduces;
-  # cgroup io.stat only reports the device side, so it cannot show the gap on its own.
+  # from storage. Differences can reflect cache hits, readahead, and direct-I/O alignment;
+  # neither counter identifies algorithmic scans, which require source/graph tracing.
   local pid key value rchar_total=0 read_total=0
   #the appended newline guarantees the last pid is read even if the file lacks one
   while read -r pid; do
@@ -924,7 +1012,7 @@ proc_io_values() {
       esac
     done <"/proc/$pid/io"
   done < <(cat "$root/cgroup.procs" 2>/dev/null; echo)
-  printf '%d,%d' "$rchar_total" "$read_total"
+  printf '%.0f,%.0f' "$rchar_total" "$read_total"
 }
 
 sample_cgroup() {
@@ -986,12 +1074,14 @@ IFS=, read -r io_read_bytes io_write_bytes io_read_ops io_write_ops io_discard_b
   echo "cpu_system_usec=$(stat_value "$root/cpu.stat" system_usec)"
   echo "cpu_nr_throttled=$(stat_value "$root/cpu.stat" nr_throttled)"
   echo "cpu_throttled_usec=$(stat_value "$root/cpu.stat" throttled_usec)"
-  echo "proc_rchar_bytes=$(awk -F, 'NR>1 && $34>m {m=$34} END {printf "%d", m+0}' "$telemetry")"
-  echo "proc_read_bytes=$(awk -F, 'NR>1 && $35>m {m=$35} END {printf "%d", m+0}' "$telemetry")"
+  echo "proc_rchar_bytes=$(awk -F, 'NR>1 && $34>m {m=$34} END {printf "%.0f", m+0}' "$telemetry")"
+  echo "proc_read_bytes=$(awk -F, 'NR>1 && $35>m {m=$35} END {printf "%.0f", m+0}' "$telemetry")"
   echo "io_read_bytes=$io_read_bytes"
   echo "io_write_bytes=$io_write_bytes"
   echo "io_read_ops=$io_read_ops"
   echo "io_write_ops=$io_write_ops"
+  echo "io_aggregation=lowest-reported-device-layer"
+  echo "io_device_edges=$io_device_edges"
   [[ -r "$root/io.stat" ]] && echo "io_stat=$(tr '\n' ';' < "$root/io.stat")"
 } > "$metrics"
 exit "$rc"
@@ -1288,10 +1378,14 @@ def execute_plan(plan_path, validate_only=False, prepare_only=False, only=(),
         if result.returncode:
             raise RuntimeError(f"Configured Python is missing required modules: "
                                f"{result.stdout.strip()}")
-    if not prepare_only and (not shutil.which("systemd-run") or subprocess.run(
-            ["systemctl", "--user", "status"], stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL).returncode):
-        raise RuntimeError("A working user systemd instance and systemd-run are required")
+    systemd_available = bool(shutil.which("systemd-run") and shutil.which("systemctl") and
+                             subprocess.run(["systemctl", "--user", "status"],
+                                            stdout=subprocess.DEVNULL,
+                                            stderr=subprocess.DEVNULL).returncode == 0)
+    direct_parent = None if systemd_available or prepare_only else direct_cgroup_parent()
+    if not prepare_only and not systemd_available and direct_parent is None:
+        raise RuntimeError("Neither user systemd nor a delegated, writable cgroup-v2 parent "
+                           "with memory and io controllers is available")
 
     root.mkdir(parents=True, exist_ok=True)
     prepared = {}
@@ -1553,21 +1647,26 @@ def execute_plan(plan_path, validate_only=False, prepare_only=False, only=(),
                     env.update(expand_map(run.get("environment"), local_context))
                     env.update(expand_map(implementation.get("environment"), local_context))
                     unit = re.sub(r"[^A-Za-z0-9_.-]", "-", f"ooc-{tag}-{os.getpid()}")
-                    scope = ["systemd-run", "--user", "--scope", "--collect", "--quiet", f"--unit={unit}",
-                             "-p", "MemoryAccounting=yes", "-p", "IOAccounting=yes",
-                             "-p", f"MemoryMax={memory}",
-                             "-p", f"MemorySwapMax={swap}", "-p", "TasksMax=infinity",
-                             "-p", "KillMode=control-group", "-p", "SendSIGKILL=yes",
-                             "-p", f"TimeoutStopSec={grace_seconds}s"]
-                    if timeout_seconds:
-                        scope += ["-p", f"RuntimeMaxSec={timeout_seconds + grace_seconds + 15}s"]
-                    scope += [str(scope_runner), str(log), str(metrics), str(telemetry_path),
-                              str(telemetry_interval), timeout, str(grace_seconds), command]
+                    runner_args = [str(scope_runner), str(log), str(metrics), str(telemetry_path),
+                                   str(telemetry_interval), timeout, str(grace_seconds), command]
                     try:
-                        with open(log, "a", encoding="utf-8") as scope_output:
-                            rc = subprocess.run(scope, cwd=plan_dir, env=env,
-                                                stdout=scope_output,
-                                                stderr=subprocess.STDOUT).returncode
+                        if systemd_available:
+                            scope = ["systemd-run", "--user", "--scope", "--collect", "--quiet",
+                                     f"--unit={unit}", "-p", "MemoryAccounting=yes",
+                                     "-p", "IOAccounting=yes", "-p", f"MemoryMax={memory}",
+                                     "-p", f"MemorySwapMax={swap}", "-p", "TasksMax=infinity",
+                                     "-p", "KillMode=control-group", "-p", "SendSIGKILL=yes",
+                                     "-p", f"TimeoutStopSec={grace_seconds}s"]
+                            if timeout_seconds:
+                                scope += ["-p", f"RuntimeMaxSec={timeout_seconds + grace_seconds + 15}s"]
+                            scope += runner_args
+                            with open(log, "a", encoding="utf-8") as scope_output:
+                                rc = subprocess.run(scope, cwd=plan_dir, env=env,
+                                                    stdout=scope_output,
+                                                    stderr=subprocess.STDOUT).returncode
+                        else:
+                            rc = run_direct_cgroup(direct_parent, unit, memory, swap,
+                                                   runner_args, plan_dir, env, log)
                     finally:
                         removed, cleanup_errors = cleanup_temporary_paths(temporary_paths)
                         with open(log, "a", encoding="utf-8") as output:
@@ -1590,8 +1689,11 @@ def execute_plan(plan_path, validate_only=False, prepare_only=False, only=(),
                         with open(log, "a", encoding="utf-8") as output:
                             output.write(f"scope exited with {rc} before the accounting wrapper "
                                          "could finalize; likely whole-scope termination\n")
-                    if status == "ok" and "An Error Occurred" in log.read_text(errors="replace"):
-                        status = "failed"
+                    if status == "ok":
+                        log_text = log.read_text(errors="replace")
+                        if ("An Error Occurred" in log_text or
+                                "org.apache.sysds.runtime.DMLRuntimeException:" in log_text):
+                            status = "failed"
                     time_path = Path(str(metrics) + ".time")
                     wall_seconds = elapsed_seconds(time_path)
                     algorithm_seconds = reported_seconds(log)

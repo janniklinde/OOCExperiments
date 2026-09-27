@@ -65,8 +65,9 @@ public class CSRToSystemDS {
 	}
 
 	public static void main(String[] args) throws Exception {
-		if(args.length != 6) {
-			System.err.println("usage: CSRToSystemDS CSR_DIR OUTPUT_FILE VERTICES BLOCKSIZE FIRST_BLOCK LAST_BLOCK");
+		if(args.length < 6 || args.length > 7) {
+			System.err.println(
+				"usage: CSRToSystemDS CSR_DIR OUTPUT_FILE VERTICES BLOCKSIZE FIRST_BLOCK LAST_BLOCK [EMIT_EMPTY_BLOCKS]");
 			System.exit(2);
 		}
 		Path csr = Path.of(args[0]);
@@ -75,6 +76,7 @@ public class CSRToSystemDS {
 		int blocksize = Integer.parseInt(args[3]);
 		int firstBlock = Integer.parseInt(args[4]);
 		int lastBlock = Integer.parseInt(args[5]);
+		boolean emitEmptyBlocks = args.length == 7 && Boolean.parseBoolean(args[6]);
 		long firstRow = (long)firstBlock * blocksize;
 		long offset = rowOffset(csr.resolve("row_ptr.i64"), firstRow);
 		long nextOffset = offset;
@@ -101,11 +103,12 @@ public class CSRToSystemDS {
 				}
 				for(int blockCol = 0; blockCol < colBlocks; blockCol++) {
 					SparseBlockCOO sparse = blocks[blockCol];
-					if(sparse == null)
-						continue;
 					int colsInBlock = (int)Math.min(blocksize, vertices - (long)blockCol * blocksize);
+					if(sparse == null && !emitEmptyBlocks)
+						continue;
 					writer.append(new MatrixIndexes(blockRow + 1L, blockCol + 1L),
-						new MatrixBlock(rowsInBlock, colsInBlock, sparse.size(), sparse));
+						sparse == null ? new MatrixBlock(rowsInBlock, colsInBlock, true) :
+							new MatrixBlock(rowsInBlock, colsInBlock, sparse.size(), sparse));
 				}
 			}
 		}

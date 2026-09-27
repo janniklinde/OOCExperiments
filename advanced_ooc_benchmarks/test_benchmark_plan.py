@@ -437,6 +437,35 @@ class OutputRetentionTest(unittest.TestCase):
 
 
 class ScopeRunnerTest(unittest.TestCase):
+    def test_io_totals_do_not_double_count_stacked_devices(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "runner.sh"
+            benchmark_plan.write_scope_runner(runner)
+            functions = runner.read_text().split("stat_value()", 1)[1].split("proc_io_values()", 1)[0]
+            functions = "stat_value()" + functions
+            stat = root / "io.stat"
+            stat.write_text("9:127 rbytes=32000000000 wbytes=8000000000 rios=20 wios=8\n"
+                            "8:0 rbytes=16000000000 wbytes=4000000000 rios=10 wios=4\n"
+                            "8:16 rbytes=16000000000 wbytes=4000000000 rios=10 wios=4\n"
+                            "8:32 rbytes=4096 wbytes=0 rios=1 wios=0\n")
+            # Neither the intermediate mapper nor partition need appear in io.stat.
+            command = 'io_device_edges="9:127>253:0 253:0>8:1 8:1>8:0 253:0>8:16"\n' + functions
+            command += '\nio_totals "$1"\n'
+            result = subprocess.run(["bash", "-c", command, "test", str(stat)],
+                                    text=True, capture_output=True, check=True)
+            self.assertEqual(result.stdout, "32000004096,8000000000,21,8,0,0")
+            telemetry_command = command.rsplit('\nio_totals', 1)[0] + '\nroot="$2"; cgroup_values 5\n'
+            result = subprocess.run(["bash", "-c", telemetry_command, "test", str(stat), str(root)],
+                                    text=True, capture_output=True, check=True)
+            values = result.stdout.split(",")
+            self.assertEqual(values[17:21], ["32000004096", "8000000000", "21", "8"])
+            # If only the logical device is reported, keep its counters.
+            stat.write_text("9:127 rbytes=32000000000 wbytes=8000000000 rios=20 wios=8\n")
+            result = subprocess.run(["bash", "-c", command, "test", str(stat)],
+                                    text=True, capture_output=True, check=True)
+            self.assertEqual(result.stdout, "32000000000,8000000000,20,8,0,0")
+
     def test_payload_failure_is_recorded_by_accounting_wrapper(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

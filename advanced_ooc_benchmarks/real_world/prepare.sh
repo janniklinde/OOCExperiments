@@ -54,10 +54,17 @@ mkdir -p "$raw" "$out/systemds"
 : "${PREP_JAVA_HEAP:=2g}"
 : "${PREP_GRAPHFRAMES:=0}"
 : "${PREP_SKEW_JAVA_HEAP:=20g}"
+: "${PREP_EMIT_EMPTY_BLOCKS:=0}"
 [[ "$PREP_WORKERS" =~ ^[1-9][0-9]*$ && "$PREP_CONCURRENCY" =~ ^[1-9][0-9]*$ ]] || {
   echo "PREP_WORKERS and PREP_CONCURRENCY must be positive integers" >&2
   exit 2
 }
+[[ "$PREP_EMIT_EMPTY_BLOCKS" == 0 || "$PREP_EMIT_EMPTY_BLOCKS" == 1 ]] || {
+  echo "PREP_EMIT_EMPTY_BLOCKS must be 0 or 1" >&2
+  exit 2
+}
+emit_empty_blocks=false
+[[ "$PREP_EMIT_EMPTY_BLOCKS" == 1 ]] && emit_empty_blocks=true
 
 fetch() {
   local file="$1"
@@ -127,8 +134,12 @@ blocks=$(((vertices + blocksize - 1) / blocksize))
 native_suffix="${REAL_WORLD_NATIVE_SUFFIX:-}"
 native_log_tag="${native_suffix:+${native_suffix}-}"
 native_g="$out/systemds/G$native_suffix"
+native_g_complete="$native_g.complete-blocks"
+if [[ "$PREP_EMIT_EMPTY_BLOCKS" == 1 && ! -s "$native_g_complete" ]]; then
+  rm -rf "$native_g" "$native_g.mtd"
+fi
 if [[ ! -s "$native_g.mtd" ]]; then
-  rm -rf "$native_g"
+  rm -rf "$native_g" "$native_g_complete"
   mkdir -p "$native_g"
   echo "writing $blocks x $blocks SystemDS blocks with $PREP_WORKERS workers" >&2
   # Twitter's compression ordering has one exceptionally dense diagonal region. At the default
@@ -150,6 +161,7 @@ if [[ ! -s "$native_g.mtd" ]]; then
     last=$(((worker + 1) * blocks / PREP_WORKERS))
     java -Xmx"$PREP_JAVA_HEAP" -cp "$sysds_classes:$sysds_cp" CSRToSystemDS "$out/csr" \
       "$native_g/part-$(printf '%05d' "$worker")" "$vertices" "$blocksize" "$first" "$last" \
+      "$emit_empty_blocks" \
       >"$out/systemds/convert-$native_log_tag$worker.log" 2>&1 &
     pids+=("$!")
     if (( ${#pids[@]} >= PREP_CONCURRENCY )); then
@@ -164,6 +176,7 @@ if [[ ! -s "$native_g.mtd" ]]; then
     last=$(((skew_worker + 1) * blocks / PREP_WORKERS))
     java -Xmx"$PREP_SKEW_JAVA_HEAP" -cp "$sysds_classes:$sysds_cp" CSRToSystemDS "$out/csr" \
       "$native_g/part-$(printf '%05d' "$skew_worker")" "$vertices" "$blocksize" "$first" "$last" \
+      "$emit_empty_blocks" \
       >"$out/systemds/convert-$native_log_tag$skew_worker.log" 2>&1
   fi
   cat > "$native_g.mtd" <<EOF
@@ -178,14 +191,21 @@ if [[ ! -s "$native_g.mtd" ]]; then
   "format": "binary"
 }
 EOF
+  if [[ "$PREP_EMIT_EMPTY_BLOCKS" == 1 ]]; then
+    printf 'blocksize=%s\nblocks=%s\n' "$blocksize" "$blocks" > "$native_g_complete"
+  fi
 fi
 
 native_dangling="$out/systemds/dangling$native_suffix"
+native_dangling_complete="$native_dangling.complete-blocks"
+if [[ "$PREP_EMIT_EMPTY_BLOCKS" == 1 && ! -s "$native_dangling_complete" ]]; then
+  rm -rf "$native_dangling" "$native_dangling.mtd"
+fi
 if [[ ! -s "$native_dangling.mtd" ]]; then
-  rm -rf "$native_dangling"
+  rm -rf "$native_dangling" "$native_dangling_complete"
   mkdir -p "$native_dangling"
   java -Xmx"$PREP_JAVA_HEAP" -cp "$sysds_classes:$sysds_cp" DanglingToSystemDS "$out/dangling.u8" \
-    "$native_dangling/part-00000" "$vertices" "$blocksize"
+    "$native_dangling/part-00000" "$vertices" "$blocksize" "$emit_empty_blocks"
   dangling_nnz="$($PYTHON -c 'import json,sys; print(json.load(open(sys.argv[1]))["dangling_vertices"])' "$out/metadata.json")"
   cat > "$native_dangling.mtd" <<EOF
 {
@@ -199,6 +219,9 @@ if [[ ! -s "$native_dangling.mtd" ]]; then
   "format": "binary"
 }
 EOF
+  if [[ "$PREP_EMIT_EMPTY_BLOCKS" == 1 ]]; then
+    printf 'blocksize=%s\nblocks=%s\n' "$blocksize" "$blocks" > "$native_dangling_complete"
+  fi
 fi
 
 if [[ "$PREP_GRAPHFRAMES" == 1 && ! -d "$out/graphframes-csv" ]]; then

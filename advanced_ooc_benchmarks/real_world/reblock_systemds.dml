@@ -1,0 +1,3 @@
+# Reblock a prepared binary matrix using the SystemDS OOC reader and writer.
+X = read($1);
+write(X, $2, format="binary", rows_in_block=$3, cols_in_block=$3);

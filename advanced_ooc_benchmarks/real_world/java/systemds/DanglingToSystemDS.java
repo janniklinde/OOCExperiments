@@ -12,14 +12,16 @@ import org.apache.sysds.runtime.matrix.data.MatrixIndexes;
 
 public class DanglingToSystemDS {
 	public static void main(String[] args) throws Exception {
-		if(args.length != 4) {
-			System.err.println("usage: DanglingToSystemDS DANGLING_U8 OUTPUT_FILE VERTICES BLOCKSIZE");
+		if(args.length < 4 || args.length > 5) {
+			System.err.println(
+				"usage: DanglingToSystemDS DANGLING_U8 OUTPUT_FILE VERTICES BLOCKSIZE [EMIT_EMPTY_BLOCKS]");
 			System.exit(2);
 		}
 		Path input = Path.of(args[0]);
 		String output = args[1];
 		long vertices = Long.parseLong(args[2]);
 		int blocksize = Integer.parseInt(args[3]);
+		boolean emitEmptyBlocks = args.length == 5 && Boolean.parseBoolean(args[4]);
 		try(InputStream flags = new BufferedInputStream(Files.newInputStream(input), 8 << 20);
 			SequenceFile.Writer writer = IOUtilFunctions.getSeqWriter(new org.apache.hadoop.fs.Path(output),
 				new Configuration(), 1)) {
@@ -36,6 +38,8 @@ public class DanglingToSystemDS {
 				}
 				if(sparse.size() > 0)
 					writer.append(new MatrixIndexes(block + 1, 1), new MatrixBlock(rows, 1, sparse.size(), sparse));
+				else if(emitEmptyBlocks)
+					writer.append(new MatrixIndexes(block + 1, 1), new MatrixBlock(rows, 1, true));
 			}
 			if(flags.read() >= 0)
 				throw new IllegalStateException("Dangling bitmap is longer than vertex count");

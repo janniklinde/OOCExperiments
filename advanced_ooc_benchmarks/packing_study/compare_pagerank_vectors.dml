@@ -1,0 +1,6 @@
+# Compare the retained result of an experimental run with its control.
+A = read($1);
+B = read($2);
+print("max_abs_error=" + max(abs(A - B)));
+print("sum_reference=" + sum(A));
+print("sum_candidate=" + sum(B));

@@ -1,0 +1,5 @@
+a = read($1);
+b = read($2);
+print("sum_a=" + sum(a));
+print("sum_b=" + sum(b));
+print("max_abs=" + max(abs(a - b)));

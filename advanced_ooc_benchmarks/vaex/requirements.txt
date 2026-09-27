@@ -1,0 +1,3 @@
+# Separate environment: Vaex requires an older Dask than the main benchmark suite.
+vaex-core==4.19.0
+vaex-ml==0.18.3

@@ -44,18 +44,29 @@ FIGURE_WIDTH = 7.5
 # Bold, slightly below the body size so the legend reads clearly without crowding the plot.
 LEGEND_FONT = {"weight": "bold", "size": 26}
 
+# Okabe-Ito / Wong palette: colour-blind-safe, high-contrast hues that remain
+# legible after normal paper downscaling.  Identity is encoded by the stable
+# legend labels and bar positions; hatching is deliberately avoided because it
+# turns into visual noise in dense multi-panel figures.
 _SYSTEM_STYLES = {
-    "systemds-ooc": ("#202020", ""),
-    "systemds-spark": ("#666666", "//"),
-    "numpy": ("#a0a0a0", ".."),
-    "dask": ("#dedede", "xx"),
+    "systemds-ooc": ("#00507E", ""),       # blue
+    "systemds-spark": ("#A74800", ""),     # vermillion
+    "numpy": ("#007B5A", ""),              # bluish green
+    "dask": ("#A15C82", ""),               # reddish purple
+    "systemds-cp-spoof": ("#BD8204", "//"), # CP codegen reference
+    "systemds-cp": ("#BD8204", ""),        # orange
+    "sklearn": ("#5F3A87", ""),            # violet
+    "scipy": ("#709EB9", ""),              # sky blue
+    "vaex": ("#7F6565", ""),               # neutral fallback framework
 }
-_SYSTEM_ORDER = ("systemds-ooc", "systemds-spark", "numpy", "dask")
+_SYSTEM_ORDER = ("systemds-ooc", "systemds-spark", "systemds-cp",
+                 "systemds-cp-spoof", "numpy", "dask")
 # Short display names; the internal labels stay untouched because they key the OOC replacement.
 _LEGEND_NAMES = {
     "systemds-ooc": "ACES",
     "systemds-spark": "SysDS-SP",
     "systemds-cp": "SysDS-CP",
+    "systemds-cp-spoof": "SysDS-CP Spoof",
     "numpy": "NumPy",
     "dask": "Dask",
 }
@@ -73,13 +84,14 @@ def number(value):
 
 
 def implementation_style(name):
-    return next((style for prefix, style in _SYSTEM_STYLES.items() if name.startswith(prefix)),
-                ("#888888", "++"))
+    label = implementation_label(name)
+    return _SYSTEM_STYLES.get(label, ("#7F7F7F", ""))
 
 
 def implementation_label(name):
     """Use framework/backend names instead of workload-specific implementation suffixes."""
-    return next((prefix for prefix in _SYSTEM_STYLES if name.startswith(prefix)), name)
+    return next((prefix for prefix in sorted(_SYSTEM_STYLES, key=len, reverse=True)
+                 if name.startswith(prefix)), name)
 
 
 def legend_label(name):
@@ -157,7 +169,8 @@ def load_case(case_dir):
 
 
 def profile_key(profile):
-    match = re.fullmatch(r"mem(\d+)", profile)
+    # Specialized profiles (for example mem16_mlp) retain the same cgroup size.
+    match = re.fullmatch(r"mem(\d+)(?:_.*)?", profile)
     return int(match.group(1)) if match else math.inf
 
 
@@ -166,9 +179,27 @@ def bar_axis(rows):
     profiles = {row["memory_profile"] for row in rows}
     datasets = {row.get("dataset") for row in rows if row.get("dataset_bytes") is not None}
     if len(profiles) == 1 and len(datasets) > 1:
-        values = sorted(datasets, key=lambda dataset: rows_for_dataset(rows, dataset))
-        labels = [f"{rows_for_dataset(rows, dataset) / 1e9:g}GB" for dataset in values]
-        return "dataset", values, labels, "Dataset Size"
+        def dataset_key(dataset):
+            shape = next((row.get("dataset_shape") for row in rows
+                          if row.get("dataset") == dataset), None)
+            return (rows_for_dataset(rows, dataset), shape[0] if shape else math.inf, dataset)
+        values = sorted(datasets, key=dataset_key)
+        sizes = [rows_for_dataset(rows, dataset) for dataset in values]
+        duplicate_sizes = len(set(sizes)) < len(sizes)
+        same_size = len(set(sizes)) == 1
+        labels = []
+        for dataset, size in zip(values, sizes):
+            label = f"{size / 1e9:g}GB" if not same_size else ""
+            if duplicate_sizes:
+                shape = next((row.get("dataset_shape") for row in rows
+                              if row.get("dataset") == dataset), None)
+                dimension = (f"{compact_count(shape[0])} × {compact_count(shape[1])}"
+                             if shape else dataset)
+                label = f"{label}\n{dimension}" if label else dimension
+            labels.append(label)
+        xlabel = (f"Dataset Shape ({sizes[0] / 1e9:g}GB FP64)" if same_size
+                  else "Dataset Shape" if duplicate_sizes else "Dataset Size")
+        return "dataset", values, labels, xlabel
     values = sorted(profiles, key=profile_key, reverse=True)
     labels = [f"{profile_key(profile):g}GB" if math.isfinite(profile_key(profile)) else profile
               for profile in values]
@@ -177,6 +208,13 @@ def bar_axis(rows):
 
 def rows_for_dataset(rows, dataset):
     return next(row["dataset_bytes"] for row in rows if row.get("dataset") == dataset)
+
+
+def compact_count(value):
+    for scale, suffix in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")):
+        if value >= scale and value % scale == 0:
+            return f"{value // scale}{suffix}"
+    return str(value)
 
 
 def workload_name(base_id):
@@ -233,8 +271,12 @@ def grouped_bars(axis, rows, value_key, title, ylabel, log_scale=False, log_limi
     legend = [Patch(facecolor=implementation_style(name)[0], hatch=implementation_style(name)[1],
                     edgecolor="black", label=legend_label(name))
               for name in implementations]
-    axis.legend(handles=legend, ncol=2, loc="upper center", bbox_to_anchor=(0.5, 0.97),
-                frameon=False, prop=LEGEND_FONT, handlelength=1.3, handletextpad=0.4,
+    many_implementations = len(implementations) > 4
+    legend_font = dict(LEGEND_FONT, size=15) if many_implementations else LEGEND_FONT
+    axis.legend(handles=legend, ncol=2,
+                loc="upper left" if many_implementations else "upper center",
+                bbox_to_anchor=(0.01, 0.99) if many_implementations else (0.5, 0.97),
+                frameon=False, prop=legend_font, handlelength=1.3, handletextpad=0.4,
                 columnspacing=1.0, labelspacing=0.25, borderaxespad=0.0)
 
 

@@ -13,6 +13,7 @@ its matching ``*_memory`` sweep.
 """
 
 import argparse
+import json
 import re
 import shutil
 import sys
@@ -63,29 +64,36 @@ def split(tagged, index, axis):
             for value in sorted(values)]
 
 
-def dataset_bytes(invocation):
+def dataset_geometry(invocation):
     plan = yaml.safe_load((invocation / "expanded-plan.yaml").read_text(encoding="utf-8"))
     result = {}
     for name, dataset in plan.get("datasets", {}).items():
         parameters = dataset.get("parameters", {})
         rows, cols = parameters.get("rows"), parameters.get("cols")
         if isinstance(rows, int) and isinstance(cols, int):
-            result[name] = rows * cols * 8
+            result[name] = (rows, cols)
     return result
 
 
 def tagged_rows(invocation):
     """Yield dataset, blocksize and result rows from one invocation."""
-    sizes = dataset_bytes(invocation)
+    geometry = dataset_geometry(invocation)
     for case in sorted(path for path in invocation.iterdir() if (path / "results.csv").is_file()):
         run = vi.json.loads((case / "resolved-run.json").read_text(encoding="utf-8"))
         dataset = str(run.get("dataset") or "")
         tag = (dataset, blocksize(str(run["id"])))
+        signature = json.dumps((run.get("entrypoint"), run.get("parameter_case"),
+                                run.get("parameters")), sort_keys=True)
         for row in vi.load_case(case):
-            yield (*tag, dict(row, dataset=dataset, dataset_bytes=sizes.get(dataset)))
+            shape = geometry.get(dataset)
+            yield (*tag, dict(row, dataset=dataset,
+                              dataset_bytes=shape[0] * shape[1] * 8 if shape else None,
+                              dataset_shape=shape,
+                              memory_limit=run.get("resources", {}).get("memory_max"),
+                              case_signature=signature))
 
 
-def partition_rows(invocation, fallbacks=()):
+def partition_rows(invocation, fallbacks=(), prefer_successful=False):
     """Split a base id only where two rows would land on the same bar.
 
     grouped_bars keys its lookup by one x-axis value and implementation, so a base id spanning
@@ -93,27 +101,54 @@ def partition_rows(invocation, fallbacks=()):
     A dataset-only sweep uses dataset size as that axis; otherwise dataset comes first and
     blocksize splits only what remains.
     Baseline cases carry no blocksize and are shared into every partition.
+    With prefer_successful, use the first successful candidate for each bar; if every
+    candidate failed, retain the first failure. Never replace an existing success.
     """
     by_base = defaultdict(list)
-    selected = set()
-    for candidate in (invocation, *fallbacks):
-        for tag in tagged_rows(candidate):
-            row = tag[2]
-            key = (row["base_id"], tag[0], row["memory_profile"], row["implementation"])
-            if key not in selected:
-                selected.add(key)
-                by_base[row["base_id"]].append(tag)
+    selected = {}
+    prior_blocksizes = defaultdict(set)
+    prior_configs = defaultdict(set)
+    candidates = [list(tagged_rows(candidate)) for candidate in (invocation, *fallbacks)]
+    memory_ids = {tag[2]["base_id"] for rows in candidates for tag in rows
+                  if tag[2]["base_id"].endswith("_memory")}
 
-    # The main workload case is the 16 GB point omitted from the corresponding memory sweep.
-    # Keep the memory-sweep name so the rendered artifact represents one continuous experiment.
-    for base_id in list(by_base):
+    def canonical_base_id(base_id):
+        if base_id.endswith("_spoof"):
+            memory_id = f"{base_id.removesuffix('_spoof')}_memory"
+            return memory_id if memory_id in memory_ids else base_id
         memory_id = f"{base_id}_memory"
-        if memory_id not in by_base:
-            continue
-        main_datasets = {tag[0] for tag in by_base[base_id]}
-        memory_datasets = {tag[0] for tag in by_base[memory_id]}
-        if main_datasets <= memory_datasets:
-            by_base[memory_id].extend(by_base.pop(base_id))
+        return memory_id if memory_id in memory_ids else base_id
+
+    for candidate_rows in candidates:
+        candidate_blocksizes = defaultdict(set)
+        candidate_configs = defaultdict(set)
+        for tag in candidate_rows:
+            row = tag[2]
+            base_id = canonical_base_id(row["base_id"])
+            scope = (base_id, tag[0], row.get("memory_limit") or row["memory_profile"])
+            config = (row["memory_profile"], row.get("case_signature"))
+            if prior_configs[scope] and config not in prior_configs[scope]:
+                continue
+            candidate_configs[scope].add(config)
+            group = (base_id, tag[0], row["memory_profile"],
+                     row["implementation"])
+            if prior_blocksizes[group] and tag[1] not in prior_blocksizes[group]:
+                continue
+            candidate_blocksizes[group].add(tag[1])
+            key = (*group, tag[1])
+            if key not in selected or (
+                prefer_successful and selected[key][2]["status"] != "ok"
+                and row["status"] == "ok"
+            ):
+                selected[key] = tag
+        for group, blocksizes in candidate_blocksizes.items():
+            if not prior_blocksizes[group]:
+                prior_blocksizes[group].update(blocksizes)
+        for scope, configs in candidate_configs.items():
+            if not prior_configs[scope]:
+                prior_configs[scope].update(configs)
+    for key, tag in selected.items():
+        by_base[key[0]].append(tag)
 
     for base_id, tagged in by_base.items():
         profiles = {tag[2]["memory_profile"] for tag in tagged}
@@ -127,9 +162,9 @@ def partition_rows(invocation, fallbacks=()):
                 yield base_id, suffix, [tag[2] for tag in by_size]
 
 
-def render(invocation, out_dir, figures, fallbacks=()):
+def render(invocation, out_dir, figures, fallbacks=(), prefer_successful=False):
     written = []
-    for base_id, suffix, rows in partition_rows(invocation, fallbacks):
+    for base_id, suffix, rows in partition_rows(invocation, fallbacks, prefer_successful):
         stem = "-".join(part for part in (base_id, suffix) if part)
         with tempfile.TemporaryDirectory() as staging:
             target = Path(staging)
@@ -150,6 +185,13 @@ def render(invocation, out_dir, figures, fallbacks=()):
                     destination = out_dir / f"{stem}-{figure}.{extension}"
                     shutil.move(str(source), destination)
                     written.append(destination)
+        # These references now live in the memory comparison. Remove files from
+        # earlier generator runs so the output directory cannot show both versions.
+        for spoof_id in {row["base_id"] for row in rows
+                         if row["base_id"].endswith("_spoof") and base_id != row["base_id"]}:
+            for figure in FIGURES:
+                for extension in ("png", "pdf"):
+                    (out_dir / f"{spoof_id}-{figure}.{extension}").unlink(missing_ok=True)
     return written
 
 
@@ -170,6 +212,9 @@ def main():
                         help="figure set to render (default: all)")
     parser.add_argument("--fallback", type=Path, nargs="*", default=[], metavar="INVOCATION",
                         help="older invocations, in descending priority, used only for missing bars")
+    parser.add_argument("--prefer-successful", action="store_true",
+                        help="also fall back for unsuccessful bars: use the first success in "
+                             "priority order, or retain the first failure if no success exists")
     args = parser.parse_args()
     total = 0
     for invocation in args.invocations:
@@ -181,7 +226,7 @@ def main():
         out_dir = args.out / invocation.name.split(".")[0].replace("+0000", "")
         out_dir.mkdir(parents=True, exist_ok=True)
         figures = FIGURES if args.figures == "all" else ("runtime", "io")
-        written = render(invocation, out_dir, figures, args.fallback)
+        written = render(invocation, out_dir, figures, args.fallback, args.prefer_successful)
         total += len(written)
         print(f"{invocation.name}\t{len(written)} files -> {out_dir}")
     print(f"wrote {total} files to {args.out}")

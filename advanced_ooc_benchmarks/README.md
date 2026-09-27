@@ -51,7 +51,8 @@ only by `lmcg_spoof`, `kmeans_spoof`, and `multilogreg_spoof` at `mem128`
   blocksize conversion and, like it, runs outside the timed cgroup.
 - `gnmf/` implements the fixed-iteration Lee-Seung multiplicative updates over a non-negative FP64
   matrix. SystemDS, NumPy, and Dask share deterministic positive initialization and materialize both
-  learned factors.
+  learned factors. The main plan also contains a three-update rank-512 stress case: each tall factor
+  and update operand is 15.26 GiB, so only the spill-capable OOC, Spark, and Dask arms are selected.
 - `als/` uses an auto-prepared deterministic sparse ratings matrix and a SciPy ALS-CG baseline.
   Its canonical CSR arrays are generated once, while blocksize-qualified native SystemDS inputs
   are converted on demand for each OOC/Spark blocksize candidate. Its entrypoint calls the vendored
@@ -62,9 +63,11 @@ only by `lmcg_spoof`, `kmeans_spoof`, and `multilogreg_spoof` at `mem128`
   and sklearn both train fixed-depth, Gini-classification forests without row bootstrapping and
   materialize their learned models.
 - `pagerank/` uses the published Twitter-2010 vertex ordering directly, its normalized CSR
-  representation and dangling bitmap, and blocksize-qualified 20,000-by-20,000 native SystemDS
+  representation and dangling bitmap, and blocksize-qualified native SystemDS
   tiles. The OOC arm packs the resulting ultra-sparse source tiles into 16 MiB spillable groups;
   the Spark and SciPy arms retain their native physical representations.
+  `pagerank-blen-plan.yaml` uses those same CSR-generated `G-bs*` and `dangling-bs*`
+  binary-block inputs directly; it does not retain a second OOC-rewritten copy.
 - `sliceline/` uses the complete CriteoD21 day, the largest dataset in the
   SliceLine paper. Preparation automatically stages the published Criteo Click Logs Parquet
   shards for `day=2015-03-08`: the historical source files were zero-indexed, so this is

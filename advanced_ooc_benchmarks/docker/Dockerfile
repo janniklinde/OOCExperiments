@@ -32,6 +32,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-venv \
         bash gawk coreutils time procps util-linux sudo \
         ca-certificates curl git tzdata less \
+        build-essential libopenblas-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Units that cannot work (or are pointless) inside a container. Leaving them

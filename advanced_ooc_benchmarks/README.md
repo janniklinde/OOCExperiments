@@ -50,9 +50,14 @@ only by `lmcg_spoof`, `kmeans_spoof`, and `multilogreg_spoof` at `mem128`
   Dask arm reads, in bounded transfer bands. This is the Dask counterpart to the native SystemDS
   blocksize conversion and, like it, runs outside the timed cgroup.
 - `gnmf/` implements the fixed-iteration Lee-Seung multiplicative updates over a non-negative FP64
-  matrix. SystemDS, NumPy, and Dask share deterministic positive initialization and materialize both
+  matrix. SystemDS, NumPy, Dask, and the opt-in `prevision.c` workload share deterministic positive
+  initialization and materialize both
   learned factors. The main plan also contains a three-update rank-512 stress case: each tall factor
   and update operand is 15.26 GiB, so only the spill-capable OOC, Spark, and Dask arms are selected.
+- `prevision/` provides reusable setup, preparation, and execution support for the opt-in
+  [PreVision pilot](prevision/README.md). The raw workload DAGs are `gnmf/prevision.c` and
+  `gram/prevision.c`. It prepares the published engine's TileStore format directly
+  from the canonical raw matrix and keeps PreVision disabled in the normal sweep.
 - `als/` uses an auto-prepared deterministic sparse ratings matrix and a SciPy ALS-CG baseline.
   Its canonical CSR arrays are generated once, while blocksize-qualified native SystemDS inputs
   are converted on demand for each OOC/Spark blocksize candidate. Its entrypoint calls the vendored

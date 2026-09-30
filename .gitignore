@@ -17,8 +17,10 @@ bench-results/
 bench-data/
 # Container-rewritten benchmark plans and local docker settings
 advanced_ooc_benchmarks/*.container.yaml
+advanced_ooc_benchmarks/benchmark-plan-prevision.generated.yaml
 advanced_ooc_benchmarks/docker/.env
 results-remote/
 results-remote-calibration/
 advanced_ooc_benchmarks/results-other-laptop
+advanced_ooc_benchmarks/packing_study
 research/

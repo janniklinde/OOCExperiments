@@ -8,6 +8,7 @@ tools:
   python: /home/jannik/.venvs/systemds/bin/python
   spark_submit: /home/jannik/.venvs/spark35/bin/spark-submit
   systemds_jar: /home/jannik/Dev/SystemDSTest/systemds/target/SystemDS.jar
+  prevision_adapter: ${plan.root}/tools/prevision/bin/adapter
 
 environment:
   BENCH_ROOT: ${plan.root}
@@ -39,6 +40,12 @@ defaults:
     dask_chunk_size: 100MB
     dask_memory_limit: 3GiB
     python_jobs: 4
+    prevision_cache_bytes: 10737418240
+    prevision_arena: posix
+    # PreVision parallelizes within a tile, not across tiles. Avoid inheriting
+    # the 64-task-thread su02 allowance for its fresh per-operation thread teams.
+    prevision_blas_threads: 4
+    prevision_elementwise_threads: 1
     spark_threads: auto
     swap_max: 0
     timeout_seconds: 1800
@@ -217,6 +224,10 @@ templates:
       NUMEXPR_NUM_THREADS: 1
       MALLOC_ARENA_MAX: 2
       DASK_ARRAY__CHUNK_SIZE: ${resources.dask_chunk_size}
+  prevision:
+    comparable: true
+    enabled: false
+    required_tools: [prevision_adapter]
 
 datasets:
   # Anchor only: every dense-family dataset merges it. No run uses dense_1m itself.
@@ -298,6 +309,7 @@ datasets:
       # of kilobyte-sized tasks to every graph for a 32 MB operand.
       dask_chunk:
         baseline_only: true
+        implementation_templates: [dask]
         artifacts:
           X_zarr:
             path: zarr/X.zarr
@@ -312,6 +324,47 @@ datasets:
           policy: auto
           command: |
             "${tools.python}" "${plan.dir}/prepare_zarr.py" "${dataset.dir}/X.f64" "${dataset.dir}/zarr/X.zarr" --rows ${dataset.rows} --cols ${dataset.cols} --row-chunk ${run.dask_chunk} --chunk-mib ${dataset.systemds_chunk_mib} --replace-invalid
+      prevision_gnmf_tile:
+        baseline_only: true
+        implementation_ids: [prevision-gnmf]
+        artifacts:
+          X_prevision: {path: "prevision/gnmf-tr${run.prevision_gnmf_tile}-tc${run.prevision_gnmf_tile_cols}-r${run.rank}-s${run.seed}/X.tilestore"}
+          W_prevision: {path: "prevision/gnmf-tr${run.prevision_gnmf_tile}-tc${run.prevision_gnmf_tile_cols}-r${run.rank}-s${run.seed}/W.tilestore"}
+          H_prevision: {path: "prevision/gnmf-tr${run.prevision_gnmf_tile}-tc${run.prevision_gnmf_tile_cols}-r${run.rank}-s${run.seed}/H.tilestore"}
+          prevision_gnmf_manifest:
+            path: "prevision/gnmf-tr${run.prevision_gnmf_tile}-tc${run.prevision_gnmf_tile_cols}-r${run.rank}-s${run.seed}/manifest.json"
+            metadata:
+              path: "prevision/gnmf-tr${run.prevision_gnmf_tile}-tc${run.prevision_gnmf_tile_cols}-r${run.rank}-s${run.seed}/manifest.json"
+              expect: {generator: "prevision/prepare.py", generator_version: 2, mode: gnmf, rows: "${dataset.rows}", cols: "${dataset.cols}", tile_rows: "${run.prevision_gnmf_tile}", tile_cols: "${run.prevision_gnmf_tile_cols}", rank: "${run.rank}", seed: "${run.seed}"}
+        prepare:
+          policy: auto
+          verify_source: true
+          command: >-
+            "${tools.python}" "${plan.dir}/prevision/prepare.py"
+            --adapter "${tools.prevision_adapter}" --raw "${dataset.dir}/X.f64"
+            --output "${dataset.dir}/prevision/gnmf-tr${run.prevision_gnmf_tile}-tc${run.prevision_gnmf_tile_cols}-r${run.rank}-s${run.seed}"
+            --mode gnmf --rows ${dataset.rows} --cols ${dataset.cols}
+            --tile-rows ${run.prevision_gnmf_tile} --tile-cols ${run.prevision_gnmf_tile_cols}
+            --rank ${run.rank} --seed ${run.seed}
+      prevision_gram_tile:
+        baseline_only: true
+        implementation_ids: [prevision-gram]
+        artifacts:
+          X_prevision: {path: "prevision/gram-tr${run.prevision_gram_tile}-tc${run.prevision_gram_tile_cols}/X.tilestore"}
+          prevision_gram_manifest:
+            path: "prevision/gram-tr${run.prevision_gram_tile}-tc${run.prevision_gram_tile_cols}/manifest.json"
+            metadata:
+              path: "prevision/gram-tr${run.prevision_gram_tile}-tc${run.prevision_gram_tile_cols}/manifest.json"
+              expect: {generator: "prevision/prepare.py", generator_version: 2, mode: gram, rows: "${dataset.rows}", cols: "${dataset.cols}", tile_rows: "${run.prevision_gram_tile}", tile_cols: "${run.prevision_gram_tile_cols}"}
+        prepare:
+          policy: auto
+          verify_source: true
+          command: >-
+            "${tools.python}" "${plan.dir}/prevision/prepare.py"
+            --adapter "${tools.prevision_adapter}" --raw "${dataset.dir}/X.f64"
+            --output "${dataset.dir}/prevision/gram-tr${run.prevision_gram_tile}-tc${run.prevision_gram_tile_cols}"
+            --mode gram --rows ${dataset.rows} --cols ${dataset.cols}
+            --tile-rows ${run.prevision_gram_tile} --tile-cols ${run.prevision_gram_tile_cols}
 
   dense_d16:
     <<: *dense_dataset
@@ -620,6 +673,103 @@ systemds_setup: &systemds_setup
       "${run.results}/SystemDS-config.xml" > "${run.results}/SystemDS-config-spoof.xml"
 
 runs:
+  # Opt-in PreVision pilot. Generate benchmark-plan-prevision.generated.yaml with
+  # prevision/make_plan.py; the main sweep does not acquire a new build dependency.
+  - id: gnmf_prevision
+    enabled: false
+    dataset: gnmf_d32
+    resource_profiles: [mem16]
+    entrypoint: ${plan.dir}/gnmf/systemds.dml
+    blocksize_sweeps: {ooc: [1000], spark: [1000]}
+    parameters:
+      dask_chunk: 12500
+      # 100 full-width tiles of 320 MB, matching the paper's 32 GB tile bytes/count.
+      prevision_gnmf_tile: 40000
+      prevision_gnmf_tile_cols: 1000
+      rank: 16
+      iterations: 3
+      epsilon: 1e-8
+      seed: 23
+      systemds_args: >-
+        -args "${input.X}" ${run.rank} ${run.iterations} ${run.epsilon} ${run.seed}
+        "${run.outputs}/systemds-W-r${rep}" "${run.outputs}/systemds-H-r${rep}"
+    inputs: {X: {artifact: X}}
+    resources: {timeout_seconds: 3600}
+    setup: *systemds_setup
+    cold_cache: ["${dataset.dir}"]
+    implementations:
+      - {id: systemds-ooc, template: systemds-ooc}
+      - {id: systemds-spark, template: systemds-spark}
+      - id: dask-multiplicative-updates
+        template: dask
+        command: >-
+          "${tools.python}" "${plan.dir}/gnmf/dask_array.py" "${dataset.dir}"
+          --rank ${run.rank} --iterations ${run.iterations} --epsilon ${run.epsilon}
+          --seed ${run.seed} --threads ${resources.dask_threads} --workers ${resources.dask_workers}
+          --memory-limit ${resources.dask_memory_limit} --temporary-directory "${run.results}/dask-spill"
+          --output "${run.outputs}/dask-r${rep}.json"
+      - id: prevision-gnmf
+        # Raw workload DAG: gnmf/prevision.c; run.py is the reusable launcher.
+        template: prevision
+        enabled: true
+        command: >-
+          "${tools.python}" "${plan.dir}/prevision/run.py"
+          --adapter "${tools.prevision_adapter}" --mode gnmf
+          --x "${artifact.X_prevision}" --w "${artifact.W_prevision}" --h "${artifact.H_prevision}"
+          --rank ${run.rank} --iterations ${run.iterations} --epsilon ${run.epsilon}
+          --cache-bytes ${resources.prevision_cache_bytes} --arena ${resources.prevision_arena}
+          --threads ${resources.prevision_blas_threads} --elementwise-threads ${resources.prevision_elementwise_threads}
+          --work-dir "${run.results}/prevision-work"
+          --output-prefix "${run.outputs}/prevision-r${rep}"
+          --engine-log "${run.results}/logs/prevision-engine-r${rep}.log"
+          --lock "${plan.root}/tools/prevision/run.lock"
+
+  - id: gram_prevision
+    enabled: false
+    dataset: dense_d32
+    resource_profiles: [mem16]
+    entrypoint: ${plan.dir}/gram/systemds.dml
+    blocksize_sweeps: {ooc: [1000], spark: [1000]}
+    parameters:
+      dask_chunk: 12500
+      prevision_gram_tile: 40000
+      prevision_gram_tile_cols: 1000
+      systemds_args: >-
+        -args "${input.X}" "${run.outputs}/systemds-G-r${rep}"
+    inputs: {X: {artifact: X}}
+    resources: {timeout_seconds: 1800}
+    setup: *systemds_setup
+    cold_cache: ["${dataset.dir}"]
+    implementations:
+      - {id: systemds-ooc, template: systemds-ooc}
+      - {id: systemds-spark, template: systemds-spark}
+      - id: numpy-gram
+        template: python
+        command: >-
+          "${tools.python}" "${plan.dir}/gram/numpy.py" "${dataset.dir}"
+          --output "${run.outputs}/numpy-r${rep}.json"
+      - id: dask-gram
+        template: dask
+        command: >-
+          "${tools.python}" "${plan.dir}/gram/dask_array.py" "${dataset.dir}"
+          --threads ${resources.dask_threads} --workers ${resources.dask_workers}
+          --memory-limit ${resources.dask_memory_limit} --temporary-directory "${run.results}/dask-spill"
+          --output "${run.outputs}/dask-r${rep}.json"
+      - id: prevision-gram
+        # Raw workload DAG: gram/prevision.c, linked by prevision/setup.sh.
+        template: prevision
+        enabled: true
+        command: >-
+          "${tools.python}" "${plan.dir}/prevision/run.py"
+          --adapter "${tools.prevision_adapter}" --mode gram
+          --x "${artifact.X_prevision}"
+          --cache-bytes ${resources.prevision_cache_bytes} --arena ${resources.prevision_arena}
+          --threads ${resources.prevision_blas_threads} --elementwise-threads ${resources.prevision_elementwise_threads}
+          --work-dir "${run.results}/prevision-work"
+          --output-prefix "${run.outputs}/prevision-r${rep}"
+          --engine-log "${run.results}/logs/prevision-engine-r${rep}.log"
+          --lock "${plan.root}/tools/prevision/run.lock"
+
   # Execution order is plan order, and each dataset is staged immediately before the
   # first run that needs it, so the phases below are also the staging order.
   #

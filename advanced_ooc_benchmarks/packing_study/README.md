@@ -1,5 +1,32 @@
 # Source-layout and reactive packing study
 
+The [native packed KMeans chain](PACKED_KMEANS_CHAIN.md) implements source-to-contraction
+pack preservation and compares 200M x 2 and 1B x 2 under a 4 GiB cgroup. It records
+the cache-call reduction, mixed runtime results, remaining spill/read costs, and
+admission/lifetime fixes rather than attributing all gains to packing.
+
+The [range-contract validation](range-contract-findings.md) compares the actual
+rectangle filter with exact partition discovery using identical bounded
+build/probe consumers, including KMeans and GNMF operator chains.
+
+The [byte-only and bucket-capacity follow-up](bucket-capacity-findings.md)
+removes the experimental 32-tile closure constraint and varies matching
+bucket size, cache capacity and work allowance under enforced cgroups.
+
+The [packing-policy study](policy-findings.md) compares arrival, staged,
+coordinated bucket and sorted layouts across shapes and reuse horizons, including
+direct SSD reads. See its [methodology](policy-study.md) for the distinction
+between the original forced-writer-flush measurements and the subsequent
+direct-read/buffered-write validation.
+
+The [join scheduling follow-up](join-expansion.md) holds physical packs fixed
+and compares one-hop tasks, linear batching and bounded overlap expansion.
+
+The broader algorithm-kernel and balanced-join follow-up is documented in
+[broader-findings.md](broader-findings.md), with setup and reproduction in
+[broader-study.md](broader-study.md). It uses actual SystemDS cache/store APIs,
+unlike the original isolated simulator described below.
+
 The bounded-buffer 1D packing follow-up is documented in
 [staging-findings.md](staging-findings.md), with implementation and reproduction
 details in [staging-study.md](staging-study.md).

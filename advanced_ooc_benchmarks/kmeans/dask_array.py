@@ -25,6 +25,8 @@ def main():
     parser.add_argument("--memory-limit", default="3GiB")
     parser.add_argument("--temporary-directory", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--skip-labels", action="store_true",
+                        help="compute centers and inertia only, without collecting the full label vector")
     args = parser.parse_args()
 
     if min(args.clusters, args.iterations, args.threads) < 1:
@@ -61,13 +63,17 @@ def main():
     Y = k - 1 - da.argmin(D[:, ::-1], axis=1)
     min_d = da.min(D, axis=1)
 
-    Y, sum_x_sq, min_d = da.compute(Y, sum_x_sq, da.sum(min_d))
-    Y = Y + 1
+    if args.skip_labels:
+        sum_x_sq, min_d = da.compute(sum_x_sq, da.sum(min_d))
+    else:
+        Y, sum_x_sq, min_d = da.compute(Y, sum_x_sq, da.sum(min_d))
+        Y = Y + 1
     inertia = float(sum_x_sq + min_d)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     np.save(args.output.with_name(args.output.stem + "-centers.npy"), C)
-    np.save(args.output.with_name(args.output.stem + "-labels.npy"), Y)
+    if not args.skip_labels:
+        np.save(args.output.with_name(args.output.stem + "-labels.npy"), Y)
 
     report = {
         "implementation": "dask-kmeans",
@@ -75,6 +81,7 @@ def main():
         "clusters": k,
         "iterations": iterations,
         "inertia": inertia,
+        "labels_materialized": not args.skip_labels,
     }
 
     args.output.write_text(json.dumps(report, indent=2) + "\n")

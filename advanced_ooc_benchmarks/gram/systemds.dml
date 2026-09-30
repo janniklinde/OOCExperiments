@@ -1,0 +1,4 @@
+X = read($1);
+G = t(X) %*% X;
+write(G, $2, format="binary");
+print("gram_checksum=" + sum(G));

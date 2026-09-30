@@ -38,6 +38,7 @@ _DEFAULT_TEMPORARY_PATHS = [
     "${run.results}/java-tmp",
     "${run.results}/dask-spill",
     "${run.results}/python-tmp",
+    "${run.results}/prevision-work",
 ]
 
 _RETENTION_METRICS = {
@@ -49,6 +50,7 @@ _RETENTION_METRICS = {
     "l2svm": ("model_norm",),
     "random_features": ("model_norm", "residual_norm"),
     "knn": ("accuracy", "vote_sum"),
+    "gram": ("gram_checksum",),
 }
 
 
@@ -138,8 +140,11 @@ def _json_validation_values(outputs, impl_id, rep, metric_names):
     candidates = sorted(outputs.glob(f"*-r{rep}.json"))
     if "dask" in impl_id:
         candidates = [path for path in candidates if path.name.startswith("dask-")]
+    elif "prevision" in impl_id:
+        candidates = [path for path in candidates if path.name.startswith("prevision-")]
     else:
-        candidates = [path for path in candidates if not path.name.startswith("dask-")]
+        candidates = [path for path in candidates
+                      if not path.name.startswith(("dask-", "prevision-"))]
     for path in candidates:
         try:
             report = json.loads(path.read_text(encoding="utf-8"))
@@ -260,7 +265,7 @@ def write_invocation_metadata(path, plan_dir, root, context):
             "sha256": file_digest(source),
         }
     tool_files = {}
-    for tool_id in ("systemds_jar",):
+    for tool_id in ("systemds_jar", "prevision_adapter"):
         configured = context.get(f"tools.{tool_id}")
         if not configured:
             continue
@@ -539,10 +544,11 @@ def prepare_dataset_variant(dataset_id, variant_id, variant, directory, context,
                             plan_dir, global_env, timeout=None):
     """Ensure run-specific dataset artifacts, such as a native blocksize, exist."""
     problems = dataset_status(variant, directory, context)
-    if not problems:
+    preparation = variant.get("prepare")
+    verify_source = bool(preparation and preparation.get("verify_source"))
+    if not problems and not verify_source:
         return context
 
-    preparation = variant.get("prepare")
     description = f"{dataset_id} {variant_id}={context[f'run.{variant_id}']}"
     if not preparation:
         raise RuntimeError(f"Dataset variant {description} is not ready: {'; '.join(problems)}")
@@ -566,7 +572,8 @@ def prepare_dataset_variant(dataset_id, variant_id, variant, directory, context,
         raise RuntimeError(f"Dataset variant {description} is not ready: {'; '.join(problems)}")
 
     directory.mkdir(parents=True, exist_ok=True)
-    remove_preparation_outputs(variant, directory, context)
+    if problems:
+        remove_preparation_outputs(variant, directory, context)
     command = expand(str(preparation["command"]), context)
     env = dict(global_env)
     env.update(expand_map(preparation.get("env"), context))
@@ -1038,6 +1045,7 @@ monitor_cgroup() {
 
 printf '%s\n' 'elapsed_ms,memory_current_bytes,memory_peak_bytes,memory_swap_current_bytes,anon_bytes,file_bytes,shmem_bytes,file_dirty_bytes,file_writeback_bytes,pgfault,pgmajfault,workingset_refault_anon,workingset_refault_file,workingset_activate_file,cpu_usage_usec,cpu_user_usec,cpu_system_usec,cpu_nr_periods,cpu_nr_throttled,cpu_throttled_usec,pids_current,io_read_bytes,io_write_bytes,io_read_ops,io_write_ops,io_discard_bytes,io_discard_ops,cpu_pressure_some_usec,cpu_pressure_full_usec,memory_pressure_some_usec,memory_pressure_full_usec,io_pressure_some_usec,io_pressure_full_usec,proc_rchar_bytes,proc_read_bytes' >"$telemetry"
 telemetry_start_ns=$(date +%s%N)
+payload_start_ns=$telemetry_start_ns
 # Give the benchmark payload a higher OOM score than this small accounting
 # wrapper. If MemoryMax is exhausted, the kernel can kill the payload while
 # timeout, GNU time, and this wrapper remain alive to record the failure.
@@ -1058,6 +1066,7 @@ monitor_cgroup "$timed_pid" &
 monitor_pid=$!
 wait "$timed_pid"
 rc=$?
+payload_end_ns=$(date +%s%N)
 kill "$monitor_pid" 2>/dev/null
 wait "$monitor_pid" 2>/dev/null
 sample_cgroup
@@ -1065,6 +1074,7 @@ io=$(io_totals "$root/io.stat")
 IFS=, read -r io_read_bytes io_write_bytes io_read_ops io_write_ops io_discard_bytes io_discard_ops <<<"$io"
 {
   echo "exit_status=$rc"
+  awk -v start="$payload_start_ns" -v end="$payload_end_ns" 'BEGIN {printf "wall_seconds=%.6f\n", (end-start)/1000000000}'
   echo "memory_current_bytes=$(cat "$root/memory.current")"
   echo "memory_peak_bytes=$(cat "$root/memory.peak")"
   echo "memory_swap_current_bytes=$(cat "$root/memory.swap.current" 2>/dev/null || echo 0)"
@@ -1445,6 +1455,21 @@ def execute_plan(plan_path, validate_only=False, prepare_only=False, only=(),
             # is prepared only for the case type that reads it.
             if bool(variant.get("baseline_only")) != bool(run.get("_baseline_case")):
                 continue
+            required_ids = variant.get("implementation_ids")
+            required_templates = variant.get("implementation_templates")
+            if required_ids is not None or required_templates is not None:
+                for field, values in (("implementation_ids", required_ids),
+                                      ("implementation_templates", required_templates)):
+                    if values is not None and (not isinstance(values, list) or
+                                               not all(isinstance(item, str) for item in values)):
+                        raise ValueError(f"Dataset variant {dataset_id}.{variant_id} "
+                                         f"{field} must be a list of names")
+                active = [item for item in run.get("implementations", [])
+                          if resolve_implementation(item, templates).get("enabled", True)]
+                if not any(str(item["id"]) in (required_ids or ()) or
+                           str(item.get("template", "")) in (required_templates or ())
+                           for item in active):
+                    continue
             context_key = f"run.{variant_id}"
             if context_key not in run_context:
                 raise ValueError(f"Run {run_id} must define parameters.{variant_id} for dataset "
@@ -1696,6 +1721,8 @@ def execute_plan(plan_path, validate_only=False, prepare_only=False, only=(),
                             status = "failed"
                     time_path = Path(str(metrics) + ".time")
                     wall_seconds = elapsed_seconds(time_path)
+                    if not math.isfinite(float(wall_seconds)):
+                        wall_seconds = metric(metrics, r"^wall_seconds=([0-9.]+)$")
                     algorithm_seconds = reported_seconds(log)
                     peak = metric(metrics, r"^memory_peak_bytes=([0-9]+)$")
                     faults = metric(time_path, r"Major \(requiring I/O\) page faults:\s*([0-9]+)")

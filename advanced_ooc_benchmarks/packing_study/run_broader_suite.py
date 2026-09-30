@@ -6,7 +6,7 @@ from pathlib import Path
 
 p = argparse.ArgumentParser()
 p.add_argument("results", type=Path)
-p.add_argument("--suite", choices=("joins", "algorithms", "bounds", "repeat"), required=True)
+p.add_argument("--suite", choices=("joins", "algorithms", "bounds", "repeat", "coordination"), required=True)
 a = p.parse_args()
 cases = []
 def add(op, policy, rows, cols, rank, cache=16, order="random", seed=42):
@@ -22,11 +22,11 @@ if a.suite == "joins":
         for cache in (4, 128, 512):
             add("equijoin", policy, 8000000, 2, 2, cache=cache)
 elif a.suite == "algorithms":
-    for op in ("pca-stats", "logreg-hvp", "l2svm-line", "mlp-gate"):
+    for op in ("pca-stats", "logreg-hvp", "l2svm-line", "mlp-gate", "rsvd-project"):
         for rows, cols in (((16000000, 1),) if op == "l2svm-line" else ((8000000, 2), (500000, 32))):
             for order in ("chunk", "random"):
                 for policy in ("arrival", "stage4", "stage50", "reorder"):
-                    add(op, policy, rows, cols, 1 if op.endswith("hvp") else cols, order=order)
+                    add(op, policy, rows, cols, 1 if op.endswith("hvp") else 16 if op == "rsvd-project" else cols, order=order)
 elif a.suite == "bounds":
     for op in ("map", "equijoin"):
         for policy in ("single", "batch", "arrival", "stage50", "reorder"):
@@ -34,10 +34,14 @@ elif a.suite == "bounds":
             add(op, policy, 500000, 128, 128)
     for policy in ("single", "batch", "arrival", "stage4", "stage16", "stage50", "reorder"):
         add("equijoin", policy, 32000000, 2, 2)
-else:
+elif a.suite == "repeat":
     for op in ("equijoin", "mlp-gate", "logreg-hvp", "pca-stats"):
         for policy in ("arrival", "stage4", "stage50", "reorder"):
             add(op, policy, 8000000, 2, 1 if op.endswith("hvp") else 2, seed=73)
+else:
+    for order in ("random", "correlated"):
+        for policy in ("arrival", "reorder-x", "stage50x", "reorder"):
+            add("equijoin", policy, 8000000, 2, 2, order=order, seed=73)
 random.Random(901+len(cases)).shuffle(cases)
 a.results.mkdir(parents=True, exist_ok=False)
 plan = a.results.resolve() / "cases.txt"
